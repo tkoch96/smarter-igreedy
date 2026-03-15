@@ -5,12 +5,13 @@ from utils import *
 from perfect_geolocator import Perfect_Geolocator
 from pull_ripe_atlas_measurement_data import RipeAtlasPipeline
 from random_geolocator import Random_Geolocator
+from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
 
 from plot_results import *
 
 class Geolocator_Comparator:
 	def __init__(self):
-		self.geolocators = [Perfect_Geolocator(), Random_Geolocator()]
+		self.geolocators = [Perfect_Geolocator(), Random_Geolocator(), Iterative_Greedy_Geolocator()]
 		self.measurement_converter_mode = 'nearest_neighbor' # or 'nearest_neighbor'
 		self.target_data = None
 		self.errors = {}
@@ -152,5 +153,15 @@ class Geolocator_Comparator:
 
 
 if __name__ == "__main__":
-	gc = Geolocator_Comparator()
-	gc.run()
+    gc = Geolocator_Comparator()
+    
+    # 1. Load the data into gc.target_data
+    gc.load_target_measurement_data()
+    
+    # 2. Call the diagnostic plot to see what your dataset actually looks like
+    print("Generating Latency vs. Distance diagnostic plot...")
+    plot_latency_vs_distance(gc.target_data, os.path.join(FIG_DIR, "latency_vs_distance.pdf"))
+    
+    # 3. Run your geolocator simulation as normal
+    gc.run()
+
