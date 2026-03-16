@@ -1,6 +1,7 @@
 import numpy as np
-import geopy.distance
 from scipy.optimize import minimize
+
+from utils import *
 
 class FeasibleRegion:
 	"""Tracks the feasible geographic region for a target based on RTT constraints."""
@@ -36,7 +37,7 @@ class FeasibleRegion:
 			lat, lon = point
 			penalty = 0
 			for (src_lat, src_lon), max_dist in self.constraints:
-				dist = geopy.distance.geodesic((lat, lon), (src_lat, src_lon)).km
+				dist = get_distance((lat,lon), (src_lat, src_lon))
 				if dist > max_dist:
 					penalty += (dist - max_dist) ** 2
 				else:
@@ -48,7 +49,9 @@ class FeasibleRegion:
 			error_function, 
 			self.best_guess, 
 			method='Nelder-Mead',
-			bounds=[(-90, 90), (-180, 180)]
+			bounds=[(-90, 90), (-180, 180)],
+			tol=1.0,
+    		options={'maxiter': 200},
 		)
 		
 		self.best_guess = result.x
@@ -59,4 +62,4 @@ class FeasibleRegion:
 		
 	def distance_to(self, vp_loc):
 		"""Utility for geolocators to easily evaluate distance to the current guess."""
-		return geopy.distance.geodesic(vp_loc, self.get_location()).km
+		return get_distance(vp_loc, self.get_location())

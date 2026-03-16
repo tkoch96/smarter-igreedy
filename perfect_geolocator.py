@@ -1,4 +1,4 @@
-import geopy.distance, copy
+import geopy.distance, copy, tqdm
 from utils import *
 from feasible_region_maintainer import FeasibleRegion
 
@@ -27,46 +27,56 @@ class Perfect_Geolocator:
 		
 		ranked_dst_to_srcs = {}
 		
-		for dst, srcs in dst_to_src_rtts.items():
-		    actual_target_loc = address_to_loc.get(dst)
-		    if not actual_target_loc or not srcs:
-		        continue
+		for dst, srcs in tqdm.tqdm(dst_to_src_rtts.items(), desc="Picking best oracle measurements..."):
+			actual_target_loc = address_to_loc.get(dst)
+			if not actual_target_loc or not srcs:
+				continue
 
-		    # Initialize the region for this target
-		    current_region = FeasibleRegion(target_id=dst)
-		    selected_srcs = []
-		    remaining_srcs = srcs[:] # List of (vp_src, min_rtt)
+			# Initialize the region for this target
+			current_region = FeasibleRegion(target_id=dst)
+			selected_srcs = []
+			remaining_srcs = srcs[:] # List of (vp_src, min_rtt)
 
-		    while remaining_srcs:
-		        best_idx = -1
-		        best_error = float('inf')
+			while remaining_srcs:
+				best_idx = -1
+				best_error = float('inf')
 
-		        # The Oracle simulates the future for every single candidate
-		        for i, (cand_src, cand_rtt) in enumerate(remaining_srcs):
-		            cand_loc = address_to_loc.get(cand_src)
-		            if not cand_loc:
-		                continue
-		                
-		            # Clone the region so we don't permanently alter the current state
-		            simulated_region = copy.deepcopy(current_region)
-		            simulated_region.add_measurement(cand_loc, cand_rtt)
-		            
-		            # Calculate the literal error of the new estimate against the ground truth
-		            simulated_error = get_distance(simulated_region.get_location(), actual_target_loc)
+				# The Oracle simulates the future for every single candidate
+				for i, (cand_src, cand_rtt) in enumerate(remaining_srcs):
+					cand_loc = address_to_loc.get(cand_src)
+					if not cand_loc:
+						continue
+						
+					# Clone the region so we don't permanently alter the current state
+					old_guess = current_region.best_guess.copy() # Just copy the numpy array
 
-		            if simulated_error < best_error:
-		                best_error = simulated_error
-		                best_idx = i
+					# Manually push the constraint
+					max_radius_km = cand_rtt * 100.0
+					current_region.constraints.append((cand_loc, max_radius_km))
+					current_region._update_estimate()
 
-		        if best_idx != -1:
-		            # Commit the best measurement to our actual region and save it
-		            best_src, best_rtt = remaining_srcs.pop(best_idx)
-		            current_region.add_measurement(address_to_loc[best_src], best_rtt)
-		            selected_srcs.append((best_src, best_rtt))
-		        else:
-		            break
-		            
-		    ranked_dst_to_srcs[dst] = selected_srcs
+					simulated_error = get_distance(current_region.get_location(), actual_target_loc)
+
+					# Pop it back off and restore the guess
+					current_region.constraints.pop()
+					current_region.best_guess = old_guess
+					
+					# # Calculate the literal error of the new estimate against the ground truth
+					# simulated_error = get_distance(simulated_region.get_location(), actual_target_loc)
+
+					if simulated_error < best_error:
+						best_error = simulated_error
+						best_idx = i
+
+				if best_idx != -1:
+					# Commit the best measurement to our actual region and save it
+					best_src, best_rtt = remaining_srcs.pop(best_idx)
+					current_region.add_measurement(address_to_loc[best_src], best_rtt)
+					selected_srcs.append((best_src, best_rtt))
+				else:
+					break
+					
+			ranked_dst_to_srcs[dst] = selected_srcs
 
 		# Interleave them for the budget:
 		# The 1st most valuable measurement for EVERY target is added first, then the 2nd, etc.

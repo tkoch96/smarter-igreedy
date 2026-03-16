@@ -1,5 +1,4 @@
 import numpy as np, pickle, os
-import geopy.distance
 from scipy.optimize import minimize
 from utils import *
 from perfect_geolocator import Perfect_Geolocator
@@ -88,10 +87,10 @@ class Geolocator_Comparator:
 		self.plot_data = {}
 
 		for geolocator in self.geolocators:
+			print(f"\n--- Running {geolocator.name} ---")
 			geolocator.set_data(self.target_data)
 			geolocator.solve()
 			
-			print(f"\n--- Running {geolocator.name} ---")
 			
 			# Initialize data storage for this specific geolocator
 			self.plot_data[geolocator.name] = {'budgets': [], 'errors': []}
