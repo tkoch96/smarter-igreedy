@@ -12,7 +12,7 @@ from plot_results import *
 class Geolocator_Comparator:
 	def __init__(self):
 		self.geolocators = [Perfect_Geolocator(), Random_Geolocator(), Iterative_Greedy_Geolocator()]
-		self.measurement_converter_mode = 'nearest_neighbor' # or 'nearest_neighbor'
+		self.measurement_converter_mode = 'nearest_neighbor' # setting this to 'great_circle_overlap_centroid' really hurts performance, why?
 		self.target_data = None
 		self.errors = {}
 
