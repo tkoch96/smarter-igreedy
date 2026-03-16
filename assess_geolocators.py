@@ -6,6 +6,7 @@ from perfect_geolocator import Perfect_Geolocator
 from pull_ripe_atlas_measurement_data import RipeAtlasPipeline
 from random_geolocator import Random_Geolocator
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
+from feasible_region_maintainer import FeasibleRegion
 
 from plot_results import *
 
@@ -44,57 +45,31 @@ class Geolocator_Comparator:
 
 		for dst, src_rtts in dst_to_src_rtts.items():
 			if self.measurement_converter_mode == 'nearest_neighbor':
-				# Target location is the location of the VP with the lowest latency
 				closest_src = min(src_rtts, key=src_rtts.get)
 				if closest_src in address_to_loc:
 					estimated_locations[dst] = address_to_loc[closest_src]
 
 			elif self.measurement_converter_mode == 'great_circle_overlap_centroid':
-				sources = []
-				max_distances = []
+				# Use the new FeasibleRegion object for batch estimation
+				region = FeasibleRegion(target_id=dst)
 				
+				batch_measurements = []
 				for src, rtt in src_rtts.items():
 					if src in address_to_loc:
-						sources.append(address_to_loc[src])
-						# Note: 1ms RTT = ~100km one-way distance in fiber. 
-						# Adjust to 50.0 if you strictly meant 50km one-way.
-						max_distances.append(rtt * 100.0) 
-
-				if not sources:
-					continue
-				if len(sources) == 1:
-					estimated_locations[dst] = sources[0]
-					continue
-
-				# Initial guess is the simple centroid of all responding sources
-				lat_guess = sum(s[0] for s in sources) / len(sources)
-				lon_guess = sum(s[1] for s in sources) / len(sources)
-				initial_guess = np.array([lat_guess, lon_guess])
-
-				# Objective: minimize distance violations based on the Speed of Light
-				def error_function(point):
-					lat, lon = point
-					penalty = 0
-					for (src_lat, src_lon), max_dist in zip(sources, max_distances):
-						dist = geopy.distance.geodesic((lat, lon), (src_lat, src_lon)).km
-						
-						# Penalize heavily if we exceed the physical distance limit dictated by RTT
-						if dist > max_dist:
-							penalty += (dist - max_dist) ** 2
-						else:
-							# Add a tiny pull towards the center to approximate a centroid within the valid intersection
-							penalty += 0.001 * dist 
-					return penalty
-
-				# Use Nelder-Mead as it handles non-differentiable spatial optimizations well
-				result = minimize(
-					error_function, 
-					initial_guess, 
-					method='Nelder-Mead',
-					bounds=[(-90, 90), (-180, 180)]
-				)
+						batch_measurements.append((address_to_loc[src], rtt))
 				
-				estimated_locations[dst] = (result.x[0], result.x[1])
+				if not batch_measurements:
+					continue
+				elif len(batch_measurements) == 1:
+					estimated_locations[dst] = batch_measurements[0][0]
+				else:
+					# Seed an initial guess before optimizing (optional but helps convergence)
+					lat_guess = sum(m[0][0] for m in batch_measurements) / len(batch_measurements)
+					lon_guess = sum(m[0][1] for m in batch_measurements) / len(batch_measurements)
+					region.best_guess = np.array([lat_guess, lon_guess])
+					
+					region.add_measurements_batch(batch_measurements)
+					estimated_locations[dst] = region.get_location()
 
 			else:
 				raise ValueError(f"measurement_converter_mode {self.measurement_converter_mode} not understood")
@@ -153,15 +128,15 @@ class Geolocator_Comparator:
 
 
 if __name__ == "__main__":
-    gc = Geolocator_Comparator()
-    
-    # 1. Load the data into gc.target_data
-    gc.load_target_measurement_data()
-    
-    # 2. Call the diagnostic plot to see what your dataset actually looks like
-    print("Generating Latency vs. Distance diagnostic plot...")
-    plot_latency_vs_distance(gc.target_data, os.path.join(FIG_DIR, "latency_vs_distance.pdf"))
-    
-    # 3. Run your geolocator simulation as normal
-    gc.run()
+	gc = Geolocator_Comparator()
+	
+	# 1. Load the data into gc.target_data
+	gc.load_target_measurement_data()
+	
+	# 2. Call the diagnostic plot to see what your dataset actually looks like
+	print("Generating Latency vs. Distance diagnostic plot...")
+	plot_latency_vs_distance(gc.target_data, os.path.join(FIG_DIR, "latency_vs_distance.pdf"))
+	
+	# 3. Run your geolocator simulation as normal
+	gc.run()
 

@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.optimize import minimize
 from utils import get_distance
+from feasible_region_maintainer import FeasibleRegion
 
 class Iterative_Greedy_Geolocator:
 	def __init__(self):
@@ -32,34 +33,37 @@ class Iterative_Greedy_Geolocator:
 		expected_rtt_ms = (distance_km * 1.3) / 100.0
 		return expected_rtt_ms
 
-	def evaluate_vp_utility(self, vp_loc, current_guess_loc, used_vp_locs):
+	def evaluate_vp_utility(self, vp_loc, target_region):
 		"""
-		Calculates utility based on expected tightness of the bounding circle,
-		penalized by how redundant the measurement is geographically.
+		Evaluates a candidate VP based on the target's current FeasibleRegion.
+		Maximizes expected constraint tightness while penalizing redundancy.
 		"""
+		current_guess_loc = target_region.get_location()
 		distance_to_guess = get_distance(vp_loc, current_guess_loc)
 		
-		# 1. Expected Latency Penalty (closer to guess is better)
-		expected_rtt = (distance_to_guess * 1.5) / 100.0 
+		# 1. Expected Bounding Circle (Smaller is better)
+		# Closer VPs are expected to return lower RTTs, resulting in tighter constraint circles.
+		expected_rtt = (distance_to_guess * 1.5) / 100.0  
 		
-		# 2. Geographic Diversity Reward (further from used VPs is better)
+		# 2. Spatial Diversity against Existing Constraints
 		diversity_score = 0
-		if used_vp_locs:
-			# Find the distance to the CLOSEST VP we've already used
-			distances_to_used = [get_distance(vp_loc, used_loc) for used_loc in used_vp_locs]
+		existing_constraint_centers = [c[0] for c in target_region.constraints]
+		
+		if existing_constraint_centers:
+			# Find how close this candidate is to VPs we've already measured from
+			distances_to_used = [get_distance(vp_loc, used_loc) for used_loc in existing_constraint_centers]
 			min_dist_to_used = min(distances_to_used)
 			
-			# If the VP is within 500km of one we already used, heavily penalize it.
-			# If it's further away, it provides a good cross-section for triangulation.
+			# Heavy penalty if we already have a constraint from this exact area
 			if min_dist_to_used < 500:
-				diversity_score = -1000  # "We already pinged from this area, skip it"
+				diversity_score = -1000  
 			else:
-				# Diminishing returns on being super far away from other probes
-				diversity_score = min(min_dist_to_used, 3000) * 0.1 
+				# Reward providing a constraint from a new angle/distance.
+				# Capped so we don't just pick VPs on the other side of the planet.
+				diversity_score = min(min_dist_to_used, 3000) * 0.1  
 
-		# We want to minimize expected RTT, but maximize diversity.
+		# Maximize diversity, minimize expected RTT
 		utility = diversity_score - expected_rtt
-		
 		return utility
 
 	def measurements(self, budget):
@@ -79,41 +83,36 @@ class Iterative_Greedy_Geolocator:
 		if not targets:
 			return meas_dict
 
-		# State tracking for the online learning process
-		current_guesses = {dst: self.get_prior_guess(dst) for dst in targets}
+		# State tracking entirely delegated to FeasibleRegion
+		target_regions = {dst: FeasibleRegion(dst, self.get_prior_guess(dst)) for dst in targets}
+		
+		# Track which sources we've actually executed to avoid pinging twice
 		measurements_used = {dst: set() for dst in targets}
 		
-		# Keep track of the physical constraints (VP location, max radius in km) discovered so far
-		constraints_history = {dst: [] for dst in targets}
-
 		pings_allocated = 0
 		target_idx = 0
 		
 		while pings_allocated < budget:
 			dst = targets[target_idx % len(targets)]
 			
-			# Find VPs we haven't used for this target yet
 			available_srcs = [s for s in available_measurements[dst] if s not in measurements_used[dst]]
 			
 			if not available_srcs:
 				target_idx += 1
 				if all(len(measurements_used[t]) == len(available_measurements[t]) for t in targets):
-					break # All targets exhausted
+					break 
 				continue
 
-			# 1. Rank available VPs by their utility against our current guess
+			# 1. Rank available VPs by their utility against our CURRENT region
 			best_src = None
 			best_utility = -float('inf')
-			
-			# Get the actual coordinates of the VPs we've already used for this target
-			used_vp_locs = [self.vp_locations[s] for s in measurements_used[dst] if s in self.vp_locations]
 			
 			for src in available_srcs:
 				if src in self.vp_locations:
 					vp_loc = self.vp_locations[src]
 					
-					# Pass the used_vp_locs into the new utility function
-					utility = self.evaluate_vp_utility(vp_loc, current_guesses[dst], used_vp_locs)
+					# Pass the whole region object to the utility function
+					utility = self.evaluate_vp_utility(vp_loc, target_regions[dst])
 					
 					if utility > best_utility:
 						best_utility = utility
@@ -122,7 +121,7 @@ class Iterative_Greedy_Geolocator:
 			if best_src is None:
 				best_src = available_srcs[0]
 
-			# 2. "Execute" the measurement
+			# 2. Execute the measurement
 			measurements_used[dst].add(best_src)
 			actual_rtts = loc_loc_meas[best_src][dst]
 			
@@ -131,40 +130,10 @@ class Iterative_Greedy_Geolocator:
 			meas_dict[best_src][dst] = actual_rtts
 			pings_allocated += 1
 			
-			# 3. Incorporate new data to update the "Current Guess" (The ML / CBG Estimator)
+			# 3. Add the measurement to the region (which auto-updates the guess)
 			if best_src in self.vp_locations:
-				vp_loc = self.vp_locations[best_src]
 				min_actual_rtt = min(actual_rtts)
-				max_radius_km = min_actual_rtt * 100.0 # Speed of light in fiber constraint
-				
-				# Add new constraint to history
-				constraints_history[dst].append((vp_loc, max_radius_km))
-				
-				# Optimization Objective: Minimize distance violations for all known constraints
-				def error_function(point):
-					lat, lon = point
-					penalty = 0
-					for (src_lat, src_lon), max_dist in constraints_history[dst]:
-						dist = get_distance((lat, lon), (src_lat, src_lon))
-						if dist > max_dist:
-							penalty += (dist - max_dist) ** 2
-						else:
-							# Gentle pull to the center of the valid intersection
-							penalty += 0.001 * dist 
-					return penalty
-
-				# Use the previous guess as the starting point so the optimizer converges quickly
-				initial_guess = np.array(current_guesses[dst])
-				
-				result = minimize(
-					error_function, 
-					initial_guess, 
-					method='Nelder-Mead',
-					bounds=[(-90, 90), (-180, 180)]
-				)
-				
-				# Update our belief of where the target is
-				current_guesses[dst] = (result.x[0], result.x[1])
+				target_regions[dst].add_measurement(self.vp_locations[best_src], min_actual_rtt)
 
 			target_idx += 1
 
