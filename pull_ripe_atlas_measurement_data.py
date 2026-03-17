@@ -3,6 +3,7 @@ import bz2
 import json
 import requests
 from datetime import datetime, timedelta
+from subprocess import call
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pull_ripe_atlas_probe_data import RipeAtlasProbePipeline
 from utils import *
@@ -46,29 +47,51 @@ class RipeAtlasPipeline:
 		return url, filename
 
 	def download_dump(self, target_tuple):
-		"""Downloads the raw .bz2 file with a rapid idempotency check."""
+		"""Downloads the raw .bz2 file with retries and a safe idempotency check."""
 		target_date, hour = target_tuple
 		url, filename = self._build_url(target_date, hour)
 		raw_path = os.path.join(self.raw_dir, filename)
+		temp_path = raw_path + ".tmp"
 		
-		# Idempotency check: fast skip if already downloaded completely
+		# Idempotency check: fast skip ONLY if the finalized file exists
 		if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
 			return raw_path
 
-		try:
-			with requests.get(url, stream=True, timeout=30) as r:
-				r.raise_for_status()
-				with open(raw_path, 'wb') as f:
-					for chunk in r.iter_content(chunk_size=8192):
-						f.write(chunk)
-			return raw_path
-		except requests.exceptions.HTTPError as e:
-			# RIPE occasionally misses an hour if their backend restarts
-			print(f"Skipping {filename} (Not found or HTTP error): {e}")
-			return None
-		except Exception as e:
-			print(f"Connection error for {filename}: {e}")
-			return None
+		max_retries = 3
+		for attempt in range(max_retries):
+			try:
+				# Use a tuple for timeouts: (connect_timeout, read_timeout)
+				with requests.get(url, stream=True, timeout=(15, 120)) as r:
+					r.raise_for_status()
+					
+					# Write to a temporary file first
+					with open(temp_path, 'wb') as f:
+						# Increased chunk size to 1MB for better throughput
+						for chunk in r.iter_content(chunk_size=1024 * 1024):
+							f.write(chunk)
+				
+				# Download complete: rename temp file to final raw_path
+				os.rename(temp_path, raw_path)
+				return raw_path
+				
+			except requests.exceptions.HTTPError as e:
+				# 404s usually mean RIPE just didn't generate a file for that hour
+				if r.status_code == 404:
+					print(f"Skipping {filename}: Not found on server (404).")
+					break # No point retrying a 404
+				print(f"HTTP Error for {filename}: {e}")
+			except Exception as e:
+				print(f"Attempt {attempt + 1}/{max_retries} failed for {filename}: {e}")
+				if attempt < max_retries - 1:
+					time.sleep(5 * (attempt + 1)) # Simple linear backoff
+				else:
+					print(f"Giving up on {filename} after {max_retries} attempts.")
+		
+		# Clean up the dangling temporary file if all attempts failed
+		if os.path.exists(temp_path):
+			os.remove(temp_path)
+			
+		return None
 
 	def process_dump(self, raw_path):
 		"""Streams the .bz2 archive and extracts required data."""
@@ -85,23 +108,25 @@ class RipeAtlasPipeline:
 
 		filtered_results = []
 		with bz2.open(raw_path, "rt") as f:
-			for line in f:
-				try:
+			try:
+				for line in f:
 					try:
-						record = json.loads(line)
-						filtered_results.append({"dst": record["dst_addr"], "src": record["src_addr"],
-							"probe": record["prb_id"], "rtt": record["min"]})	
-						if np.random.random() > .9999:
-							break
-					except json.JSONDecodeError:
-						continue
-				except Exception as e:
-					pass							
-			with open(parsed_path, "w") as out_f:
-				json.dump(filtered_results, out_f)
-				
-			return parsed_path
-		
+						try:
+							record = json.loads(line)
+							filtered_results.append({"dst": record["dst_addr"], "src": record["src_addr"],
+								"probe": record["prb_id"], "rtt": record["min"]})	
+						except json.JSONDecodeError:
+							continue
+					except Exception as e:
+						pass							
+				with open(parsed_path, "w") as out_f:
+					json.dump(filtered_results, out_f)
+					
+				return parsed_path
+			except Exception as e:
+				print("File {} malformed, removing...".format(filename))
+				call("rm {}".format(raw_path), shell=True)
+			
 
 	def load_parsed_target_data(self):
 		### returns probes
@@ -111,28 +136,38 @@ class RipeAtlasPipeline:
 
 		parsed_probe_measurements = self.export_latest_measurements()
 
-		probe_metadata_obj = RipeAtlasProbePipeline(start_date="2026-01-01", end_date="2026-01-31")
+		probe_metadata_obj = RipeAtlasProbePipeline(start_date="2026-02-01", end_date="2026-02-28")
 		probe_metadata = probe_metadata_obj.export_latest_probes()
 
-		probe_24s = {convert_32_to_24(prb['address_v4']): None for prb in probe_metadata.values() if prb['address_v4'] is not None}
+		# Build the location dictionary first so we can use it to filter
+		address_to_loc = {
+			convert_32_to_24(probe['address_v4']): (probe['latitude'], probe['longitude']) 
+			for probe in probe_metadata.values() 
+			if (probe['address_v4'] is not None and probe['latitude'] is not None and probe['longitude'] is not None)
+		}
 
 		full_mesh_probe_meas = {}
 		for src, m in parsed_probe_measurements['meas'].items():
-			for dst in m:
-				try:
-					# This measurement is a measurement from a probe to a probe, keep
-					probe_24s[src]
-					probe_24s[dst]
-					try:
-						full_mesh_probe_meas[src]
-					except KeyError:
-						full_mesh_probe_meas[src] = {}
-					full_mesh_probe_meas[src][dst] = m[dst]					
-				except KeyError:
-					pass
+			for dst, rtts in m.items():
+				# Only process if we have valid locations for both source and destination
+				if src in address_to_loc and dst in address_to_loc:
+					
+					# Calculate the geographic distance
+					dist_km = get_distance(address_to_loc[src], address_to_loc[dst])
+					
+					# Speed of light in fiber is approx 100km per 1ms
+					min_possible_rtt_ms = dist_km / 100.0 
+					
+					# Filter out any measurements that violate physics
+					valid_rtts = [rtt for rtt in rtts if rtt >= min_possible_rtt_ms]
+					
+					if valid_rtts:
+						if src not in full_mesh_probe_meas:
+							full_mesh_probe_meas[src] = {}
+						full_mesh_probe_meas[src][dst] = valid_rtts					
 
 		return {
-			'address_to_loc': {convert_32_to_24(probe['address_v4']): (probe['latitude'], probe['longitude']) for probe in probe_metadata.values() if (probe['address_v4'] is not None and probe['latitude'] is not None and probe['longitude'] is not None)},
+			'address_to_loc': address_to_loc,
 			'loc_loc_meas': full_mesh_probe_meas,
 		}
 
@@ -140,7 +175,7 @@ class RipeAtlasPipeline:
 	def export_latest_measurements(self):
 		## given parsed dumps, export src -> dst -> latency
 		self.execute()
-		probe_metadata_obj = RipeAtlasProbePipeline(start_date="2026-01-01", end_date="2026-01-31")
+		probe_metadata_obj = RipeAtlasProbePipeline(start_date="2026-02-01", end_date="2026-02-28")
 		probe_metadata = probe_metadata_obj.export_latest_probes()
 		export = {
 			"meas": {},
@@ -168,7 +203,7 @@ class RipeAtlasPipeline:
 	def execute(self):
 		### Pulls hourly dumps from ripe atlas, 
 		## does some basic parsing to make them smaller
-		targets = self._get_hourly_targets()[0:4]
+		targets = self._get_hourly_targets()
 		raw_files = []
 		
 		print(f"--- Phase 1: Downloading {len(targets)} hourly chunks in parallel ---")
@@ -191,8 +226,8 @@ class RipeAtlasPipeline:
 if __name__ == "__main__":
 	# Test a single recent day to verify the hourly fetching logic
 	pipeline = RipeAtlasPipeline(
-		start_date="2026-01-24", 
-		end_date="2026-01-24", 
+		start_date="2026-02-24", 
+		end_date="2026-02-24", 
 		max_workers=6 
 	)
 	pipeline.execute()

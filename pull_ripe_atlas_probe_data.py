@@ -171,8 +171,8 @@ class RipeAtlasProbePipeline:
 if __name__ == "__main__":
 	# Test a few days from October to get the probe layouts for your ping data
 	pipeline = RipeAtlasProbePipeline(
-		start_date="2026-01-01", 
-		end_date="2026-01-31", 
+		start_date="2026-02-01", 
+		end_date="2026-02-28", 
 		max_workers=4 
 	)
 	pipeline.execute()

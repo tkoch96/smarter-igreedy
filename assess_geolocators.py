@@ -12,7 +12,7 @@ from plot_results import *
 class Geolocator_Comparator:
 	def __init__(self):
 		self.geolocators = [Perfect_Geolocator(), Random_Geolocator(), Iterative_Greedy_Geolocator()]
-		self.measurement_converter_mode = 'nearest_neighbor' # setting this to 'great_circle_overlap_centroid' really hurts performance, why?
+		self.measurement_converter_mode = 'great_circle_overlap_centroid' # setting this to 'great_circle_overlap_centroid' really hurts performance, why?
 		self.target_data = None
 		self.errors = {}
 
@@ -20,7 +20,7 @@ class Geolocator_Comparator:
 		## loads all measurements from ripe atlas probes, and information about those probes
 		cache_fn = os.path.join(CACHE_DIR, 'cached_target_data.pkl')
 		if not os.path.exists(cache_fn):
-			rap = RipeAtlasPipeline(start_date="2026-01-24", end_date="2026-01-24")
+			rap = RipeAtlasPipeline(start_date="2026-02-24", end_date="2026-02-24")
 			rap.execute()
 			self.target_data = rap.load_parsed_target_data()
 			pickle.dump(self.target_data, open(cache_fn, 'wb'))
@@ -75,7 +75,10 @@ class Geolocator_Comparator:
 
 		return estimated_locations
 
-	def run(self, min_budget=100, max_budget=2000, step=100):
+	def do_cache(self, geolocator):
+		return {'smart_perfect': True, 'random': True}.get(geolocator.name, False)
+
+	def run(self, min_budget=100, max_budget=5000, step=100):
 		self.load_target_measurement_data()
 		
 		address_to_loc = self.target_data.get('address_to_loc', {})
@@ -88,11 +91,16 @@ class Geolocator_Comparator:
 
 		for geolocator in self.geolocators:
 			print(f"\n--- Running {geolocator.name} ---")
+			
+			cache_fn = os.path.join(CACHE_DIR, f"cached_results_{geolocator.name}_{self.measurement_converter_mode}.pkl")
+			
+			if os.path.exists(cache_fn) and self.do_cache(geolocator):
+				self.plot_data[geolocator.name] = pickle.load(open(cache_fn, 'rb'))
+				continue
+			
 			geolocator.set_data(self.target_data)
 			geolocator.solve()
 			
-			
-			# Initialize data storage for this specific geolocator
 			self.plot_data[geolocator.name] = {'budgets': [], 'errors': []}
 			
 			for budget in range(min_budget, max_budget + 1, step):
@@ -121,10 +129,11 @@ class Geolocator_Comparator:
 					# Store the results
 					self.plot_data[geolocator.name]['budgets'].append(budget)
 					self.plot_data[geolocator.name]['errors'].append(avg_error)
+			if self.do_cache(geolocator):
+				pickle.dump(self.plot_data[geolocator.name], open(cache_fn, 'wb'))
 
-		# Call the plotting function after all geolocators have run
+		# Call the plotting function after all geolocators have run (or loaded)
 		plot_error_over_budget(self.plot_data, os.path.join(FIG_DIR, "geolocator_results.pdf"))
-
 
 if __name__ == "__main__":
 	gc = Geolocator_Comparator()
