@@ -26,6 +26,9 @@ class Geolocator_Comparator:
 			pickle.dump(self.target_data, open(cache_fn, 'wb'))
 		else:
 			self.target_data = pickle.load(open(cache_fn, 'rb'))
+			for src in self.target_data['loc_loc_meas']:
+				for dst in self.target_data['loc_loc_meas'][src]:
+					self.target_data['loc_loc_meas'][src][dst] = [self.target_data['loc_loc_meas'][src][dst]]
 
 	def convert_measurements_to_locations(self, measurements):
 		estimated_locations = {}
