@@ -193,8 +193,12 @@ class RipeAtlasPipeline:
 
 		return export
 
-	def load_parsed_target_data(self):
-		"""Filters the dataset against physical limitations directly from disk to save RAM."""
+	def load_parsed_target_data(self, mesh_coverage_ratio=0.8, full_mesh_probe_meas={}):
+		"""
+		Filters the dataset against physical limitations directly from disk to save RAM,
+		and applies an iterative pruning filter to extract a highly dense, bi-directional mesh.
+		"""
+		print("Mesh coverage ratio = {}".format(mesh_coverage_ratio))
 		# Ensure pipeline has run before trying to load data
 		self.execute()
 		print("Loading target data...")
@@ -207,47 +211,111 @@ class RipeAtlasPipeline:
 				probe.get('longitude') is not None)
 		}
 
-		full_mesh_probe_meas = {}
 		min_rtt_cache = {} # Cache distance math to save CPU cycles
 
-		# Read summary files one by one, keeping memory footprint tiny
-		for fn in tqdm.tqdm(glob.glob(os.path.join(self.parsed_dir, "*_summary.json")), desc="Looking through jsons..."):
-			with open(fn, 'r') as f:
-				hourly_summary = json.load(f)
-				
-				for src, dst_dict in hourly_summary.items():
-					# Skip immediately if we don't have location data
-					if src not in address_to_loc:
-						continue
-						
-					for dst, rtts in dst_dict.items():
-						if dst not in address_to_loc:
+		if len(full_mesh_probe_meas) == 0:
+			fni = 0
+			for fn in tqdm.tqdm(glob.glob(os.path.join(self.parsed_dir, "*_summary.json")), desc="Looking through jsons..."):
+				with open(fn, 'r') as f:
+					hourly_summary = json.load(f)
+					
+					for src, dst_dict in hourly_summary.items():
+						if src not in address_to_loc:
 							continue
 							
-						# Use cached minimum RTT or calculate it if it's our first time seeing this pair
-						cache_key = (src, dst)
-						if cache_key not in min_rtt_cache:
-							dist_km = get_distance(address_to_loc[src], address_to_loc[dst])
-							# Speed of light in fiber is approx 100km per 1ms
-							min_rtt_cache[cache_key] = dist_km / 100.0
+						for dst, rtts in dst_dict.items():
+							if dst not in address_to_loc:
+								continue
+								
+							cache_key = (src, dst)
+							if cache_key not in min_rtt_cache:
+								dist_km = get_distance(address_to_loc[src], address_to_loc[dst])
+								min_rtt_cache[cache_key] = dist_km / 100.0
+								
+							min_possible_rtt_ms = min_rtt_cache[cache_key]
+							valid_rtts = [rtt for rtt in rtts if rtt >= min_possible_rtt_ms]
 							
-						min_possible_rtt_ms = min_rtt_cache[cache_key]
-						
-						# Filter out any measurements that violate physics
-						valid_rtts = [rtt for rtt in rtts if rtt >= min_possible_rtt_ms]
-						
-						# Only store data we are actually keeping
-						if valid_rtts:
-							if src not in full_mesh_probe_meas:
-								full_mesh_probe_meas[src] = {}
-							if dst not in full_mesh_probe_meas[src]:
-								full_mesh_probe_meas[src][dst] = np.min(valid_rtts)
-							else:
-								full_mesh_probe_meas[src][dst] = np.min(valid_rtts + [full_mesh_probe_meas[src][dst]])
+							if valid_rtts:
+								if src not in full_mesh_probe_meas:
+									full_mesh_probe_meas[src] = {}
+								
+								if dst not in full_mesh_probe_meas[src]:
+									full_mesh_probe_meas[src][dst] = np.min(valid_rtts)
+								else:
+									full_mesh_probe_meas[src][dst] = np.min([np.min(valid_rtts), full_mesh_probe_meas[src][dst]])
+				fni += 1
+				if fni == 10:
+					break
+
+		# 1. Start with the universe of all unique nodes (both srcs and dsts)
+		valid_nodes = set(full_mesh_probe_meas.keys())
+		for src, dsts in full_mesh_probe_meas.items():
+			valid_nodes.update(dsts.keys())
+			
+		print(f"\nStarting iterative dense mesh filtering with {len(valid_nodes)} total unique VPs...")
+
+		# 2. Iteratively prune nodes that don't meet the f*100% threshold
+		print("Starting pruning with {} nodes".format(len(valid_nodes)))
+		iteration = 1
+		while True:
+            # We subtract 1 because a node shouldn't count itself in the mesh coverage
+			current_node_count = len(valid_nodes)
+			if current_node_count <= 1:
+				break # The mesh collapsed entirely
+
+			target_degree = mesh_coverage_ratio * (current_node_count - 1)
+			nodes_to_remove = set()
+
+			# Tally in-degrees and out-degrees strictly within the *surviving* pool of nodes
+			out_degrees = {node: 0 for node in valid_nodes}
+			in_degrees = {node: 0 for node in valid_nodes}
+
+			for src in valid_nodes:
+				if src in full_mesh_probe_meas:
+					for dst in full_mesh_probe_meas[src]:
+						if dst in valid_nodes and src != dst:
+							out_degrees[src] += 1
+							in_degrees[dst] += 1
+
+			# Find nodes failing to meet the threshold in EITHER direction
+			for node in valid_nodes:
+				if out_degrees[node] < target_degree or in_degrees[node] < target_degree:
+					nodes_to_remove.add(node)
+
+			if not nodes_to_remove:
+				break # Convergence reached! 
+
+			valid_nodes -= nodes_to_remove
+			iteration += 1
+		print("Finished with {} nodes".format(len(valid_nodes)))
+		if len(valid_nodes) < 500:
+			## if we have too few measurements, re-search with a lighter restriction
+			return self.load_parsed_target_data(mesh_coverage_ratio=0.9*mesh_coverage_ratio, 
+				full_mesh_probe_meas=full_mesh_probe_meas)
+
+		# 3. Rebuild the measurement dictionary with only the surviving mesh
+		dense_mesh_meas = {}
+		for src in valid_nodes:
+			if src in full_mesh_probe_meas:
+				kept_dsts = {dst: rtt for dst, rtt in full_mesh_probe_meas[src].items() if dst in valid_nodes}
+				if kept_dsts:
+					dense_mesh_meas[src] = kept_dsts
+
+		print(f"\n--- Mesh Filtering Applied ---")
+		print(f"Convergence reached in {iteration} iterations.")
+		print(f"Coverage threshold required: {mesh_coverage_ratio * 100}% of remaining pool.")
+		print(f"Final mesh size: {len(valid_nodes)} highly connected VPs.")
+		
+		if len(valid_nodes) > 1:
+			total_possible_edges = len(valid_nodes) * (len(valid_nodes) - 1)
+			actual_edges = sum(len(dsts) for dsts in dense_mesh_meas.values())
+			print(f"Final mesh density: {(actual_edges / total_possible_edges) * 100:.1f}%\n")
+		else:
+			print("WARNING: The mesh collapsed completely. Try lowering the mesh_coverage_ratio.\n")
 
 		return {
-			'address_to_loc': address_to_loc,
-			'loc_loc_meas': full_mesh_probe_meas,
+			'address_to_loc': {k: v for k, v in address_to_loc.items() if k in valid_nodes},
+			'loc_loc_meas': dense_mesh_meas,
 		}
 
 	def execute(self):

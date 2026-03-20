@@ -1,4 +1,4 @@
-import geopy.distance, copy, tqdm
+import copy, tqdm
 from utils import *
 from feasible_region_maintainer import FeasibleRegion
 
@@ -8,6 +8,9 @@ class Perfect_Geolocator:
 		self.name = "smart_perfect"
 		self.data = None
 		self.measurement_order = []
+
+		## number of things to consider per target as a measurement to. Limits complexity to O(N)
+		self.n_srcs_to_consider = 50
 
 	def set_data(self, data):
 		self.data = data
@@ -35,7 +38,8 @@ class Perfect_Geolocator:
 			# Initialize the region for this target
 			current_region = FeasibleRegion(target_id=dst)
 			selected_srcs = []
-			remaining_srcs = srcs[:] # List of (vp_src, min_rtt)
+			## keep 
+			remaining_srcs = sorted(srcs, key=lambda x: x[1])[:self.n_srcs_to_consider] # List of (vp_src, min_rtt)
 
 			while remaining_srcs:
 				best_idx = -1

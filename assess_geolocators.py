@@ -81,7 +81,7 @@ class Geolocator_Comparator:
 	def do_cache(self, geolocator):
 		return {'smart_perfect': True, 'random': True}.get(geolocator.name, False)
 
-	def run(self, min_budget=100, max_budget=5000, step=100):
+	def run(self, min_budget=100, max_budget=2500, step=100):
 		self.load_target_measurement_data()
 		
 		address_to_loc = self.target_data.get('address_to_loc', {})
@@ -143,10 +143,11 @@ if __name__ == "__main__":
 	
 	# 1. Load the data into gc.target_data
 	gc.load_target_measurement_data()
+	plot_ping_count_cdf(gc.target_data)
 	
-	# 2. Call the diagnostic plot to see what your dataset actually looks like
-	print("Generating Latency vs. Distance diagnostic plot...")
-	plot_latency_vs_distance(gc.target_data, os.path.join(FIG_DIR, "latency_vs_distance.pdf"))
+	# # 2. Call the diagnostic plot to see what your dataset actually looks like
+	# print("Generating Latency vs. Distance diagnostic plot...")
+	# plot_latency_vs_distance(gc.target_data, os.path.join(FIG_DIR, "latency_vs_distance.pdf"))
 	
 	# 3. Run your geolocator simulation as normal
 	gc.run()
