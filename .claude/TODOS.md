@@ -6,17 +6,49 @@ maintain a "done" list here.
 
 ---
 
+## ⏭️ Immediate (see `.claude/HANDOFF_next_steps.md` for full context)
+
+### 0a. Additive model under greedy selection
+
+The additive src/dst estimator currently runs only under a shared RANDOM
+measurement order (`run_additive_budget_seed`) because it needs per-source
+state shared across targets, which per-target `FeasibleRegion`s can't
+hold. Integrate it into `Iterative_Greedy_Geolocator` via a shared model
+object, use σ̂_dst in the utility (fixes the measured budget-sink), then
+add `greedy_additive` lines to both budget figures.
+(Note: `error_over_measurements_adaptive.pdf` already uses greedy
+selection — only the new additive figure is random-order, as a stopgap.)
+
+### 0b. Additive methodology on the real mesh
+
+Run the additive estimator on RIPE data via `assess_geolocators`
+(recommended: a cross-target `'additive_em'` converter mode) against
+NN / per-target-em / em_asymmetric. Reference numbers, replication
+caveats and pitfalls are in the handoff.
+
+---
+
 ## 🔴 High priority
 
 ### 1. Per-VP extension of the EM framework + real-data performance
 
-`FeasibleRegion(mode='em_gaussian')` fits a per-TARGET (μ, σ) online. Real
-RIPE Atlas data needs the per-VP version: overhead is VP-dependent and
-scales with distance (mean 67ms, ∝ d^0.67), so the next steps are:
+`FeasibleRegion(mode='em_gaussian')` fits a per-TARGET (μ, σ) online. The
+ADDITIVE two-way model rtt = SOL + X_src + X_dst (X_n ~ N(μ_n, σ_n²)) is
+now implemented and validated on synthetic data
+(`probabilistic_helpers.fit_additive_params` +
+`tests/test_e2e_additive_em.py`): it identifies pathological destinations
+via σ̂_dst 100% of the time (the honest "stop wasting pings here" signal
+for selection), and halves the per-target EM's location error (512 vs
+1149 km mean). Key implementation lesson recorded in the test: run the
+PARAMETER step before the location step each EM iteration, otherwise a
+pathological target's offset gets absorbed into distance (a wrong
+self-consistent fixed point; μ̂_t collapse).
 
-1. Per-VP affine model `rtt ≈ a_v × d + b_v`, fitted via the same
-   EM/shrinkage machinery but pooling residuals per VP across targets
-   (honest: uses estimated target locations, never VP-to-VP distances).
+Next steps:
+
+1. Integrate the additive model into the greedy (shared per-source state
+   across targets — this is the LatencyModel interface, see #4 below) and
+   use σ̂_dst in the utility to fix the budget-sink pathology.
 2. Fix the EM × robust-noise interaction: under heavy detour
    contamination, EM's μ-fit absorbs some detour bias, so robust noise +
    fixed slope currently beats robust noise + EM (asymmetric: 213 vs
@@ -48,13 +80,26 @@ with — probably the same overlap estimate it optimises during selection.
 intended experiment, not a confound — see "The two phases" in
 `SIMULATION_ENVIRONMENT.md`.)
 
-### 3. Greedy still doesn't beat random
+### 3. Greedy beats random on synthetic — port the win to the real mesh
 
-The selection algorithm is the main open research problem. Now that the
-estimation stack is in decent shape (slope model, km-consistent region
-sizes, em_gaussian), run the greedy sweep with `region_mode=GAUSSIAN` /
-`'em_gaussian'` and compare against random ordering under the same
-estimator to isolate selection quality.
+The old headline ("greedy doesn't beat random") is RESOLVED on synthetic
+multi-target budget allocation (`TestMultiTargetBudgetAllocation`,
+5 targets / 10 VPs / 20 seeds) after making `BASICALLY_GEOLOCATED` a
+deprioritisation rather than a hard stop (leftover budget flows to the
+least-certain "done" targets). Medians: greedy_em beats random+NN at every
+budget (k=10: 893 vs 1214; k=25: 437 vs 699 — random's FULL-budget
+accuracy at half budget; k=50: 174 vs 477, winning every seed) and
+statistically ties the parameter-oracle (170). greedy_hard remains worse
+than random at mid-budget — estimation quality gates selection quality.
+
+Remaining:
+1. Selection utility should use the region's own model
+   (`region.expected_rtt_ms`) instead of the separate AdaptiveRTTModel
+   (see #4) — for em regions the fitted μ̂ should drive choices.
+2. Plumb `noise_model` through the greedy constructor (asymmetric noise
+   for real data).
+3. Port the comparison to the real mesh via assess_geolocators (structure
+   to be agreed before editing — see session history).
 
 ---
 
@@ -95,23 +140,18 @@ already-pruned data. Should return a new dict or deepcopy.
 
 ## 🟢 Low priority / ergonomics
 
-### 8. Hardcoded debug target
-
-`'85.93.215.0'` appears in `feasible_region_maintainer.py`. Replace with an
-env var or constructor argument.
-
-### 9. `get_distance` dead code in `utils.py`
+### 8. `get_distance` dead code in `utils.py`
 
 Everything after `return fast_haversine(...)` is unreachable. Delete it.
 
-### 10. Data coverage
+### 9. Data coverage
 
 The dense-mesh filter requires ≥80% bidirectional coverage. Some RTT pairs
 are genuinely missing (probe offline). Consider merging more than 10 hourly
 files (current `fni == 10` early-exit) and symmetric imputation
 RTT(A→B) ≈ RTT(B→A).
 
-### 11. Compute scaling
+### 10. Compute scaling
 
 `_update_best_vp_for_target` fans out one `ProcessPoolExecutor` job per VP
 per target. With 900×900 = 810k tasks this is very slow locally. Use

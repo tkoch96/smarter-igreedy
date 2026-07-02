@@ -5,14 +5,26 @@ from perfect_geolocator import Perfect_Geolocator
 from pull_ripe_atlas_measurement_data import RipeAtlasPipeline
 from random_geolocator import Random_Geolocator
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
-from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN
+from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN, EM_GAUSSIAN
 from probabilistic_helpers import GLOBAL_SIGMA_MS
 
 from plot_results import *
 
 class Geolocator_Comparator:
 	def __init__(self):
-		self.geolocators = [Iterative_Greedy_Geolocator(), Perfect_Geolocator(), Random_Geolocator()]
+		# Greedy variants carry their own estimates (get_current_estimates);
+		# random and the selection-oracle are scored through the converter
+		# (nearest_neighbor by default).
+		self.geolocators = [
+			Iterative_Greedy_Geolocator(region_mode=GAUSSIAN, region_slope=1.3,
+			                            name='greedy_gaussian_1.3'),
+			Iterative_Greedy_Geolocator(region_mode=GAUSSIAN, region_slope=1.05,
+			                            name='greedy_gaussian_1.05'),
+			Iterative_Greedy_Geolocator(region_mode=EM_GAUSSIAN,
+			                            name='greedy_em'),
+			Perfect_Geolocator(),
+			Random_Geolocator(),
+		]
 		self.measurement_converter_mode = 'nearest_neighbor'
 		self.target_data = None
 		self.errors = {}
@@ -105,7 +117,7 @@ class Geolocator_Comparator:
 	def do_cache(self, geolocator):
 		return {'smart_perfect': True, 'random': True}.get(geolocator.name, False)
 
-	def run(self, min_budget=100, max_budget=2500, step=100):
+	def run(self, min_budget=100, max_budget=2500, step=100, n_subsample=100):
 		## Two-phase comparison, analogous to a train/test split:
 		##   (a) selection  - geolocator.measurements(budget) decides which pings
 		##       to spend, under realistic information limits (no ground truth;
@@ -120,7 +132,7 @@ class Geolocator_Comparator:
 		## is the dumb whole-system baseline, greedy+overlap is ours.
 		self.load_target_measurement_data()
 
-		self.get_random_subsample()
+		self.get_random_subsample(n=n_subsample)
 		
 		address_to_loc = self.target_data.get('address_to_loc', {})
 		all_targets = set()
@@ -133,7 +145,9 @@ class Geolocator_Comparator:
 		for geolocator in self.geolocators:
 			print(f"\n--- Running {geolocator.name} ---")
 			
-			cache_fn = os.path.join(CACHE_DIR, f"cached_results_{geolocator.name}_{self.measurement_converter_mode}.pkl")
+			# n_subsample is part of the cache key: results from different
+			# subsample sizes are not interchangeable.
+			cache_fn = os.path.join(CACHE_DIR, f"cached_results_{geolocator.name}_{self.measurement_converter_mode}_n{n_subsample}.pkl")
 			
 			if os.path.exists(cache_fn) and self.do_cache(geolocator):
 				self.plot_data[geolocator.name] = pickle.load(open(cache_fn, 'rb'))

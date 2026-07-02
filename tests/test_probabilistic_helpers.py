@@ -504,3 +504,55 @@ class TestResidualNll:
     def test_unknown_model_raises(self):
         with pytest.raises(ValueError):
             residual_nll(1.0, 1.0, 'cauchy')
+
+
+# ---------------------------------------------------------------------------
+# fit_additive_params — two-way overhead decomposition
+# ---------------------------------------------------------------------------
+
+from probabilistic_helpers import fit_additive_params
+
+
+class TestFitAdditiveParams:
+    def _synthetic(self, seed=0, n_src=8, n_dst=6, reps=4):
+        rng = np.random.default_rng(seed)
+        mu_s = {f's{i}': rng.uniform(1, 12) for i in range(n_src)}
+        mu_t = {f't{j}': rng.uniform(1, 12) for j in range(n_dst)}
+        sig_s = {k: rng.uniform(0.3, 1.5) for k in mu_s}
+        sig_t = {k: rng.uniform(0.3, 1.5) for k in mu_t}
+        sig_t['t0'] = 20.0   # one pathological destination
+        residuals = {
+            (s, t): [float(rng.normal(mu_s[s], sig_s[s])
+                           + rng.normal(mu_t[t], sig_t[t]))
+                     for _ in range(reps)]
+            for s in mu_s for t in mu_t
+        }
+        return mu_s, sig_s, mu_t, sig_t, residuals
+
+    def test_sums_recovered(self):
+        """Only μ_s + μ_t is identifiable (gauge freedom) — the pairwise
+        sums must match, whatever the split."""
+        mu_s, _, mu_t, _, residuals = self._synthetic()
+        fit_ms, _, fit_mt, _ = fit_additive_params(residuals)
+        errs = [abs((fit_ms[s] + fit_mt[t]) - (mu_s[s] + mu_t[t]))
+                for s in mu_s for t in mu_t]
+        assert float(np.median(errs)) < 1.5   # ms
+
+    def test_centered_offsets_recovered(self):
+        mu_s, _, mu_t, _, residuals = self._synthetic()
+        fit_ms, _, _, _ = fit_additive_params(residuals)
+        true = np.array([mu_s[s] for s in sorted(mu_s)])
+        fit = np.array([fit_ms[s] for s in sorted(mu_s)])
+        r = np.corrcoef(true - true.mean(), fit - fit.mean())[0, 1]
+        assert r > 0.9
+
+    def test_pathological_destination_gets_top_variance(self):
+        _, _, _, sig_t, residuals = self._synthetic()
+        _, _, _, fit_vt = fit_additive_params(residuals)
+        assert max(fit_vt, key=fit_vt.get) == 't0'
+
+    def test_variances_positive(self):
+        _, _, _, _, residuals = self._synthetic(seed=3)
+        _, vs, _, vt = fit_additive_params(residuals)
+        assert all(v > 0 for v in vs.values())
+        assert all(v > 0 for v in vt.values())

@@ -732,50 +732,39 @@ class TestNoiseModels:
 
 class TestGenerateConvergenceFigure:
     """
-    tests/region_convergence.pdf — rows = methods, columns = measurement
-    counts, with a +70ms detour injected as measurement #4.  The assertions
-    pin the four stories the figure tells (deterministic scenario):
+    tests/region_convergence.pdf — the 1:1 spatial companion to
+    error_over_measurements_adaptive.pdf: same five multi-target strategies
+    (rows, same order/colours as the curves), same data model, one
+    representative seed (15); each column is a point on the curves' x-axis.
 
-      hard-circle : detour circle is harmless (contains everything);
-                    the lens keeps shrinking → converges.
-      gaussian    : quadratic loss chases the detour and NEVER recovers.
-      asymmetric  : dragged briefly at k=4, then snaps back to the truth.
-      em_gaussian : absorbs the detour into an inflated fitted μ̂ → stuck.
+    The assertions pin the seed's story, which mirrors the 20-seed medians:
+    greedy_em beats random at mid and full budget (BASICALLY_GEOLOCATED
+    deprioritises done targets instead of hard-stopping, so leftover budget
+    keeps refining), and the oracle dominates.
     """
 
     @pytest.fixture(scope='class')
-    def trajectories(self):
+    def run(self):
         sys.path.insert(0, os.path.dirname(__file__))
-        from plot_region_convergence import run_method, METHODS, TARGET
-        out = {}
-        for label, kwargs in METHODS:
-            snaps = run_method(kwargs)
-            out[label] = {
-                k: {'err': get_distance(s['location'], TARGET),
-                    'slope': s['slope']}
-                for k, s in snaps.items()
-            }
-        return out
+        from plot_region_convergence import SEED
+        from test_e2e_adaptive_em import run_multi_seed
+        return run_multi_seed(SEED)
 
-    def test_hard_circle_converges_despite_detour(self, trajectories):
-        assert trajectories['hard-circle'][10]['err'] < 300.0
+    def test_em_greedy_beats_random_at_mid_budget(self, run):
+        assert run['errors']['greedy_em'][24] < run['errors']['random_nn'][24]
 
-    def test_gaussian_never_recovers_from_detour(self, trajectories):
-        assert trajectories['gaussian'][10]['err'] > 800.0
+    def test_em_greedy_beats_random_at_full_budget(self, run):
+        assert run['errors']['greedy_em'][49] < run['errors']['random_nn'][49]
 
-    def test_asymmetric_recovers_from_detour(self, trajectories):
-        t = trajectories['asymmetric noise']
-        assert t[4]['err'] > 1000.0     # briefly dragged when detour lands
-        assert t[10]['err'] < 300.0     # then snaps back to the truth
-        assert t[10]['err'] < t[4]['err'] / 5.0
+    def test_leftover_budget_keeps_improving_greedy(self, run):
+        """The point of budget-aware deprioritisation: error keeps falling
+        after every target is past the done-threshold."""
+        assert run['errors']['greedy_em'][49] < 0.8 * run['errors']['greedy_em'][24]
 
-    def test_em_absorbs_detour_into_inflated_slope(self, trajectories):
-        """The EM × contamination interaction (TODOS #1.2), demonstrated:
-        μ_true = 1.4 but the fitted μ̂ inflates well past it to explain the
-        detour, and the estimate stays far off."""
-        t = trajectories['em_gaussian']
-        assert t[10]['slope'] > 1.5
-        assert t[10]['err'] > 800.0
+    def test_oracle_dominates_at_full_budget(self, run):
+        oracle = run['errors']['oracle'][49]
+        for s in ('random_nn', 'greedy_hard', 'greedy_gaussian', 'greedy_em'):
+            assert oracle < run['errors'][s][49]
 
     def test_figure_renders(self):
         sys.path.insert(0, os.path.dirname(__file__))
@@ -783,3 +772,22 @@ class TestGenerateConvergenceFigure:
         path = make_figure(OUT_PATH)
         assert os.path.exists(path)
         assert os.path.getsize(path) > 10_000
+
+
+class TestHaversineDomainSafety:
+    """fast_haversine crashed with a math domain error when float rounding
+    pushed the haversine parameter past 1.0 — near-antipodal pairs do it
+    with valid coordinates, and Nelder-Mead feeds off-globe points to the
+    loss mid-search (killed the 100-probe real-mesh greedy run)."""
+
+    def test_antipodal_points_do_not_raise(self):
+        d = get_distance((0.0, 0.0), (0.0, 180.0))
+        assert 19000 < d < 21000
+        d = get_distance((42.9, 71.4), (-42.9, -108.6))
+        assert 19000 < d < 21000
+
+    def test_off_globe_intermediate_points_do_not_raise(self):
+        """NM explores points like these while optimising the NLL."""
+        for raw in [(223.1, -29.8), (125.7, -17.3), (-100.0, 40.0), (96.6, 0.0)]:
+            d = get_distance(raw, (50.0, 10.0))
+            assert math.isfinite(d) and d >= 0.0

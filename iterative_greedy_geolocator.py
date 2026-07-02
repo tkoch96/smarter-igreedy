@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
 from utils import LatLon, get_distance
-from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, DEFAULT_SLOPE
+from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, DEFAULT_SLOPE, TARGET_OF_INTEREST
 
 DEBUG = False
 
@@ -66,7 +66,13 @@ def default_utility_evaluator(
 	verb: bool,
 ) -> float:
 	if current_size < BASICALLY_GEOLOCATED:
-		return -1000000.0
+		# "Done" targets are deprioritised, not abandoned: the offset ranks
+		# them below every unfinished target, but leftover budget still
+		# flows to the least-certain done target (larger size first) via
+		# its nearest VP. Region size is an optimistic proxy for true
+		# error, so free refinement is never wasted.
+		distance = get_distance(vp_loc, target_region.get_location())
+		return -1000000.0 + current_size + 1.0 / (distance + 1.0)
 
 	expected_rtt = rtt_model_func(vp_loc, target_region, dst)
 
@@ -107,8 +113,11 @@ class Iterative_Greedy_Geolocator:
 		rtt_func: Optional[Callable] = None,
 		region_mode: str = HARD_CIRCLE,
 		region_slope: float = DEFAULT_SLOPE,
+		name: Optional[str] = None,
 	) -> None:
-		self.name = "iterative_greedy"
+		# Distinct names let several differently-configured greedys coexist
+		# in one Geolocator_Comparator run (plot keys / cache filenames).
+		self.name = name or "iterative_greedy"
 		self.data: Optional[TargetData] = None
 		self.vp_locations: dict[str, LatLon] = {}
 		self.debug = DEBUG
@@ -190,13 +199,6 @@ class Iterative_Greedy_Geolocator:
 		try:
 			target_region = self.target_regions[dst]
 		except KeyError:
-			return
-
-		current_size = target_region.get_region_size()
-
-		if current_size <= BASICALLY_GEOLOCATED:
-			if dst in self.best_vp_cache:
-				del self.best_vp_cache[dst]
 			return
 
 		available_srcs = [s for s in self.available_measurements[dst] if s not in self.measurements_used.get(dst, [])]
@@ -282,10 +284,10 @@ class Iterative_Greedy_Geolocator:
 			actual_rtts: list[float] = loc_loc_meas[best_global_src][best_global_dst]
 
 			min_actual_rtt = min(actual_rtts)
-			if best_global_dst == '85.93.215.0':
+			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
 			self.target_regions[best_global_dst].add_measurement(self.vp_locations[best_global_src], min_actual_rtt)
-			if best_global_dst == '85.93.215.0':
+			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
 
 			new_actual_size = self.target_regions[best_global_dst].get_region_size()

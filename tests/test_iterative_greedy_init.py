@@ -232,9 +232,10 @@ class TestRegionModePlumbing:
         every other (min pair: London-NYC), that ball has radius >= ~1450km.
         Localising to 200km would need a VP within ~770km — none exists.
 
-        After exhausting every available ping, no target may be declared
-        geolocated (dropped from the VP cache), and every hard-circle
-        region must report at least the guaranteed-ball bound.
+        After exhausting every available ping, every target must remain in
+        the VP cache (BASICALLY_GEOLOCATED deprioritises rather than
+        removes) and every hard-circle region must report at least the
+        guaranteed-ball bound.
         """
         global_cities = [
             (51.5,  -0.1),    # London

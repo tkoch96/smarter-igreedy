@@ -1,4 +1,5 @@
 import math
+import os
 import numpy as np
 from scipy.optimize import minimize
 from typing import Optional
@@ -14,7 +15,10 @@ from probabilistic_helpers import (
     ProbConstraint,
 )
 
-TARGET_OF_INTEREST = '85.93.215.0'
+# Verbose per-measurement debugging for one target id; disabled unless the
+# env var is set (a hardcoded '85.93.215.0' used to spam real-mesh runs
+# whenever that /24 landed in the subsample).
+TARGET_OF_INTEREST = os.environ.get('FEASIBLE_REGION_DEBUG_TARGET')
 
 EARTH_RADIUS_KM = 6371.0
 

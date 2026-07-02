@@ -8,3 +8,5 @@ tests/error_over_measurements.pdf
 tests/gaussian_vs_hard_circle.pdf
 tests/error_over_measurements_adaptive.pdf
 tests/region_convergence.pdf
+tests/em_edge_vs_mismatch.pdf
+tests/error_over_measurements_additive.pdf

@@ -22,6 +22,10 @@ def fast_haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlambda = math.radians(lon2 - lon1)
 
     a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0)**2
+    # Clamp: float rounding pushes a slightly past [0, 1] for near-antipodal
+    # points, and off-globe latitudes (Nelder-Mead explores them mid-search)
+    # push it further — sqrt would raise a math domain error.
+    a = min(1.0, max(0.0, a))
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 

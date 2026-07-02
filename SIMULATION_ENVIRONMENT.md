@@ -190,6 +190,51 @@ because they extract more information from each RTT by reasoning about geometry.
 
 ---
 
+## The model ladder
+
+The estimation methods form a ladder of increasingly expressive latency
+models; each rung was motivated by a measured failure of the previous one.
+Every claim below is pinned by tests (see `CLAUDE.md` for file names).
+
+1. **Straight SOL** (`rtt ≈ d/100`) — catastrophic on real data (rings
+   placed thousands of km too far) and DIVERGES with more measurements:
+   a wrong model integrates more wrong information.
+2. **Fixed slope** (`rtt ≈ slope × d/100`, DEFAULT_SLOPE = 1.3) — hard
+   circles trade validity against informativeness (a slope-beating
+   measurement empties the intersection); the gaussian keeps the slope
+   soft. Right slope helps; wrong slope still diverges.
+3. **Noise models** — real residuals are one-sided (SOL is a floor) and
+   heavy-tailed (detours). `asymmetric` (steep below the model, linear
+   above) is robust to detours at ~16% clean-data cost; `student_t` is a
+   free symmetric-robustness upgrade. A single 10× detour drags the plain
+   gaussian ~1500 km and the asymmetric ~0 km.
+4. **Per-target EM** (`em_gaussian`) — learns each target's (μ_t, σ_t)
+   online by alternating MAP location with a prior-anchored refit. Beats
+   every fixed slope in proportion to how wrong the fixed slope is
+   (em/gaussian error ratio 0.93 → 0.31 as mismatch grows). Cannot
+   separate "far away" from "badly routed", and σ is inert under a shared
+   per-target value.
+5. **Additive two-way model** (`rtt = SOL + X_src + X_dst`,
+   X ~ N(μ_node, σ_node²)) — per-source AND per-destination overheads,
+   fitted by pooling residuals across the mesh (honest: uses estimated
+   locations only). The only model class that beats nearest-neighbour
+   under additive ground truth, and σ̂_dst identifies pathological
+   destinations 100% of the time — the signal selection needs to stop
+   sinking budget into hopeless targets. NOT yet integrated into the
+   greedy (per-source state is shared across targets; see
+   `.claude/HANDOFF_next_steps.md`).
+
+Selection findings so far (multi-target shared budget): greedy allocation
+beats random ordering decisively in the early-budget regime and, with the
+em estimator underneath, at every budget on synthetic data (statistically
+tying the parameter-oracle). Estimation quality gates selection quality —
+the same greedy loop on hard-circle regions chooses worse than random.
+On the real mesh, the measured failure mode is a budget SINK: over-promising
+utilities concentrate pings on hopeless targets (one target absorbed 52
+pings while the median got 3); the additive σ̂_dst is the planned fix.
+
+---
+
 ## Real-data limitations
 
 The RIPE Atlas data has mean routing overhead ~67ms (median 53ms). The assumed

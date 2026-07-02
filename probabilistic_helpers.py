@@ -332,3 +332,91 @@ def posterior_mean_grid(
     lat_est = float(np.sum(weights * LATS))
     lon_est = float(np.sum(weights * LONS))
     return lat_est, lon_est
+
+
+# ---------------------------------------------------------------------------
+# Additive two-way overhead model:  rtt = SOL + X_src + X_dst
+# ---------------------------------------------------------------------------
+# X_src ~ N(mu_src, sigma_src²), X_dst ~ N(mu_dst, sigma_dst²) — per-node
+# overhead means AND per-node noise. The sigma_dst of a destination with
+# pathological routing grows large, which is the honest "stop spending pings
+# here" signal a selection algorithm can consume.
+#
+# Identifiability note: only the sums mu_src + mu_dst are observable (gauge
+# freedom: add c to every source, subtract from every destination). The
+# symmetric priors anchor the split; consumers should rely on predictions
+# and CENTERED offsets, which are gauge-invariant.
+
+ADDITIVE_PRIOR_MU_MS = 5.0        # prior per-node overhead mean
+ADDITIVE_PRIOR_VAR_MS2 = 25.0     # prior per-node noise variance (5ms)²
+ADDITIVE_PRIOR_STRENGTH = 2.0     # pseudo-observations anchoring each node
+ADDITIVE_VAR_FLOOR_MS2 = 0.04     # (0.2ms)² — don't let variances collapse
+
+
+def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
+    """
+    Fit the two-way additive overhead model from SOL residuals.
+
+    residuals_by_pair: {(src, dst): [residual_ms, ...]} where
+                       residual = observed rtt − d(src, dst_estimate)/100.
+                       (Distances come from ESTIMATED destination locations —
+                       honest; no ground truth needed.)
+
+    Returns (mu_src, var_src, mu_dst, var_dst) — dicts keyed by node name.
+    Means via alternating shrunk averages (two-way ANOVA style); variances
+    via moment matching on the de-meaned residuals, split alternately
+    between the source and destination of each pair.
+    """
+    srcs = sorted({s for s, _ in residuals_by_pair})
+    dsts = sorted({t for _, t in residuals_by_pair})
+    mu_s = {s: ADDITIVE_PRIOR_MU_MS for s in srcs}
+    mu_t = {t: ADDITIVE_PRIOR_MU_MS for t in dsts}
+
+    by_src = {s: [(t, rs) for (s2, t), rs in residuals_by_pair.items() if s2 == s]
+              for s in srcs}
+    by_dst = {t: [(s, rs) for (s, t2), rs in residuals_by_pair.items() if t2 == t]
+              for t in dsts}
+
+    for _ in range(n_iters):
+        for t in dsts:
+            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_MU_MS
+            den = ADDITIVE_PRIOR_STRENGTH
+            for s, rs in by_dst[t]:
+                for r in rs:
+                    num += r - mu_s[s]
+                    den += 1.0
+            mu_t[t] = max(0.0, num / den)
+        for s in srcs:
+            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_MU_MS
+            den = ADDITIVE_PRIOR_STRENGTH
+            for t, rs in by_src[s]:
+                for r in rs:
+                    num += r - mu_t[t]
+                    den += 1.0
+            mu_s[s] = max(0.0, num / den)
+
+    # Per-pair excess variance of the de-meaned residuals
+    pair_var = {}
+    for (s, t), rs in residuals_by_pair.items():
+        e = [r - mu_s[s] - mu_t[t] for r in rs]
+        pair_var[(s, t)] = sum(x * x for x in e) / len(e)
+
+    var_s = {s: ADDITIVE_PRIOR_VAR_MS2 for s in srcs}
+    var_t = {t: ADDITIVE_PRIOR_VAR_MS2 for t in dsts}
+    for _ in range(n_iters):
+        for t in dsts:
+            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_VAR_MS2
+            den = ADDITIVE_PRIOR_STRENGTH
+            for s, _ in by_dst[t]:
+                num += max(0.0, pair_var[(s, t)] - var_s[s])
+                den += 1.0
+            var_t[t] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
+        for s in srcs:
+            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_VAR_MS2
+            den = ADDITIVE_PRIOR_STRENGTH
+            for t, _ in by_src[s]:
+                num += max(0.0, pair_var[(s, t)] - var_t[t])
+                den += 1.0
+            var_s[s] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
+
+    return mu_s, var_s, mu_t, var_t

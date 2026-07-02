@@ -7,10 +7,12 @@ RIPE Atlas probes to unknown-location targets, how accurately can you locate
 the targets — and which probe-selection strategy spends the budget best?
 
 **Read `SIMULATION_ENVIRONMENT.md` first** — it explains the research problem,
-the information boundary (what's allowed during inference), and why several
-intuitive approaches are considered cheating.
+the information boundary (what's allowed during inference), why several
+intuitive approaches are considered cheating, and the model ladder (how each
+estimation idea motivated the next).
 
 Entry point: `assess_geolocators.py` → `Geolocator_Comparator.run()`.
+Current work: `.claude/HANDOFF_next_steps.md`; open items: `.claude/TODOS.md`.
 
 ---
 
@@ -173,9 +175,26 @@ intentionally use dumb nearest-neighbor estimation, while the greedy
 supplies its own overlap-based estimates via `get_current_estimates()`
 (bypassing the converter entirely).
 
-Sweeps budget from 100 to 2500 in steps of 100. At each budget, estimates
-locations and computes great-circle error vs known probe locations. Missing
-estimates incur a 10,000 km penalty.
+Sweeps budget from 100 to 2500 in steps of 100 (`run()` also takes
+`n_subsample=` — the probe-count knob, threaded to `get_random_subsample`).
+At each budget, estimates locations and computes great-circle error vs known
+probe locations. Missing estimates incur a 10,000 km penalty.
+
+The default `self.geolocators` list compares three greedy variants
+(gaussian slope 1.3 / 1.05 / em_gaussian, distinguishable via the greedy's
+`name=` param) against `Perfect_Geolocator` and `Random_Geolocator`.
+Result caches include the subsample size in the filename
+(`cached_results_<name>_<mode>_n<N>.pkl`) — results from different
+subsample sizes are not interchangeable (a stale-cache bug once mixed
+20-probe baselines into a 100-probe figure).
+
+Real-mesh findings at n=100 (means; medians are far kinder — isolated
+targets dominate means): greedy_em ~2,850 km from 2 pings/target onward
+(best model-based, ~3× less budget than random for equal error);
+fixed-slope greedys DIVERGE (4,171→4,731 and 4,324→5,211); random+NN
+grinds to 1,620 at budget 2,000; per-target-em's full-coverage floor is
+2,601 — the estimator ceiling, which the additive src/dst model is meant
+to break (see handoff).
 
 `get_random_subsample(n=100)` **mutates `target_data` in place** — subsequent
 re-runs operate on already-pruned data.
@@ -290,8 +309,11 @@ python3 -m pytest tests/ -v
   selection utility and its reported estimates. `get_region_size()` returns
   km-equivalents in both modes (gaussian = mean residual × 100 km/ms), so
   `BASICALLY_GEOLOCATED = 200` km applies uniformly.
-- `measurements()` returns early (fewer pings than budget) once every
-  target is either geolocated or out of unused VPs, rather than looping.
+- `BASICALLY_GEOLOCATED` (200km region size) DEPRIORITISES a target rather
+  than dropping it: done targets rank below every unfinished one, and
+  leftover budget flows to the least-certain done target via its nearest
+  VP. `measurements()` returns early only when every (VP, target) pair is
+  exhausted.
 - `AdaptiveRTTModel`: predicts RTT as `distance × DEFAULT_SLOPE / 100ms`, with per-target
   EMA correction (α=0.3)
 - `default_utility_evaluator`: simulates adding a candidate constraint to a
@@ -338,15 +360,29 @@ tests/plot_error_over_measurements.py figure generator (called by integration te
 tests/plot_gaussian_vs_hard_circle.py 3-panel map: hard-circle lenses vs gaussian
                                       posterior (called by TestGaussianVsHardCircle;
                                       writes tests/gaussian_vs_hard_circle.pdf)
-tests/test_e2e_adaptive_em.py         online-EM e2e: per-target unknown (μ, σ);
-                                      random vs SOL vs const-gaussian vs em vs oracle
-                                      + noise models under detour contamination
-tests/plot_error_adaptive_em.py       error-vs-budget curves for the EM comparison
+tests/test_e2e_additive_em.py         additive two-way model rtt = SOL + X_src + X_dst:
+                                      learns per-node (μ, σ); σ̂_dst flags pathological
+                                      destinations; beats per-target EM ~2× (batch) and
+                                      is the only model-based estimator to beat NN in
+                                      the budget sweep (408 vs 605 km at full budget)
+tests/plot_error_additive.py          error-vs-budget curves under the additive world
+                                      (writes tests/error_over_measurements_additive.pdf)
+tests/test_e2e_adaptive_em.py         online-EM e2e (single-target estimator comparison
+                                      + noise models under contamination) AND the
+                                      multi-target budget-allocation comparison:
+                                      random+NN vs greedy(hard/gaussian/em) vs oracle
+                                      over a shared total budget, avg error across
+                                      5 random targets (the project objective)
+tests/plot_error_adaptive_em.py       error-vs-total-budget curves for the multi-target
+                                      comparison, with greedy stop markers
                                       (writes tests/error_over_measurements_adaptive.pdf)
-tests/plot_region_convergence.py      filmstrip: regions converging over measurements
-                                      per method, with an injected detour (called by
-                                      TestGenerateConvergenceFigure; writes
-                                      tests/region_convergence.pdf)
+tests/plot_em_edge_vs_mismatch.py     em/gaussian error ratio vs μ-range mismatch,
+                                      with σ-only variants (writes
+                                      tests/em_edge_vs_mismatch.pdf)
+tests/plot_region_convergence.py      filmstrip: 1:1 spatial companion to the curves —
+                                      5 targets per cell, estimates + each region's own
+                                      uncertainty circle, per strategy over budget
+                                      (writes tests/region_convergence.pdf)
 
 SIMULATION_ENVIRONMENT.md         ← read this to understand what's allowed during inference
 .claude/TODOS.md                   ordered fix list
