@@ -1,104 +1,91 @@
 # Agent TODOs
 
-Items are ordered by priority. Fix blocking issues before ergonomics.
-
----
-
-## ✅ Done
-
-- **Cache init bug** — `solve()` never seeded `best_vp_cache`, causing
-  `measurements()` to infinite-loop. Fixed.
-- **Type annotations** — all function signatures carry argument and return types.
-- **Unit tests** — `tests/test_iterative_greedy_init.py` covers cache
-  population, VP validity, finite utilities, liveness, coverage, deduplication,
-  pair validity, history monotonicity.
-- **Probabilistic FeasibleRegion** — `FeasibleRegion` now supports
-  `mode='hard_circle'` and `mode='gaussian'`. Gaussian uses Nelder-Mead on
-  the NLL with configurable per-measurement sigma.
-- **Probabilistic helper functions** — `probabilistic_helpers.py` with unit
-  tests (29 tests, `tests/test_probabilistic_helpers.py`).
-- **Gaussian mode wired into comparator** — `Geolocator_Comparator` supports
-  `measurement_converter_mode = 'gaussian'` using `GLOBAL_SIGMA_MS`.
-- **Integration test restructured** — `tests/test_e2e_probabilistic.py` now
-  calls the real `Geolocator_Comparator.convert_measurements_to_locations()`
-  and `Random_Geolocator` with synthetic data in the real pipeline format.
-- **Location locking** — `LockedLocationDict` and `simulation_mode()` in
-  `utils.py`. Integration test enforces the information boundary at runtime.
-- **Real-data analysis** — `analyze_latency_distance.py` fits 4 RTT models,
-  shows per-VP heterogeneity, confirms overhead ∝ d^0.67, not constant.
-- **Honest baseline** — removed per-VP mu/sigma calibration from inference
-  (it required VP-to-VP distances = cheating). Gaussian now uses global σ only.
-- **Documentation** — `SIMULATION_ENVIRONMENT.md` explains the research
-  problem, simulation setup, and information boundary. `CLAUDE.md` updated.
+Open work items, ordered by priority. Completed work is recorded in git
+history and reflected in `CLAUDE.md` / `SIMULATION_ENVIRONMENT.md` — do not
+maintain a "done" list here.
 
 ---
 
 ## 🔴 High priority
 
-### 1. Algorithm/evaluator mismatch
+### 1. Per-VP extension of the EM framework + real-data performance
 
-The greedy optimises *FeasibleRegion area reduction* but the default evaluator
-uses `nearest_neighbor` (estimate = location of closest-RTT VP). These
-objectives are orthogonal.
+`FeasibleRegion(mode='em_gaussian')` fits a per-TARGET (μ, σ) online. Real
+RIPE Atlas data needs the per-VP version: overhead is VP-dependent and
+scales with distance (mean 67ms, ∝ d^0.67), so the next steps are:
 
-**Option A — align evaluator to greedy**: switch to `'gaussian'` mode and use
-`get_current_estimates()` on the greedy (already wired).
+1. Per-VP affine model `rtt ≈ a_v × d + b_v`, fitted via the same
+   EM/shrinkage machinery but pooling residuals per VP across targets
+   (honest: uses estimated target locations, never VP-to-VP distances).
+2. Fix the EM × robust-noise interaction: under heavy detour
+   contamination, EM's μ-fit absorbs some detour bias, so robust noise +
+   fixed slope currently beats robust noise + EM (asymmetric: 213 vs
+   300km median). Candidate fixes: fit μ on the trimmed/lower-quantile
+   residuals, or down-weight detour-suspect measurements in the M-step
+   using the likelihood itself.
+3. Re-run the real-data sweep (`assess_probabilistic.py`) with the slope +
+   EM + asymmetric-noise estimators; the old catastrophic 10,000km
+   failures came from the slope-1.0 gaussian placing rings ~6700km too far
+   out. (`noise_model=ASYMMETRIC_NOISE` is likely the right default for
+   real data.)
+4. General predictive-model interface: estimation and selection both
+   consume "what RTT do I expect and how sure am I" — a `LatencyModel`
+   protocol with `nll(vp, rtt, candidate_loc)`, `predict(vp, loc) →
+   (expected_rtt, sigma)`, and `update(vp, rtt, loc_estimate, weight)`
+   would let slope/EM/per-VP-affine/learned models swap freely under
+   FeasibleRegion and the greedy. Sketched, not implemented.
 
-**Option B — align greedy to evaluator**: change greedy utility to select the
-VP closest to the current centroid estimate. Simpler, abandons triangulation.
+### 2. Oracle's estimation half is unclear
 
-### 2. Online EM for per-VP calibration (honest version)
+The oracle *selects* pings by minimising the true error of an internal
+hard-circle FeasibleRegion estimate (`perfect_geolocator.py`), but is then
+*scored* through the `nearest_neighbor` converter. Its selection objective
+and its scored estimator disagree, so it may not be a tight upper bound for
+the overlap methodology. Decide what estimator the oracle should be scored
+with — probably the same overlap estimate it optimises during selection.
 
-Per-VP sigma and mu can be estimated honestly via EM:
-- **E-step**: estimate target locations using current (μ_v, σ_v)
-- **M-step**: update (μ_v, σ_v) from residuals against those location estimates
+(Note: comparing greedy+overlap against random+NN whole-system is the
+intended experiment, not a confound — see "The two phases" in
+`SIMULATION_ENVIRONMENT.md`.)
 
-Cold start: global σ, no mu correction. As target estimates accumulate and
-improve, the VP parameters refine automatically. No VP-to-VP distances needed.
+### 3. Greedy still doesn't beat random
 
-Not yet implemented. Would likely close most of the gap between Gaussian
-(honest) and oracle.
-
-### 3. Real-data Gaussian performance
-
-The Gaussian MAP with global σ and no mu correction performs poorly on real
-RIPE Atlas data: mean overhead 67ms (not zero), overhead ∝ d^0.67 (not
-constant). Some targets get 10,000+ km errors.
-
-Root cause: `rtt = d/100 + N(0, σ²)` is badly misspecified. Real overhead
-is large, VP-dependent, and scales with distance.
-
-Pending fixes (in order of impact):
-1. Online EM for per-VP calibration (see #2 above)
-2. Per-VP affine model: `rtt ≈ a_v × d + b_v` — slope + intercept per VP.
-   Estimated honestly via EM against accumulating target estimates.
-3. Clip catastrophically wrong estimates (e.g. >5000km from any VP) as a
-   robustness fallback
+The selection algorithm is the main open research problem. Now that the
+estimation stack is in decent shape (slope model, km-consistent region
+sizes, em_gaussian), run the greedy sweep with `region_mode=GAUSSIAN` /
+`'em_gaussian'` and compare against random ordering under the same
+estimator to isolate selection quality.
 
 ---
 
 ## 🟡 Medium priority
 
-### 4. RTT model quality in greedy
+### 4. Two RTT prediction paths in the greedy
 
-`AdaptiveRTTModel` uses `distance × 1.5 / 100` as base RTT. The 1.5× routing
-factor is a rough constant; real overhead is path-dependent. EMA correction
-(α=0.3) helps per-target but can't fix systematic regional bias.
-
-Ideas:
-- Per-region (continent pair) routing factors from empirical data
-- Use SOL floor (d/100) as hard lower bound for constraint radius
+`AdaptiveRTTModel` predicts `distance × DEFAULT_SLOPE / 100` + per-target
+EMA correction — a second, parallel copy of the predictive model that now
+lives in `FeasibleRegion.expected_rtt_ms()`. Unify: the greedy should ask
+the region for its model prediction (which em_gaussian keeps calibrated
+per target) instead of maintaining its own.
 
 ### 5. Single-ping corner cases in greedy
 
-When a target has exactly one constraint, `_update_estimate` short-circuits to
-the VP's location. The greedy's utility for a second ping is computed against a
-region centred at the first VP — causing wildly overestimated area reduction.
+When a target has exactly one constraint, `_update_estimate` short-circuits
+to the VP's location. The greedy's utility for a second ping is computed
+against a region centred at the first VP — causing overestimated area
+reduction. Fix: compute utility relative to the constraint circle, not the
+current guess.
 
-Fix: record the VP location as the "prior centre" and compute utility relative
-to the constraint circle, not the current guess.
+### 6. Hard-circle empty intersection reads as geolocated
 
-### 6. `get_random_subsample` modifies `target_data` in place
+If constraints conflict (one slope-beating RTT makes the circles fail to
+all intersect), Nelder-Mead's estimate satisfies nothing, the region-size
+probe finds no feasible displacement, and the size reads ~0 → falsely
+"geolocated". Fix idea: if the estimate itself is infeasible, return the
+sentinel (or distance to nearest feasible point). Gaussian modes are immune
+(misfit raises their size).
+
+### 7. `get_random_subsample` modifies `target_data` in place
 
 `assess_geolocators.py` calls `get_random_subsample()` which overwrites
 `self.target_data['loc_loc_meas']`. Re-running `run()` operates on
@@ -108,25 +95,25 @@ already-pruned data. Should return a new dict or deepcopy.
 
 ## 🟢 Low priority / ergonomics
 
-### 7. Hardcoded debug target
+### 8. Hardcoded debug target
 
 `'85.93.215.0'` appears in `feasible_region_maintainer.py`. Replace with an
 env var or constructor argument.
 
-### 8. `get_distance` dead code in `utils.py`
+### 9. `get_distance` dead code in `utils.py`
 
 Everything after `return fast_haversine(...)` is unreachable. Delete it.
 
-### 9. Data coverage
+### 10. Data coverage
 
-The dense-mesh filter requires ≥80% bidirectional coverage. Some RTT pairs are
-genuinely missing (probe offline). Consider:
-- Merging more than 10 hourly files (current `fni == 10` early-exit)
-- Symmetric imputation: RTT(A→B) ≈ RTT(B→A)
+The dense-mesh filter requires ≥80% bidirectional coverage. Some RTT pairs
+are genuinely missing (probe offline). Consider merging more than 10 hourly
+files (current `fni == 10` early-exit) and symmetric imputation
+RTT(A→B) ≈ RTT(B→A).
 
-### 10. Compute scaling
+### 11. Compute scaling
 
-`_update_best_vp_for_target` fans out one `ProcessPoolExecutor` job per VP per
-target. With 900×900 = 810k tasks this is very slow locally. During development:
-- Use `max_workers=1` to avoid fork overhead
-- Consider batching VP evaluations into vectorised numpy ops
+`_update_best_vp_for_target` fans out one `ProcessPoolExecutor` job per VP
+per target. With 900×900 = 810k tasks this is very slow locally. Use
+`max_workers=1` during development; consider batching VP evaluations into
+vectorised numpy ops.

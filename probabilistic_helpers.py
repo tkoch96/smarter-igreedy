@@ -9,16 +9,20 @@ Model summary
 For a VP at known location `vp` and observed RTT `r` (ms), the log-likelihood
 of the target being at location `x` is:
 
-    log P(r | x, vp) = -( r - d(x, vp) / 100 )^2 / (2 * sigma_vp^2)
+    log P(r | x, vp) = -( r - slope * d(x, vp) / 100 )^2 / (2 * sigma_vp^2)
 
 where d(x, vp) is great-circle distance in km, 100 km/ms is the SOL floor,
-and sigma_vp is per-VP routing noise in ms.
+`slope` is the assumed routing-overhead factor over SOL (1.0 = pure SOL;
+fiber paths typically run 1.1-1.3x), and sigma_vp is per-VP noise in ms.
 
 The combined negative log-posterior (the quantity to minimise) is:
 
-    nll(x) = sum_i  ( r_i - d(x, vp_i) / 100 )^2 / (2 * sigma_i^2)
+    nll(x) = sum_i  ( r_i - slope * d(x, vp_i) / 100 )^2 / (2 * sigma_i^2)
 
 `Constraint` in the new model is (vp_loc, sigma_ms, rtt_ms).
+
+The helpers here default to slope=1.0 (pure SOL) so they stay minimal pure
+functions; FeasibleRegion passes its configured slope explicitly.
 """
 
 from __future__ import annotations
@@ -36,26 +40,75 @@ KM_PER_MS = 100.0          # speed-of-light floor: 1 ms RTT ~ 100 km one-way
 GLOBAL_SIGMA_MS = 15.0     # fallback when a VP has fewer than min_peers peers
 MIN_PEERS_FOR_SIGMA = 10   # minimum mesh pairs needed to fit a per-VP sigma
 
+# ---------------------------------------------------------------------------
+# Noise models: per-residual negative log-likelihood shapes
+# ---------------------------------------------------------------------------
+# RTT-vs-model residuals are not really gaussian: overhead is one-sided
+# (SOL is a hard floor — a measurement can beat the model only slightly,
+# but can exceed it wildly via detours) and heavy-tailed (occasional long
+# routes that a quadratic loss chases catastrophically).
+
+GAUSSIAN_NOISE   = 'gaussian'     # r²/(2σ²) — thin-tailed, symmetric
+STUDENT_T_NOISE  = 'student_t'    # heavy-tailed, symmetric: outlier-robust
+ASYMMETRIC_NOISE = 'asymmetric'   # steep wall below the model, linear above
+
+STUDENT_T_DOF = 3.0        # ν: lower = heavier tails
+ASYM_FAST_SCALE = 3.0      # how much steeper the faster-than-model side is
+
+
+def residual_nll(residual_ms: float, sigma_ms: float,
+                 noise_model: str = GAUSSIAN_NOISE) -> float:
+    """
+    Negative log-likelihood contribution of one RTT residual
+    (residual = observed rtt − model-predicted rtt, in ms).
+
+    gaussian    : r² / (2σ²)
+    student_t   : ((ν+1)/2) · log(1 + r²/(νσ²)) — grows ~logarithmically for
+                  |r| ≫ σ, so a single detour can't drag the estimate far.
+    asymmetric  : slower than model (r ≥ 0): |r|/σ — a forgiving Laplace
+                  tail for detours; faster than model (r < 0): quadratic
+                  with a σ/ASYM_FAST_SCALE scale — beating the model is
+                  nearly impossible physically, so it costs steeply.
+    """
+    r = residual_ms
+    if noise_model == GAUSSIAN_NOISE:
+        return (r ** 2) / (2.0 * sigma_ms ** 2)
+    if noise_model == STUDENT_T_NOISE:
+        return ((STUDENT_T_DOF + 1.0) / 2.0) * math.log1p(
+            (r ** 2) / (STUDENT_T_DOF * sigma_ms ** 2))
+    if noise_model == ASYMMETRIC_NOISE:
+        if r >= 0.0:
+            return r / sigma_ms
+        return ((r * ASYM_FAST_SCALE) ** 2) / (2.0 * sigma_ms ** 2)
+    raise ValueError(f"noise_model {noise_model!r} not understood")
+
 
 # ---------------------------------------------------------------------------
 # Core probabilistic primitives
 # ---------------------------------------------------------------------------
 
-def gaussian_nll(point: LatLon, constraints: list[ProbConstraint]) -> float:
+def gaussian_nll(point: LatLon, constraints: list[ProbConstraint],
+                 slope: float = 1.0,
+                 noise_model: str = GAUSSIAN_NOISE) -> float:
     """
-    Negative log-posterior (Gaussian model) for `point` given `constraints`.
+    Negative log-posterior for `point` given `constraints`.
 
     This is the objective that Nelder-Mead minimises to find the MAP estimate.
     A lower value means the point is more consistent with the observed RTTs.
+    (Historical name: with noise_model='gaussian' — the default — this is
+    the sum of squared normalised residuals; other noise models swap the
+    per-residual loss shape, see `residual_nll`.)
 
     Parameters
     ----------
     point       : (lat, lon) candidate target location
     constraints : list of (vp_loc, sigma_ms, rtt_ms)
+    slope       : assumed routing-overhead factor, expected rtt = slope * d/100
+    noise_model : GAUSSIAN_NOISE | STUDENT_T_NOISE | ASYMMETRIC_NOISE
 
     Returns
     -------
-    float -- sum of squared normalised residuals (non-negative)
+    float -- total negative log-likelihood (non-negative)
     """
     if not constraints:
         return 0.0
@@ -64,13 +117,13 @@ def gaussian_nll(point: LatLon, constraints: list[ProbConstraint]) -> float:
     total = 0.0
     for (vp_lat, vp_lon), sigma_ms, rtt_ms in constraints:
         dist_km = get_distance((lat, lon), (vp_lat, vp_lon))
-        expected_rtt = dist_km / KM_PER_MS
-        residual = rtt_ms - expected_rtt
-        total += (residual ** 2) / (2.0 * sigma_ms ** 2)
+        expected_rtt = slope * dist_km / KM_PER_MS
+        total += residual_nll(rtt_ms - expected_rtt, sigma_ms, noise_model)
     return total
 
 
-def mean_absolute_residual(point: LatLon, constraints: list[ProbConstraint]) -> float:
+def mean_absolute_residual(point: LatLon, constraints: list[ProbConstraint],
+                           slope: float = 1.0) -> float:
     """
     Mean absolute RTT residual at `point` across all constraints.
 
@@ -81,10 +134,11 @@ def mean_absolute_residual(point: LatLon, constraints: list[ProbConstraint]) -> 
     ----------
     point       : (lat, lon) candidate target location
     constraints : list of (vp_loc, sigma_ms, rtt_ms)
+    slope       : assumed routing-overhead factor, expected rtt = slope * d/100
 
     Returns
     -------
-    float -- mean |rtt - d/100| in ms
+    float -- mean |rtt - slope * d/100| in ms
     """
     if not constraints:
         return float('inf')
@@ -93,7 +147,7 @@ def mean_absolute_residual(point: LatLon, constraints: list[ProbConstraint]) -> 
     residuals = []
     for (vp_lat, vp_lon), _sigma, rtt_ms in constraints:
         dist_km = get_distance((lat, lon), (vp_lat, vp_lon))
-        expected_rtt = dist_km / KM_PER_MS
+        expected_rtt = slope * dist_km / KM_PER_MS
         residuals.append(abs(rtt_ms - expected_rtt))
     return sum(residuals) / len(residuals)
 

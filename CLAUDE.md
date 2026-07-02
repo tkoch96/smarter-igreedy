@@ -40,40 +40,109 @@ limiting it to the first 10 hourly files. The full day has 24.
 ## FeasibleRegion (`feasible_region_maintainer.py`)
 
 Tracks the estimated location of a target given RTT measurements from VPs.
-Supports two modes:
+Both modes share one predictive RTT model — `expected rtt = slope × d / 100`
+with `slope = DEFAULT_SLOPE = 1.3` (realistic fiber overhead; slope 1.0 =
+pure SOL never happens in practice) — and differ in how they treat
+deviations from it:
 
 ### `mode='hard_circle'` (default)
 
-Each RTT becomes a maximum-radius circle: target must be within
-`rtt × 100km × radius_multiplier` of the VP. Nelder-Mead minimises a penalty
-that fires when the estimate falls outside any circle.
+Each RTT becomes a maximum-radius circle at the model-implied distance
+(`rtt × 100 / slope`) × `radius_multiplier` (safety slack, default 1.05).
+Nelder-Mead minimises a penalty that fires when the estimate falls outside
+any circle. A measurement faster than the slope allows makes the truth
+infeasible — hard models trade informativeness against validity.
 
 **Known issue**: loss landscape is nearly flat inside all circles — Nelder-Mead
 barely moves from its starting point. Multiplier 1.3 is too loose; 1.05 is
 tighter but still flatter than Gaussian.
 
+Region size = largest displacement from the estimate that satisfies every
+constraint, found by probing 8 bearings (geometric ladder + bisection);
+single constraint returns the circle radius exactly. (The old "tightest
+slack" proxy measured distance to one boundary and badly underestimated
+uncertainty near the edge of a large feasible lens.)
+
 ### `mode='gaussian'`
 
 Each RTT contributes a term to the negative log-posterior:
 ```
-NLL(x) = Σ_v  (rtt_v - d(x, v) / 100)² / (2 σ_v²)
+NLL(x) = Σ_v  (rtt_v - slope × d(x, v) / 100)² / (2 σ_v²)
 ```
 Nelder-Mead minimises NLL. Always has gradient (proper bowl). σ defaults to
 `GLOBAL_SIGMA_MS = 15ms` (fixed global constant — no per-VP calibration).
+Slope-beating measurements are unlikely, not impossible — no validity cliff.
 
 **Important**: per-VP sigma estimation from the mesh would require knowing
 VP-to-VP distances, which is disallowed (see `SIMULATION_ENVIRONMENT.md`).
 The honest baseline uses global σ only.
+
+### `mode='em_gaussian'`
+
+Gaussian, but the per-target slope μ and noise σ are UNKNOWN and fitted
+online (honestly — from residuals against the target's own estimated
+location, no ground truth). Each measurement update alternates:
+
+- **E-step**: MAP location via Nelder-Mead under the current μ
+- **M-step**: closed-form least-squares refit of μ (through the origin)
+  and σ from the residuals, shrunk toward priors with pseudo-counts
+  (`EM_MU_PRIOR_STRENGTH = 3`) so the cold start (1–2 pings can't identify
+  μ jointly with location) stays well-posed; μ clamped to [1.0, 2.0].
+
+`region.slope` holds the current μ; `region.fitted_sigma_ms` the current σ.
+A full refit per update is used instead of an EWMA because a target sees at
+most tens of pings — no forgetting needed.
+
+### `noise_model` toggle (soft modes)
+
+The per-residual likelihood shape is a constructor toggle on gaussian and
+em_gaussian modes (`noise_model=`, from `probabilistic_helpers`):
+
+- `GAUSSIAN_NOISE` (default) — r²/2σ²; thin-tailed, dragged by detours.
+- `STUDENT_T_NOISE` — heavy-tailed (ν=3), saturating loss: outlier-robust,
+  essentially free on clean data.
+- `ASYMMETRIC_NOISE` — steep quadratic below the model (SOL is a hard
+  floor), linear Laplace tail above (detours are common): matches
+  one-sided RTT overhead dynamics.
+
+Calibrated (single 10× detour among 5 pings): gaussian err ≈ 1524km,
+student_t ≈ 356km, asymmetric ≈ 0km. Under 20% Exp(40ms) detour
+contamination (e2e): gaussian ≈ 925, student_t ≈ 420, asymmetric ≈ 213 km;
+clean-world cost: student_t ~0%, asymmetric ~16%. In em_gaussian mode the
+M-step switches to robust fits (median-of-ratios slope, MAD scale) for the
+non-gaussian models. ⚠️ Known interaction: under heavy contamination,
+EM's μ-fit absorbs some detour bias — robust noise + fixed slope currently
+beats robust noise + EM there.
+
+Calibrated result (per-target μ ~ U(1.01,1.4), σ ~ U(1,6)ms, 80 seeds, full
+budget, `test_e2e_adaptive_em.py`): random=281, sol(slope 1.0)=446,
+const gaussian=186, **em=133**, oracle(true μ,σ)=147 km. Two notable
+findings pinned by tests: misspecified slope-1.0 triangulation is WORSE
+than nearest-neighbour, and EM can beat the parameter-oracle in-sample
+(fitting the realised noise beats knowing the true μ).
 
 ### API
 
 ```python
 region = FeasibleRegion(target_id, mode='gaussian')
 region.add_measurement(vp_loc, rtt_ms, sigma_ms=GLOBAL_SIGMA_MS)
-region.get_location()      # → (lat, lon)
-region.get_region_size()   # uncertainty proxy
+region.get_location()      # → (lat, lon), always canonical (on-globe)
+region.get_region_size()   # uncertainty proxy, km in BOTH modes
 region.clone()             # fast isolated copy
 ```
+
+Invariants (pinned by `TestRegionSizeUnits`, `TestGeolocationImpossibility`,
+`TestLatLonNormalization`):
+
+- `get_region_size()` returns km in both modes (gaussian = mean residual ×
+  100 / slope); empty region = 20037.0 sentinel.
+- **Trilateration floor**: with <3 constraints the size never drops below
+  the best ping's model-implied distance (min rtt × 100 / slope km) —
+  1 ping is a ring,
+  2 pings are two mirror points, regardless of fit quality.
+- Estimates are wrapped to canonical lat/lon after every optimisation
+  (Nelder-Mead otherwise wanders off-globe, which breaks probing and can
+  crash `fast_haversine`).
 
 `add_measurements_batch([(vp_loc, rtt), ...])` re-optimises once at the end.
 
@@ -95,6 +164,14 @@ ordering. Estimation is done by `Geolocator_Comparator.convert_measurements_to_l
 ---
 
 ## Evaluation loop (`Geolocator_Comparator`)
+
+Two-phase design (train/test-style split — see "The two phases" in
+`SIMULATION_ENVIRONMENT.md`): selection runs under realistic information
+limits; evaluation scores against ground truth, which is never fed back.
+Each strategy is a complete system of selection + estimation — baselines
+intentionally use dumb nearest-neighbor estimation, while the greedy
+supplies its own overlap-based estimates via `get_current_estimates()`
+(bypassing the converter entirely).
 
 Sweeps budget from 100 to 2500 in steps of 100. At each budget, estimates
 locations and computes great-circle error vs known probe locations. Missing
@@ -165,7 +242,8 @@ vectorised haversine, grid posterior. Completes in ~1 second.
 real `{'address_to_loc': ..., 'loc_loc_meas': ...}` format.
 
 What the tests guarantee (80 seeds, 10 VPs, Prague target, correctly-specified
-model `rtt = d/100 + N(0, σ_vp²)`):
+model `rtt = DEFAULT_SLOPE × d/100 + N(0, σ_vp²)`, same slope in ground
+truth and estimators):
 
 | Claim | Test |
 |---|---|
@@ -207,7 +285,14 @@ python3 -m pytest tests/ -v
 
 ## Iterative Greedy — key mechanics
 
-- `AdaptiveRTTModel`: predicts RTT as `distance × 1.5 / 100ms`, with per-target
+- `region_mode` constructor param (`HARD_CIRCLE` default, or `GAUSSIAN`)
+  selects the overlap methodology for the greedy's own regions — both the
+  selection utility and its reported estimates. `get_region_size()` returns
+  km-equivalents in both modes (gaussian = mean residual × 100 km/ms), so
+  `BASICALLY_GEOLOCATED = 200` km applies uniformly.
+- `measurements()` returns early (fewer pings than budget) once every
+  target is either geolocated or out of unused VPs, rather than looping.
+- `AdaptiveRTTModel`: predicts RTT as `distance × DEFAULT_SLOPE / 100ms`, with per-target
   EMA correction (α=0.3)
 - `default_utility_evaluator`: simulates adding a candidate constraint to a
   cloned `FeasibleRegion`, measures area reduction. Targets within 200km
@@ -250,6 +335,18 @@ plot_results.py                    matplotlib output functions
 tests/test_probabilistic_helpers.py   unit tests for pure functions (29 tests, ~1s)
 tests/test_e2e_probabilistic.py       integration test using real pipeline (12 tests + figure)
 tests/plot_error_over_measurements.py figure generator (called by integration test)
+tests/plot_gaussian_vs_hard_circle.py 3-panel map: hard-circle lenses vs gaussian
+                                      posterior (called by TestGaussianVsHardCircle;
+                                      writes tests/gaussian_vs_hard_circle.pdf)
+tests/test_e2e_adaptive_em.py         online-EM e2e: per-target unknown (μ, σ);
+                                      random vs SOL vs const-gaussian vs em vs oracle
+                                      + noise models under detour contamination
+tests/plot_error_adaptive_em.py       error-vs-budget curves for the EM comparison
+                                      (writes tests/error_over_measurements_adaptive.pdf)
+tests/plot_region_convergence.py      filmstrip: regions converging over measurements
+                                      per method, with an injected detour (called by
+                                      TestGenerateConvergenceFigure; writes
+                                      tests/region_convergence.pdf)
 
 SIMULATION_ENVIRONMENT.md         ← read this to understand what's allowed during inference
 .claude/TODOS.md                   ordered fix list

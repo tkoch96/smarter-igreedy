@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
 from utils import LatLon, get_distance
-from feasible_region_maintainer import FeasibleRegion
+from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, DEFAULT_SLOPE
 
 DEBUG = False
 
@@ -27,7 +27,7 @@ class AdaptiveRTTModel:
 	def __call__(self, vp_loc: LatLon, target_region: FeasibleRegion, dst: Optional[str] = None) -> float:
 		current_guess_loc = target_region.get_location()
 		distance_to_guess = get_distance(vp_loc, current_guess_loc)
-		base_rtt = distance_to_guess * 1.5 / 100.0
+		base_rtt = distance_to_guess * DEFAULT_SLOPE / 100.0
 
 		error_inflation = 0.0
 		if dst is not None and dst in self.target_errors:
@@ -53,7 +53,7 @@ def default_expected_rtt_model(vp_loc: LatLon, target_region: FeasibleRegion) ->
 	"""Default geometric RTT estimation."""
 	current_guess_loc = target_region.get_location()
 	distance_to_guess = get_distance(vp_loc, current_guess_loc)
-	return distance_to_guess * 1.5 / 100.0
+	return distance_to_guess * DEFAULT_SLOPE / 100.0
 
 
 def default_utility_evaluator(
@@ -105,11 +105,20 @@ class Iterative_Greedy_Geolocator:
 		max_workers: Optional[int] = None,
 		utility_func: Optional[Callable] = None,
 		rtt_func: Optional[Callable] = None,
+		region_mode: str = HARD_CIRCLE,
+		region_slope: float = DEFAULT_SLOPE,
 	) -> None:
 		self.name = "iterative_greedy"
 		self.data: Optional[TargetData] = None
 		self.vp_locations: dict[str, LatLon] = {}
 		self.debug = DEBUG
+		# Overlap methodology used for this greedy's own regions (selection
+		# utility AND its reported estimates): HARD_CIRCLE or GAUSSIAN, with
+		# a shared predictive slope (expected rtt = slope × d / 100).
+		# get_region_size() returns km-equivalents in both modes, so
+		# BASICALLY_GEOLOCATED and the size sentinels apply uniformly.
+		self.region_mode = region_mode
+		self.region_slope = region_slope
 
 		self.utility_func: Callable = utility_func or default_utility_evaluator
 		self.rtt_func: Callable = rtt_func or AdaptiveRTTModel()
@@ -162,7 +171,11 @@ class Iterative_Greedy_Geolocator:
 		if not self.targets:
 			return
 
-		self.target_regions = {dst: FeasibleRegion(dst, self.get_prior_guess(dst)) for dst in self.targets}
+		self.target_regions = {
+			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
+			                    mode=self.region_mode, slope=self.region_slope)
+			for dst in self.targets
+		}
 		self.measurements_used = {dst: set() for dst in self.targets}
 		self.current_region_sizes = {dst: 20037.0 for dst in self.targets}
 		self.best_vp_cache = {}
@@ -230,6 +243,7 @@ class Iterative_Greedy_Geolocator:
 
 		while len(self.measurement_history) < budget:
 			self.iter = len(self.measurement_history)
+			focus_group_refreshed = False
 			if pings_in_current_batch == 0 or not focus_group:
 				sorted_cache = sorted(
 					self.best_vp_cache.items(),
@@ -238,6 +252,7 @@ class Iterative_Greedy_Geolocator:
 				)
 				focus_group = [item[0] for item in sorted_cache[:focus_batch_size]]
 				pings_in_current_batch = 0
+				focus_group_refreshed = True
 
 			best_global_dst: Optional[str] = None
 			best_global_src: Optional[str] = None
@@ -251,6 +266,12 @@ class Iterative_Greedy_Geolocator:
 					best_global_src = src
 
 			if best_global_dst is None:
+				if focus_group_refreshed:
+					# Even a fresh scan of the whole cache found no candidate:
+					# every target is either geolocated (dropped from the
+					# cache) or out of unused VPs. No useful ping remains, so
+					# return what we have instead of spinning forever.
+					break
 				focus_group = []
 				continue
 

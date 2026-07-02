@@ -4,9 +4,11 @@ with synthetic data.
 
 Data model
 ----------
-    rtt_vp = d(vp, target) / 100  +  N(0, sigma_vp²)
+    rtt_vp = DEFAULT_SLOPE × d(vp, target) / 100  +  N(0, sigma_vp²)
 
-Correctly specified — no routing overhead — so the Gaussian MAP is consistent.
+Ground truth carries realistic routing overhead (DEFAULT_SLOPE = 1.3× SOL —
+pure SOL never happens on real fiber), and the estimators assume the same
+slope, so the model is correctly specified and the Gaussian MAP is consistent.
 
 Information boundary
 --------------------
@@ -47,9 +49,13 @@ import pytest
 
 from assess_geolocators import Geolocator_Comparator
 from random_geolocator import Random_Geolocator
-from feasible_region_maintainer import FeasibleRegion, GAUSSIAN
+from feasible_region_maintainer import FeasibleRegion, GAUSSIAN, DEFAULT_SLOPE
 from probabilistic_helpers import KM_PER_MS
 from utils import get_distance, LatLon, LockedLocationDict, simulation_mode
+
+# The synthetic ground truth uses the same slope model as the estimators
+# ("same model for now" — decouple later to study misspecification).
+GROUND_TRUTH_SLOPE = DEFAULT_SLOPE
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +98,7 @@ VP_SIGMA_TRUE: dict[str, float] = {
 
 def _rtt(src_loc: LatLon, dst_loc: LatLon, sigma_ms: float, rng: np.random.Generator) -> float:
     sol = get_distance(src_loc, dst_loc) / KM_PER_MS
-    return sol + float(rng.normal(0.0, sigma_ms))
+    return GROUND_TRUTH_SLOPE * sol + float(rng.normal(0.0, sigma_ms))
 
 
 def make_synthetic_data(rng: np.random.Generator) -> dict:

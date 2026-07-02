@@ -52,6 +52,38 @@ global sigma with no per-VP calibration.
 
 ---
 
+## The two phases: selection vs. evaluation
+
+Every comparison run (`Geolocator_Comparator.run()`) has two phases,
+analogous to a train/test split. Very different information is available
+in each:
+
+1. **Selection (realistic emulation)** — the geolocator decides which
+   (VP, target) pairs to ping and in what order. Only boundary-respecting
+   information is available: RTTs observed so far and VP locations. The
+   oracle deliberately violates this — that is its job as an upper bound.
+
+2. **Evaluation (perfect information, unrealistic by design)** — the chosen
+   measurements are converted to location estimates and scored against
+   ground-truth probe locations. Ground truth is used only to compute
+   error; it is never fed back into selection or estimation.
+
+Estimation — converting measurements into a location guess — is part of
+each *strategy*, not a shared harness component:
+
+| Strategy | Selection | Estimation |
+|---|---|---|
+| random + NN (dumb baseline) | random shuffle | nearest neighbour |
+| oracle (upper bound) | greedy on true error (cheats) | nearest neighbour (currently — see TODOS #1) |
+| iterative greedy (ours) | expected region reduction | its own FeasibleRegion overlap estimate |
+
+Comparing "random + NN" against "greedy + overlap" is therefore an intended
+whole-system comparison. The baselines are *supposed* to lack the overlap
+computation — the dumb thing to do with a pile of pings is to report the
+nearest neighbour, and that is exactly what the dumb baseline does.
+
+---
+
 ## The LockedLocationDict enforcement
 
 `utils.py` provides `LockedLocationDict` and `simulation_mode()` to enforce

@@ -32,6 +32,18 @@ class Geolocator_Comparator:
 					self.target_data['loc_loc_meas'][src][dst] = [self.target_data['loc_loc_meas'][src][dst]]
 
 	def convert_measurements_to_locations(self, measurements):
+		"""
+		Phase (b) estimation: turn a strategy's chosen measurements into
+		location estimates (see run() for the two-phase design).
+
+		The converter mode is the *estimation half* of a strategy, not a
+		shared harness component. 'nearest_neighbor' (report the lowest-RTT
+		VP's location) is the deliberately dumb estimator paired with the
+		baselines; 'hard_circle'/'gaussian' are the overlap-computation
+		methodology under development. Geolocators that carry their own
+		estimator (Iterative_Greedy via get_current_estimates) never enter
+		this function.
+		"""
 		estimated_locations = {}
 		address_to_loc = self.target_data.get('address_to_loc', {})
 		
@@ -94,6 +106,18 @@ class Geolocator_Comparator:
 		return {'smart_perfect': True, 'random': True}.get(geolocator.name, False)
 
 	def run(self, min_budget=100, max_budget=2500, step=100):
+		## Two-phase comparison, analogous to a train/test split:
+		##   (a) selection  - geolocator.measurements(budget) decides which pings
+		##       to spend, under realistic information limits (no ground truth;
+		##       the oracle deliberately cheats here, that is its job as an
+		##       upper bound).
+		##   (b) evaluation - the chosen measurements become location estimates
+		##       and are scored against ground-truth probe locations (perfect
+		##       information, unrealistic by design; ground truth is never fed
+		##       back into selection or estimation).
+		## Each strategy is a complete system of selection + estimation, so the
+		## baselines are *supposed* to lack the overlap computation: random+NN
+		## is the dumb whole-system baseline, greedy+overlap is ours.
 		self.load_target_measurement_data()
 
 		self.get_random_subsample()
@@ -123,7 +147,10 @@ class Geolocator_Comparator:
 			for budget in range(min_budget, max_budget + 1, step):
 				budgeted_measurements = geolocator.measurements(budget)
 				
-				# Use the pre-calculated estimates if the geolocator supports it
+				# A geolocator with get_current_estimates() brings its own
+				# estimation method (the greedy's live FeasibleRegion overlap
+				# estimates); everything else is paired with the converter-mode
+				# estimator (nearest_neighbor for the baselines).
 				if hasattr(geolocator, 'get_current_estimates'):
 					estimated_locations = geolocator.get_current_estimates()
 				else:

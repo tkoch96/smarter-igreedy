@@ -448,3 +448,59 @@ class TestPosteriorMeanGrid:
         assert shift_large < 800.0, (
             f"Large-sigma outlier moved estimate by {shift_large:.1f} km — still too dominant"
         )
+
+
+# ---------------------------------------------------------------------------
+# residual_nll — noise-model shapes
+# ---------------------------------------------------------------------------
+
+from probabilistic_helpers import (
+    residual_nll,
+    GAUSSIAN_NOISE,
+    STUDENT_T_NOISE,
+    ASYMMETRIC_NOISE,
+    ASYM_FAST_SCALE,
+)
+
+
+class TestResidualNll:
+    def test_zero_residual_costs_nothing_in_every_model(self):
+        for nm in (GAUSSIAN_NOISE, STUDENT_T_NOISE, ASYMMETRIC_NOISE):
+            assert residual_nll(0.0, 5.0, nm) == pytest.approx(0.0)
+
+    def test_gaussian_matches_squared_form(self):
+        assert residual_nll(6.0, 3.0, GAUSSIAN_NOISE) == pytest.approx(
+            6.0 ** 2 / (2 * 3.0 ** 2))
+
+    def test_student_t_saturates_relative_to_gaussian(self):
+        """The whole point of heavy tails: a big outlier costs far less
+        than quadratically, so it can't dominate the posterior."""
+        sigma = 3.0
+        big = 60.0    # 20σ detour
+        assert residual_nll(big, sigma, STUDENT_T_NOISE) < \
+            residual_nll(big, sigma, GAUSSIAN_NOISE) / 10.0
+
+    def test_student_t_close_to_gaussian_for_small_residuals(self):
+        """Near zero, log(1+x) ≈ x: robustness should be ~free in the bulk."""
+        sigma = 3.0
+        small = 0.5
+        g = residual_nll(small, sigma, GAUSSIAN_NOISE)
+        t = residual_nll(small, sigma, STUDENT_T_NOISE)
+        assert t == pytest.approx(g * (3.0 + 1.0) / 3.0, rel=0.05)
+
+    def test_asymmetric_penalises_faster_than_model_more(self):
+        """Beating the model (negative residual) approaches the SOL wall —
+        must cost much more than the same-size detour above it."""
+        sigma = 3.0
+        r = 6.0
+        assert residual_nll(-r, sigma, ASYMMETRIC_NOISE) > \
+            5.0 * residual_nll(r, sigma, ASYMMETRIC_NOISE)
+
+    def test_asymmetric_detour_tail_is_linear(self):
+        sigma = 3.0
+        assert residual_nll(20.0, sigma, ASYMMETRIC_NOISE) == pytest.approx(
+            2 * residual_nll(10.0, sigma, ASYMMETRIC_NOISE))
+
+    def test_unknown_model_raises(self):
+        with pytest.raises(ValueError):
+            residual_nll(1.0, 1.0, 'cauchy')
