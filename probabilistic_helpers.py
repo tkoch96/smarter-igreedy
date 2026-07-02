@@ -31,7 +31,7 @@ import math
 import numpy as np
 from typing import Any
 
-from utils import LatLon, get_distance
+from utils import LatLon, get_distance, _normalize_latlon
 
 # (vp_location, sigma_ms, rtt_ms)
 ProbConstraint = tuple[LatLon, float, float]
@@ -420,3 +420,89 @@ def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
             var_s[s] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
 
     return mu_s, var_s, mu_t, var_t
+
+
+def additive_map_location(constraint_rows: list, starts: list[LatLon]) -> LatLon:
+    """
+    MAP location under the additive model.  constraint_rows are
+    (vp_loc, rtt_ms, mean_offset_ms, var_sum_ms2) — expected rtt =
+    d/100 + mean_offset, per-measurement weight 1/var_sum.
+
+    Nelder-Mead is local, so several starts are tried and the best kept:
+    always pass the previous estimate AND the NN anchor (lowest-RTT VP) —
+    an early wrong fixed point must not trap later refits.
+    """
+    from scipy.optimize import minimize
+
+    def nll(x):
+        total = 0.0
+        for vp_loc, rtt, mean_off, var_sum in constraint_rows:
+            r = rtt - get_distance((x[0], x[1]), vp_loc) / KM_PER_MS - mean_off
+            total += r * r / (2.0 * var_sum)
+        return total
+
+    best, best_val = None, float('inf')
+    for start in starts:
+        res = minimize(nll, np.array(start), method='Nelder-Mead',
+                       tol=1e-4, options={'maxiter': 500})
+        if res.fun < best_val:
+            best, best_val = res.x, res.fun
+    return _normalize_latlon(float(best[0]), float(best[1]))
+
+
+class AdditiveLatencyModel:
+    """
+    Shared cross-target state for the additive two-way model — the
+    "LatencyModel" object the greedy needs because X_src is pooled across
+    ALL targets while FeasibleRegions are per-target.
+
+    Owns the accumulated raw measurements and the fitted per-node
+    (μ, σ²).  `refit` recomputes SOL residuals against the callers'
+    CURRENT location estimates (honest: no ground truth) and re-runs
+    `fit_additive_params` from its internal prior inits — deliberately
+    NOT warm-started: carrying early-budget fixed points forward degraded
+    full-budget error ~2× in the budget sweep.
+
+    Consumers:
+      predict(src, dst, dist_km) → (expected_rtt_ms, var_ms2)  with
+          expected rtt = d/100 + μ̂_s + μ̂_t and var = σ̂_s² + σ̂_t².
+          Unknown nodes fall back to the priors.
+      sigma_dst(dst) → σ̂_t, the "stop sinking budget here" signal.
+    """
+
+    def __init__(self) -> None:
+        self.rtts_by_pair: dict[tuple[str, str], list[float]] = {}
+        self.mu_s: dict[str, float] = {}
+        self.var_s: dict[str, float] = {}
+        self.mu_t: dict[str, float] = {}
+        self.var_t: dict[str, float] = {}
+
+    def record(self, src: str, dst: str, rtts: list[float]) -> None:
+        self.rtts_by_pair.setdefault((src, dst), []).extend(rtts)
+
+    def refit(self, vp_locs: dict[str, LatLon],
+              estimates: dict[str, LatLon]) -> None:
+        residuals = {
+            (s, t): [r - get_distance(vp_locs[s], estimates[t]) / KM_PER_MS
+                     for r in rs]
+            for (s, t), rs in self.rtts_by_pair.items()
+            if t in estimates and s in vp_locs
+        }
+        if residuals:
+            self.mu_s, self.var_s, self.mu_t, self.var_t = \
+                fit_additive_params(residuals)
+
+    def mean_offset(self, src: str, dst: str) -> float:
+        return (self.mu_s.get(src, ADDITIVE_PRIOR_MU_MS)
+                + self.mu_t.get(dst, ADDITIVE_PRIOR_MU_MS))
+
+    def var_sum(self, src: str, dst: str) -> float:
+        return (self.var_s.get(src, ADDITIVE_PRIOR_VAR_MS2)
+                + self.var_t.get(dst, ADDITIVE_PRIOR_VAR_MS2))
+
+    def predict(self, src: str, dst: str, dist_km: float) -> tuple[float, float]:
+        return (dist_km / KM_PER_MS + self.mean_offset(src, dst),
+                self.var_sum(src, dst))
+
+    def sigma_dst(self, dst: str) -> float:
+        return math.sqrt(self.var_t.get(dst, ADDITIVE_PRIOR_VAR_MS2))

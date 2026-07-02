@@ -33,6 +33,24 @@ def get_distance(loc1: LatLon, loc2: LatLon) -> float:
 	return fast_haversine(loc1[0], loc1[1], loc2[0], loc2[1])
 
 
+def _normalize_latlon(lat: float, lon: float) -> Tuple[float, float]:
+    """
+    Wrap coordinates back onto the globe (lat ∈ [-90, 90], lon ∈ [-180, 180)).
+
+    Nelder-Mead optimises lat/lon as unconstrained reals; the trig-based
+    haversine is periodic, so the optimiser happily converges to off-globe
+    parameterisations (lat=125°, lat=223°, ...) that are wrap-equivalent for
+    distance evaluation but garbage for every other consumer.  Crossing a
+    pole flips to the antimeridian.
+    """
+    lat = (lat + 90.0) % 360.0 - 90.0     # into [-90, 270)
+    if lat > 90.0:
+        lat = 180.0 - lat                 # walked over a pole
+        lon += 180.0
+    lon = (lon + 180.0) % 360.0 - 180.0
+    return lat, lon
+
+
 class LockedLocationDict(dict):
     """
     A dict whose values are inaccessible during simulation_mode().

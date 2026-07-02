@@ -556,3 +556,48 @@ class TestFitAdditiveParams:
         _, vs, _, vt = fit_additive_params(residuals)
         assert all(v > 0 for v in vs.values())
         assert all(v > 0 for v in vt.values())
+
+
+# ---------------------------------------------------------------------------
+# AdditiveLatencyModel — the shared cross-target state object
+# ---------------------------------------------------------------------------
+
+from probabilistic_helpers import (
+    AdditiveLatencyModel, ADDITIVE_PRIOR_MU_MS, ADDITIVE_PRIOR_VAR_MS2,
+)
+
+
+class TestAdditiveLatencyModel:
+    VP = {'a': (50.0, 0.0), 'b': (40.0, 10.0)}
+
+    def test_unfitted_falls_back_to_priors(self):
+        m = AdditiveLatencyModel()
+        rtt, var = m.predict('a', 't', 1000.0)
+        assert rtt == pytest.approx(10.0 + 2 * ADDITIVE_PRIOR_MU_MS)
+        assert var == pytest.approx(2 * ADDITIVE_PRIOR_VAR_MS2)
+        assert m.sigma_dst('t') == pytest.approx(math.sqrt(ADDITIVE_PRIOR_VAR_MS2))
+
+    def test_refit_learns_offsets_from_estimates(self):
+        """rtt = d/100 + 20ms everywhere → fitted mean offset ≈ 20ms
+        (the src/dst split itself is gauge-free)."""
+        m = AdditiveLatencyModel()
+        targets = {'t0': (48.0, 5.0), 't1': (52.0, 8.0)}
+        for s, s_loc in self.VP.items():
+            for t, t_loc in targets.items():
+                d = get_distance(s_loc, t_loc)
+                m.record(s, t, [d / 100.0 + 20.0, d / 100.0 + 20.0])
+        m.refit(self.VP, targets)
+        for s in self.VP:
+            for t in targets:
+                rtt, _ = m.predict(s, t, get_distance(self.VP[s], targets[t]))
+                d = get_distance(self.VP[s], targets[t])
+                assert rtt - d / 100.0 == pytest.approx(20.0, abs=2.0)
+
+    def test_refit_skips_pairs_without_estimates(self):
+        m = AdditiveLatencyModel()
+        m.record('a', 'known', [15.0])
+        m.record('a', 'unknown', [55.0])
+        m.refit(self.VP, {'known': (48.0, 5.0)})   # no estimate for 'unknown'
+        assert 'unknown' not in m.mu_t
+        # unknown target still served via priors
+        assert m.sigma_dst('unknown') == pytest.approx(math.sqrt(ADDITIVE_PRIOR_VAR_MS2))

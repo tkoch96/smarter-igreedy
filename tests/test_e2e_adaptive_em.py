@@ -365,7 +365,7 @@ class TestNoiseModelsUnderContamination:
 # solely for scoring (and by the labelled oracle).
 
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
-from feasible_region_maintainer import HARD_CIRCLE
+from feasible_region_maintainer import HARD_CIRCLE, ADDITIVE
 
 N_TARGETS = 5
 TARGET_LAT_RANGE = (38.0, 58.0)   # roughly the European VP cluster
@@ -381,7 +381,8 @@ MULTI_MU_RANGE = (1.0, 2.0)
 MULTI_SIGMA_RANGE = SIGMA_RANGE
 
 MULTI_STRATEGIES = ('random_nn', 'greedy_hard', 'greedy_gaussian',
-                    'greedy_gaussian_105', 'greedy_em', 'oracle')
+                    'greedy_gaussian_105', 'greedy_em', 'greedy_additive',
+                    'oracle')
 
 
 def make_multi_scenario(seed: int, mu_range=MULTI_MU_RANGE,
@@ -505,6 +506,7 @@ def run_multi_seed(seed: int, snapshot_ks=(), mu_range=MULTI_MU_RANGE,
         'greedy_gaussian_105': lambda: _run_greedy(sc, GAUSSIAN, snapshot_ks,
                                                    region_slope=1.05),
         'greedy_em':       lambda: _run_greedy(sc, EM_GAUSSIAN, snapshot_ks),
+        'greedy_additive': lambda: _run_greedy(sc, ADDITIVE, snapshot_ks),
         'oracle':          lambda: _run_oracle(sc, snapshot_ks),
     }
     for name, run in runners.items():
@@ -535,9 +537,16 @@ class TestMultiTargetBudgetAllocation:
     medians (deterministic seeds), with BASICALLY_GEOLOCATED acting as a
     deprioritisation rather than a hard stop:
 
-        k=10: random=1214  g_hard=1025  g_gauss=1022  g_em=1042  oracle=358
-        k=25: random= 699  g_hard= 772  g_gauss= 657  g_em= 561  oracle=236
-        k=50: random= 462  g_hard= 392  g_gauss= 521  g_em= 222  oracle=148
+        k=10: random=1214  g_hard=1025  g_gauss=1022  g_em=1042  g_add= 921  oracle=358
+        k=25: random= 699  g_hard= 772  g_gauss= 657  g_em= 561  g_add= 563  oracle=236
+        k=50: random= 462  g_hard= 392  g_gauss= 521  g_em= 222  g_add= 283  oracle=148
+
+    greedy_additive (shared src/dst model) plays an AWAY game here — the
+    world is multiplicative (per-target slope), which an additive offset
+    cannot represent — yet it is the best non-oracle strategy at k=10,
+    ties greedy_em at k=25 and still beats random at full budget; only the
+    world-matched em estimator stays ahead late (see
+    test_em_stays_ahead_of_additive_in_multiplicative_world).
 
     Findings pinned below:
     (a) greedy allocation wins the early budget regime;
@@ -631,6 +640,29 @@ class TestMultiTargetBudgetAllocation:
             _multi_med(multi_results, 'random_nn', 25)
         assert _multi_med(multi_results, 'greedy_gaussian', 25) < \
             _multi_med(multi_results, 'random_nn', 25)
+
+    def test_greedy_additive_wins_early_budget(self, multi_results):
+        """Model misspecification matters little in the early regime, where
+        allocation dominates: the additive greedy's trust-discounted utility
+        is the best non-oracle allocator at k=10 even in a world its model
+        class cannot represent (calibrated 921 vs random's 1214 and
+        greedy_em's 1042)."""
+        assert _multi_med(multi_results, 'greedy_additive', 10) < \
+            0.85 * _multi_med(multi_results, 'random_nn', 10)
+        assert _multi_med(multi_results, 'greedy_additive', 10) < \
+            _multi_med(multi_results, 'greedy_em', 10)
+
+    def test_greedy_additive_beats_random_at_full_budget(self, multi_results):
+        assert _multi_med(multi_results, 'greedy_additive', TOTAL_BUDGET) < \
+            0.75 * _multi_med(multi_results, 'random_nn', TOTAL_BUDGET)
+
+    def test_em_stays_ahead_of_additive_in_multiplicative_world(self, multi_results):
+        """Model class matches world: per-target slope em keeps the lead at
+        full budget over the additive offset model (222 vs 283 calibrated).
+        The mirror claim — additive wins its own world — is pinned in
+        test_e2e_additive_em.py."""
+        assert _multi_med(multi_results, 'greedy_em', TOTAL_BUDGET) < \
+            _multi_med(multi_results, 'greedy_additive', TOTAL_BUDGET)
 
     def test_oracle_dominates(self, multi_results):
         for k in (10, 25, 50):

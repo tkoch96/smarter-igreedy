@@ -1,107 +1,85 @@
-# Handoff: additive src/dst model → greedy integration + real data
+# Handoff: additive integration DONE → real-mesh greedy + robustness
 
-> Written 2026-07-02. State: all 147 tests green; the additive two-way
-> model is implemented and validated on synthetic data but NOT yet wired
-> into selection (the greedy) or the real-data harness. Read `CLAUDE.md`
-> for codebase mechanics and `SIMULATION_ENVIRONMENT.md` for the research
-> framing and the model ladder.
+> Written 2026-07-02 (supersedes the previous handoff, which asked for the
+> greedy integration and the real-mesh estimator run — both landed this
+> session). All 144+ tests green. Read `CLAUDE.md` for mechanics,
+> `SIMULATION_ENVIRONMENT.md` for the research framing.
 
-## Where things stand (one paragraph)
+## What landed this session
 
-Estimation has climbed a ladder: fixed-slope gaussian → toggleable noise
-models (asymmetric wins on real data) → per-target EM (`em_gaussian`) →
-the ADDITIVE two-way model `rtt = SOL + X_src + X_dst` with per-node
-(μ, σ) learned honestly by alternating EM
-(`probabilistic_helpers.fit_additive_params` +
-`tests/test_e2e_additive_em.py`). On synthetic additive ground truth the
-additive estimator is the only model-based method that beats
-nearest-neighbour (408 vs 605 km at full budget; per-target EM stalls at
-1180) and it identifies pathological destinations via σ̂_dst 100% of the
-time — the signal selection needs to stop sinking budget into hopeless
-targets (a pathology measured on the real mesh: median target got 3
-pings while one target absorbed 52).
+1. **`AdditiveLatencyModel`** (`probabilistic_helpers.py`) — the shared
+   cross-target state object: records raw (src, dst) samples, refits
+   per-node (μ̂, σ̂²) via `fit_additive_params` against CURRENT estimates
+   (fresh inits every call), serves `predict(src, dst, d) →
+   (expected_rtt, var)` and `sigma_dst(t)`.
+2. **`FeasibleRegion(mode='additive', model=...)`** — src-aware
+   constraints, MAP weights 1/(σ̂_s²+σ̂_t²), precision-aware region size
+   (weighted-rms residual + 1/sqrt(Σw) floor, km), `reoptimize()`.
+3. **Greedy integration** (`region_mode=ADDITIVE`): shared model refit per
+   ping (`model_refit_every=`), `additive_utility_evaluator` with the
+   σ̂_dst TRUST DISCOUNT `prior_var/(prior_var+σ̂_t²)`, final
+   reoptimize-all before estimates are read.
+4. `greedy_additive` lines + calibrated assertions in BOTH budget figures
+   (`error_over_measurements_additive.pdf`, `..._adaptive.pdf`).
+5. **`'additive_em'` / `'em_gaussian'` / `'em_asymmetric'` converter
+   modes** in `assess_geolocators.py` + `assess_additive_real.py` (driver:
+   same random measurements through every estimator, mean AND median).
 
-## Immediate TODO (a): put the additive model under GREEDY selection
+## Results (pinned by tests or cached pickles)
 
-Context for the question "why does the new unit test use a random
-measurement order — didn't we change that?":
+Synthetic additive world (10 seeds): greedy_additive 1151 → 634 → 476 km
+over b = 30/120/240 vs random-order additive_em 1488 → 530 → 408.
+Selection wins early; small full-budget estimation premium (min-of-reps,
+see pitfalls). Budget sink FIXED: pathological ping share 0.20-0.30
+(fair 0.25) vs em-greedy's 0.33-0.50 on identical scenarios.
 
-- `error_over_measurements_adaptive.pdf` (test_e2e_adaptive_em.py,
-  `run_multi_seed`) DOES use greedy selection — that was changed as
-  requested. Only its `random_nn` baseline is random-ordered.
-- The NEW additive sweep (`error_over_measurements_additive.pdf`,
-  `run_additive_budget_seed`) uses a shared random order for ALL
-  estimators **by design, as a stopgap**: it isolates the estimation
-  question because the additive estimator cannot run inside
-  `Iterative_Greedy_Geolocator` yet. The blocker is structural:
-  `FeasibleRegion` is a per-target object, but the additive model needs
-  per-SOURCE state shared across all targets (X_src is pooled).
+Real mesh (seed 31415; `cache/additive_real_results_n{20,100}.pkl`):
+- n=20 full coverage: additive mean 1927 / median 575 — FIRST model-based
+  estimator to beat NN (2496/604) on both stats; em_asym 1894/791.
+- n=100: additive is best model-based MEDIAN at every budget ≥ 1000
+  (933 vs em_asym 1091 at b=2500) and breaks the per-target-em floor
+  (2081 vs 3247 mean); em_asym keeps a better MEAN at high budget
+  (1702 vs 2081); NN stays ahead overall (1249/467) — dense-coverage
+  regime, expected.
 
-The task: give the greedy a shared model object (this is the
-`LatencyModel` interface sketched in TODOS #4):
+## Pitfalls paid for THIS session (on top of the three previous ones)
 
-1. A coordinator owning (μ_s, σ_s, μ_t, σ_t), refitted from all
-   accumulated measurements via `fit_additive_params` after each ping
-   (or every few pings).
-2. Regions (or their replacement) consult it for expected rtt and
-   per-measurement variance; MAP weights = 1/(σ_s² + σ_t²).
-3. THE PAYOFF — use σ̂_dst in the utility: expected information gain of
-   another ping to target t shrinks as σ̂_t grows, so the greedy learns
-   to redirect budget away from pathological targets. This should fix
-   the budget-sink measured in the flatline debugging session.
-4. Then extend both budget figures with `greedy_additive` lines.
+- **Trust discount is load-bearing.** Ranking by raw simulated km
+  reduction makes a pathological target OUTBID finished ones: its
+  statistical floor is huge, so one more ping promises a large absolute
+  reduction. Discount by prior_var/(prior_var+σ̂_t²)
+  (`additive_utility_evaluator`).
+- **Greedy regions must constrain on MIN-of-reps** while the model records
+  all reps. Per-rep constraints let the pinged region's location step
+  absorb the pair's full mean offset → zero residuals → μ̂_t collapse
+  (measured: patho μ̂_t 8.2 vs true 35.1, errors 4400+ km). The min-vs-mean
+  gap keeps residuals positive so the parameter step claims the offset.
+- **Single-VP constraint sets must anchor at the VP**, not optimise: NM
+  parks them on an arbitrary ring point whose zero residuals feed the same
+  collapse (relevant once replicated samples make len(constraints) > 1
+  with one distinct VP).
 
-Implementation pitfalls already paid for (don't rediscover them):
-- Run the PARAMETER step before the location step each EM iteration —
-  otherwise a pathological target's offset is absorbed into distance
-  (μ̂_t collapses to ~3ms vs true ~59; a self-consistent wrong fixed
-  point). See the comment in `run_additive_em`.
-- Do NOT warm-start the fit across budget points — early-budget fixed
-  points carried forward degraded full-budget error 2×. Fresh
-  NN-anchored inits per refit. See comment in `run_additive_budget_seed`.
-- Location MAP: multi-start Nelder-Mead (previous estimate + NN start);
-  normalize coordinates afterwards (`_normalize_latlon`).
+## Next steps (ordered; TODOS.md #0/#1)
 
-## Immediate TODO (b): run the additive methodology on the REAL mesh
+1. **Real-mesh greedy_additive** — whole-system comparison: add
+   `Iterative_Greedy_Geolocator(region_mode=ADDITIVE, name='greedy_additive')`
+   to `Geolocator_Comparator.self.geolocators`, rerun `run()` at n=100 vs
+   greedy_em / random+NN. Bump `model_refit_every` to ~10-25 (per-ping
+   refits are O(pairs)). The n=100 greedy_em runs took hours on the laptop
+   — budget accordingly or trim the geolocator list.
+2. **Robustify the additive parameter step** (median/trimmed means): real
+   residuals are one-sided heavy-tailed; the gaussian M-step feels detours
+   — that's why em_asymmetric still wins the n=100 MEAN. Mirror the robust
+   fits the per-target EM M-step already has.
+3. **Replication**: lift the `fni == 10` early-exit in
+   `load_parsed_target_data` (TODOS #9) — per-pair variance from a single
+   residual pools weakly; more hourly samples sharpen the σ̂ split.
 
-Goal: assess_geolocators-style numbers for the additive estimator on
-RIPE data, against NN / per-target em / em_asymmetric baselines.
+## Workflow reminders
 
-Recommended path (no greedy needed for a first result):
-- Add converter mode `'additive_em'` to
-  `Geolocator_Comparator.convert_measurements_to_locations` — that
-  method receives the FULL budgeted measurement dict, so a cross-target
-  fit fits naturally inside it (unlike per-target FeasibleRegion modes).
-  Port the loop from `run_additive_em` (params-first, fresh inits).
-- Or, quicker and dirtier: a driver mirroring `run_additive_em` directly
-  on `gc.target_data` after `get_random_subsample(n)`.
-
-Real-data practicalities:
-- The measurement cache stores ONE rtt per pair (wrapped into a
-  1-element list on load). `fit_additive_params` still works — per-pair
-  variance from a single residual is noisy but pools across ~n pairs per
-  node — but variance estimates improve a lot with replication:
-  consider lifting the `fni == 10` early-exit in
-  `load_parsed_target_data` (TODOS #9) to get more hourly samples.
-- Real residuals are one-sided/heavy-tailed; the gaussian additive
-  M-step will feel detours. If results disappoint, robustify the
-  parameter step (median/trimmed means) the way the per-target EM's
-  M-step already does for non-gaussian noise models.
-- Reference numbers to beat (same seed-31415 20-probe subsample):
-  NN mean 2496 / median 604; per-target em mean 3913; em_asymmetric
-  mean 2054 / median 594 (the current best honest estimator). At
-  n=100: NN@full-coverage mean ≈ 1620; per-target-em floor ≈ 2601.
-- Workflow: smoke at `n_subsample=20` before 100 (cheap, same code
-  path). `run(..., n_subsample=)` is threaded; result caches include
-  the subsample size in the filename. Drive via a real script file
-  (macOS spawn breaks stdin/-c drivers with the greedy's process pool).
-- Report MEDIANS alongside means — the subsample contains isolated
-  targets (Guam/Cape Town/Dallas at n=20) whose ~10,000 km errors
-  dominate any mean.
-
-## Secondary follow-ups (see TODOS.md for the full list)
-
-- Budget-sink fix without the full additive integration: per-target
-  ping cap, or utility driven by `region.expected_rtt_ms` (TODOS #3/#4).
-- `noise_model` plumbing through the greedy constructor (one parameter).
-- Oracle estimation-half mismatch (TODOS #2).
+- Smoke any real-mesh change at `n_subsample=20` first (2 s vs minutes);
+  result caches embed the subsample size.
+- Drive greedy runs from a real script file with an
+  `if __name__ == '__main__':` guard — macOS spawn re-imports __main__
+  (breaks stdin/-c drivers AND unguarded scripts).
+- Report medians alongside means (isolated probes dominate means).

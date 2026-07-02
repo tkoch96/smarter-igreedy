@@ -95,6 +95,23 @@ location, no ground truth). Each measurement update alternates:
 A full refit per update is used instead of an EWMA because a target sees at
 most tens of pings — no forgetting needed.
 
+### `mode='additive'`
+
+The two-way model `rtt = d/100 + X_src + X_dst` with per-node (μ, σ²) held
+in a SHARED `probabilistic_helpers.AdditiveLatencyModel` (constructor param
+`model=`) — X_src pools across all targets, so the parameters cannot live in
+a per-target region. The region stores `(vp_loc, src_id, rtt)` constraints
+(`add_measurement(..., src=)`), consults the model for offsets and
+per-measurement variance (MAP weight `1/(σ̂_s² + σ̂_t²)`), and its
+`get_region_size()` is precision-aware: weighted-rms residual + statistical
+floor `1/sqrt(Σw)`, in km. The model owner refits (`model.refit(vp_locs,
+estimates)` — fresh, never warm-started) and calls `region.reoptimize()`.
+Location MAP multi-starts from [previous estimate, NN anchor]
+(`probabilistic_helpers.additive_map_location`). Single-VP constraint sets
+(replicated samples) anchor at the VP itself — optimising them parks the
+estimate on an arbitrary ring point whose zero residuals rob μ̂_t of its
+offset (the params-first pitfall through the back door).
+
 ### `noise_model` toggle (soft modes)
 
 The per-residual likelihood shape is a constructor toggle on gaussian and
@@ -206,9 +223,22 @@ re-runs operate on already-pruned data.
 | `'nearest_neighbor'` | Estimate = location of lowest-RTT VP seen |
 | `'hard_circle'` | FeasibleRegion(mode='hard_circle') on all pings |
 | `'gaussian'` | FeasibleRegion(mode='gaussian', σ=GLOBAL_SIGMA_MS) on all pings |
+| `'em_gaussian'` | FeasibleRegion(mode='em_gaussian'), batch-added |
+| `'em_asymmetric'` | em_gaussian + one-sided asymmetric noise model |
+| `'additive_em'` | cross-target two-way fit (`_convert_additive_em`): params-first alternation, fresh NN-anchored inits per call |
 
 Default is `'nearest_neighbor'`. The `random` geolocator baseline always uses
-this mode.
+this mode. `assess_additive_real.py` compares the estimator modes on
+identical random-ordered measurements (mean AND median per budget; medians
+matter — isolated probes' ~10,000 km errors dominate means).
+
+Real-mesh estimator findings (seed 31415, random order, full budget):
+at n=20 additive_em (mean 1927 / median 575) is the first model-based
+estimator to beat NN (2496 / 604) on both stats; em_asymmetric 1894 / 791.
+At n=100 / budget 2500, NN stays ahead overall (1249 / 467, dense-coverage
+regime) but additive_em is the best model-based median at every budget ≥
+1000 (933 vs em_asymmetric's 1091 at 2500) and breaks the per-target-em
+floor (2081 vs 3247 mean). Cached: `cache/additive_real_results_n{20,100}.pkl`.
 
 ---
 
@@ -304,11 +334,23 @@ python3 -m pytest tests/ -v
 
 ## Iterative Greedy — key mechanics
 
-- `region_mode` constructor param (`HARD_CIRCLE` default, or `GAUSSIAN`)
-  selects the overlap methodology for the greedy's own regions — both the
-  selection utility and its reported estimates. `get_region_size()` returns
-  km-equivalents in both modes (gaussian = mean residual × 100 km/ms), so
+- `region_mode` constructor param (`HARD_CIRCLE` default, `GAUSSIAN`,
+  `EM_GAUSSIAN`, or `ADDITIVE`) selects the overlap methodology for the
+  greedy's own regions — both the selection utility and its reported
+  estimates. `get_region_size()` returns km-equivalents in all modes, so
   `BASICALLY_GEOLOCATED = 200` km applies uniformly.
+- `ADDITIVE` mode: one shared `AdditiveLatencyModel` across all regions,
+  refit from all accumulated measurements after every actual ping
+  (`model_refit_every=`); regions constrain on MIN-of-reps while the model
+  records all reps — feeding every rep to the region lets its location step
+  absorb a pair's full mean offset and collapse μ̂_t (measured: patho μ̂_t
+  8.2 vs true 35, errors 4400+ km). `additive_utility_evaluator` predicts
+  RTT via the model and discounts the simulated km gain by
+  `prior_var/(prior_var + σ̂_t²)` — without the discount a pathological
+  target OUTBIDS finished ones (its statistical floor promises big absolute
+  reductions). Measured effect: patho ping share 0.20-0.30 (fair 0.25) vs
+  em-greedy's 0.33-0.50 on identical scenarios. All regions get a final
+  `reoptimize()` under the last fit before `measurements()` returns.
 - `BASICALLY_GEOLOCATED` (200km region size) DEPRIORITISES a target rather
   than dropping it: done targets rank below every unfinished one, and
   leftover budget flows to the least-certain done target via its nearest
@@ -342,6 +384,8 @@ TargetData = dict[str, Any]                    # 'address_to_loc' + 'loc_loc_mea
 
 ```
 assess_geolocators.py              entry point / comparator harness
+assess_additive_real.py            real-mesh estimator comparison at matched
+                                   measurements (NN / em / em_asym / additive)
 assess_probabilistic.py            real-data Gaussian vs hard-circle sweep (analysis only)
 analyze_latency_distance.py        offline RTT vs distance model fitting (analysis only)
 feasible_region_maintainer.py      FeasibleRegion: hard_circle + gaussian modes
@@ -364,7 +408,11 @@ tests/test_e2e_additive_em.py         additive two-way model rtt = SOL + X_src +
                                       learns per-node (μ, σ); σ̂_dst flags pathological
                                       destinations; beats per-target EM ~2× (batch) and
                                       is the only model-based estimator to beat NN in
-                                      the budget sweep (408 vs 605 km at full budget)
+                                      the budget sweep (408 vs 605 km at full budget).
+                                      Also the greedy_additive sweep: greedy selection
+                                      beats the random order early (1151 vs 1488 at
+                                      b=30) and never sinks budget into pathological
+                                      targets (share ≤ 0.30, fair = 0.25)
 tests/plot_error_additive.py          error-vs-budget curves under the additive world
                                       (writes tests/error_over_measurements_additive.pdf)
 tests/test_e2e_adaptive_em.py         online-EM e2e (single-target estimator comparison

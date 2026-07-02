@@ -4,14 +4,17 @@ Error-vs-measurements curves under the ADDITIVE two-way overhead world
 
 Ground truth: rtt = SOL + X_src + X_dst with per-node hidden (μ, σ), two
 pathological destinations per scenario. Every strategy sees the SAME random
-measurement order — the lines differ only in estimation:
+measurement order — the lines differ only in estimation — except
+greedy_additive, which selects its own pings:
 
-    random_nn       lowest-RTT VP seen
-    const_gaussian  fixed slope 1.3
-    per_target_em   per-target multiplicative (μ_t, σ_t)
-    additive_em     per-source AND per-destination (μ, σ) — the only model
-                    class that can represent this world
-    oracle          true per-node parameters (explicit cheat)
+    random_nn        lowest-RTT VP seen
+    const_gaussian   fixed slope 1.3
+    per_target_em    per-target multiplicative (μ_t, σ_t)
+    additive_em      per-source AND per-destination (μ, σ) — the only model
+                     class that can represent this world
+    greedy_additive  Iterative_Greedy_Geolocator + shared AdditiveLatencyModel,
+                     σ̂_dst-discounted utility (selection + estimation system)
+    oracle           true per-node parameters (explicit cheat)
 
 Run directly:
     cd ~/Documents/smarter-igreedy
@@ -39,6 +42,7 @@ LABELS = {
     'const_gaussian': 'gaussian, slope = 1.3 (constant)',
     'per_target_em':  'per-target em (multiplicative μ_t, σ_t)',
     'additive_em':    'additive em (per-source AND per-dest μ, σ)',
+    'greedy_additive': 'GREEDY selection + additive em (σ̂_dst in utility)',
     'oracle':         'oracle (true per-node μ, σ)',
 }
 STYLES = {
@@ -46,6 +50,7 @@ STYLES = {
     'const_gaussian': dict(color='darkorange'),
     'per_target_em':  dict(color='steelblue',  linestyle='--'),
     'additive_em':    dict(color='crimson',    linewidth=2.2),
+    'greedy_additive': dict(color='darkviolet', linewidth=2.2),
     'oracle':         dict(color='black',      linestyle='-.'),
 }
 
@@ -69,8 +74,8 @@ def make_figure(rows=None, output_path: str = OUT_PATH) -> str:
     ax.set_title(
         f'Additive world: rtt = SOL + X_src + X_dst, per-node hidden (μ, σ), '
         f'{N_PATHOLOGICAL} pathological destinations —\n'
-        f'{len(rows)} seeds, identical measurement order for every estimator '
-        f'(early regime penalty-dominated)',
+        f'{len(rows)} seeds, identical random order for every estimator '
+        f'except greedy_additive, which selects its own pings',
         fontsize=10,
     )
     ax.set_ylim(0, 3000)

@@ -38,7 +38,10 @@ import numpy as np
 import pytest
 from scipy.optimize import minimize
 
-from feasible_region_maintainer import FeasibleRegion, GAUSSIAN, EM_GAUSSIAN, _normalize_latlon
+from feasible_region_maintainer import (
+    FeasibleRegion, GAUSSIAN, EM_GAUSSIAN, ADDITIVE, _normalize_latlon,
+)
+from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
 from probabilistic_helpers import KM_PER_MS, fit_additive_params
 from utils import get_distance, LatLon
 
@@ -282,12 +285,49 @@ class TestAdditiveModel:
 # triples); strategies differ only in estimation. The additive EM is the
 # only one whose model class can represent this world, so it should win
 # once enough cross-target data has accumulated.
+#
+# greedy_additive is the exception: it SELECTS its own measurement order
+# (Iterative_Greedy_Geolocator with additive-mode regions sharing one
+# AdditiveLatencyModel). One greedy selection buys the whole (src, dst)
+# pair — all N_REPS samples — and is charged N_REPS budget units so the
+# x-axis stays comparable with the per-rep random order.
 
 MISSING_PENALTY_KM = 10_000.0
 TOTAL_PINGS = len(VP_LOCS) * N_TARGETS * N_REPS          # 240
 BUDGET_GRID = (10, 20, 30, 45, 60, 90, 120, 160, 200, 240)
 SWEEP_STRATEGIES = ('random_nn', 'const_gaussian', 'per_target_em',
-                    'additive_em', 'oracle')
+                    'additive_em', 'greedy_additive', 'oracle')
+
+
+def run_greedy_additive_seed(sc: dict) -> tuple[list[float], dict]:
+    """Greedy selection + additive estimation over BUDGET_GRID.
+    Returns (error curve, cumulative pathological ping share per budget)."""
+    loc_loc_meas: dict[str, dict[str, list[float]]] = {}
+    for (s, t), rtts in sc['rtts'].items():
+        loc_loc_meas.setdefault(s, {})[t] = list(rtts)
+    data = {'address_to_loc': dict(VP_LOCS), 'loc_loc_meas': loc_loc_meas}
+    patho = {t for t, tp in sc['targets'].items() if tp['pathological']}
+
+    ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE)
+    ig.set_data(data)
+    ig.solve()
+    errs, patho_share = [], {}
+    try:
+        for b in BUDGET_GRID:
+            ig.measurements(b // N_REPS)   # extends history incrementally
+            est = ig.get_current_estimates()
+            errs.append(float(np.mean([
+                get_distance(est[t], tp['loc']) if t in est
+                else MISSING_PENALTY_KM
+                for t, tp in sc['targets'].items()
+            ])))
+            n_hist = len(ig.measurement_history)
+            patho_share[b] = (
+                sum(1 for _, t in ig.measurement_history if t in patho)
+                / max(n_hist, 1))
+    finally:
+        ig.cleanup()
+    return errs, patho_share
 
 
 def run_additive_budget_seed(seed: int) -> dict:
@@ -369,7 +409,9 @@ def run_additive_budget_seed(seed: int) -> dict:
             orc[t2] = _map_location(rows, [nn_est[t2], (48.0, 10.0)])
         curves['oracle'].append(avg_err(orc))
 
-    return {'scenario': sc, 'curves': curves}
+    curves['greedy_additive'], patho_share = run_greedy_additive_seed(sc)
+
+    return {'scenario': sc, 'curves': curves, 'greedy_patho_share': patho_share}
 
 
 N_SWEEP_SEEDS = 10
@@ -404,6 +446,36 @@ class TestAdditiveBudgetSweep:
     def test_oracle_bounds_additive_at_full_budget(self, sweep_results):
         assert _sweep_med(sweep_results, 'oracle', 240) <= \
             _sweep_med(sweep_results, 'additive_em', 240)
+
+    # -- greedy_additive: selection + estimation as one system --------------
+    # Calibrated medians (10 seeds): greedy 1151 → 634 → 476 over
+    # b = 30/120/240 vs additive_em's 1488 → 530 → 408. Selection wins the
+    # early regime (fewer pings placed better); at full budget both see every
+    # pair and the greedy pays a small estimation premium: its regions
+    # constrain on min-of-reps, which is what keeps the incremental μ̂_t fit
+    # honest (see the comment in Iterative_Greedy_Geolocator.measurements).
+
+    def test_greedy_selection_beats_random_order_early(self, sweep_results):
+        """The point of selection: at b=30 the greedy places its (fewer)
+        pings better than the shared random order feeds additive_em."""
+        assert _sweep_med(sweep_results, 'greedy_additive', 30) < \
+            _sweep_med(sweep_results, 'additive_em', 30)
+
+    def test_greedy_additive_beats_all_baselines_at_full_budget(self, sweep_results):
+        g = _sweep_med(sweep_results, 'greedy_additive', 240)
+        for other in ('random_nn', 'const_gaussian', 'per_target_em'):
+            assert g < _sweep_med(sweep_results, other, 240)
+
+    def test_greedy_does_not_sink_budget_into_pathological_targets(self, sweep_results):
+        """THE payoff of σ̂_dst in the utility (trust-discounted gain): the
+        pathological targets' share of greedy pings stays at/below their
+        fair share (N_PATHOLOGICAL/N_TARGETS = 0.25) at partial budget.
+        Reference sinks: em-greedy took 0.33-0.50 on the same scenarios;
+        the real mesh showed one target absorbing 52 pings (median 3).
+        Calibrated: median 0.225, max 0.30."""
+        shares = [r['greedy_patho_share'][120] for r in sweep_results]
+        assert float(np.median(shares)) <= 0.28
+        assert max(shares) <= 0.35
 
     def test_generate_figure(self, sweep_results):
         """Renders tests/error_over_measurements_additive.pdf from the same

@@ -4,10 +4,12 @@ import numpy as np
 from scipy.optimize import minimize
 from typing import Optional
 
-from utils import LatLon, get_distance
+from utils import LatLon, get_distance, _normalize_latlon
 from probabilistic_helpers import (
     gaussian_nll,
     mean_absolute_residual,
+    additive_map_location,
+    AdditiveLatencyModel,
     GLOBAL_SIGMA_MS,
     GAUSSIAN_NOISE,
     STUDENT_T_NOISE,
@@ -21,24 +23,6 @@ from probabilistic_helpers import (
 TARGET_OF_INTEREST = os.environ.get('FEASIBLE_REGION_DEBUG_TARGET')
 
 EARTH_RADIUS_KM = 6371.0
-
-
-def _normalize_latlon(lat: float, lon: float) -> tuple[float, float]:
-    """
-    Wrap coordinates back onto the globe (lat ∈ [-90, 90], lon ∈ [-180, 180)).
-
-    Nelder-Mead optimises lat/lon as unconstrained reals; the trig-based
-    haversine is periodic, so the optimiser happily converges to off-globe
-    parameterisations (lat=125°, lat=223°, ...) that are wrap-equivalent for
-    distance evaluation but garbage for every other consumer.  Crossing a
-    pole flips to the antimeridian.
-    """
-    lat = (lat + 90.0) % 360.0 - 90.0     # into [-90, 270)
-    if lat > 90.0:
-        lat = 180.0 - lat                 # walked over a pole
-        lon += 180.0
-    lon = (lon + 180.0) % 360.0 - 180.0
-    return lat, lon
 
 
 def _destination_point(loc: 'LatLon', bearing_rad: float, dist_km: float) -> 'LatLon':
@@ -65,6 +49,7 @@ HardConstraint = tuple[LatLon, float]
 HARD_CIRCLE = 'hard_circle'
 GAUSSIAN    = 'gaussian'
 EM_GAUSSIAN = 'em_gaussian'
+ADDITIVE    = 'additive'
 
 # EM (adaptive gaussian) settings
 EM_ITERS = 4               # E/M alternations per measurement update
@@ -106,10 +91,21 @@ class FeasibleRegion:
                           prior-anchored least-squares refit of (μ, σ) from
                           the residuals.  `slope` holds the current μ.
 
+    mode='additive'     — the two-way model rtt = d/100 + X_src + X_dst.
+                          Per-node (μ, σ²) live in a SHARED
+                          AdditiveLatencyModel (constructor param `model`)
+                          because X_src pools across all targets; the region
+                          only stores its own (vp_loc, src_id, rtt)
+                          constraints and consults the model for offsets and
+                          per-measurement variance (MAP weight
+                          1/(σ_s² + σ_t²)).  The model owner (the greedy /
+                          converter) is responsible for refitting it and
+                          calling reoptimize().
+
     The public API (add_measurement, add_measurements_batch, get_region_size,
-    get_location, clone, distance_to) is identical in both modes.
-    add_measurement accepts an optional sigma_ms argument that is used only
-    in gaussian mode.
+    get_location, clone, distance_to) is identical in all modes.
+    add_measurement accepts an optional sigma_ms argument (gaussian modes
+    only) and an optional src id (additive mode only).
     """
 
     def __init__(
@@ -120,6 +116,7 @@ class FeasibleRegion:
         radius_multiplier: float = RADIUS_MULTIPLIER,
         slope: float = DEFAULT_SLOPE,
         noise_model: str = GAUSSIAN_NOISE,
+        model: Optional[AdditiveLatencyModel] = None,
     ) -> None:
         self.target_id = target_id
         self.mode = mode
@@ -138,9 +135,15 @@ class FeasibleRegion:
         # Ignored by hard_circle mode.
         self.noise_model = noise_model
         self.radius_multiplier = radius_multiplier
+        # Shared cross-target parameter state (additive mode only); the
+        # region never mutates it.
+        self.model = model
+        if mode == ADDITIVE and model is None:
+            self.model = AdditiveLatencyModel()   # standalone/test use
         self.best_guess: np.ndarray = np.array(prior_guess)
         # hard_circle: list[HardConstraint]   (vp_loc, max_radius_km)
         # gaussian:    list[ProbConstraint]   (vp_loc, sigma_ms, rtt_ms)
+        # additive:    list[(vp_loc, src_id, rtt_ms)]
         self.constraints: list = []
         self._cached_region_size: Optional[float] = None
 
@@ -165,21 +168,27 @@ class FeasibleRegion:
         vp_loc: LatLon,
         min_rtt: float,
         sigma_ms: float = GLOBAL_SIGMA_MS,
+        src: Optional[str] = None,
     ) -> None:
-        """Add a single RTT measurement and update the location estimate."""
+        """Add a single RTT measurement and update the location estimate.
+        `src` (the VP's id) is required in additive mode — the shared model
+        keys per-source parameters by it; other modes ignore it."""
         if self.target_id == TARGET_OF_INTEREST:
             print(f"[{self.target_id}] add_measurement vp={vp_loc} rtt={min_rtt:.2f}ms")
-        self._append_constraint(vp_loc, min_rtt, sigma_ms)
+        self._append_constraint(vp_loc, min_rtt, sigma_ms, src)
         self._update_estimate()
 
     def add_measurements_batch(
         self,
         measurements: list[tuple[LatLon, float]],
         sigma_ms: float = GLOBAL_SIGMA_MS,
+        src: Optional[str] = None,
     ) -> None:
-        """Batch-add measurements, re-optimising only once at the end."""
+        """Batch-add measurements, re-optimising only once at the end.
+        `src` applies to every entry (additive mode: replicated samples of
+        one pair enter as individual constraints)."""
         for vp_loc, min_rtt in measurements:
-            self._append_constraint(vp_loc, min_rtt, sigma_ms)
+            self._append_constraint(vp_loc, min_rtt, sigma_ms, src)
         self._update_estimate()
 
     def get_region_size(self) -> float:
@@ -208,19 +217,27 @@ class FeasibleRegion:
 
         if self.mode == HARD_CIRCLE:
             result = self._hard_circle_region_size()
+        elif self.mode == ADDITIVE:
+            result = self._additive_region_size()
         else:
             result = (mean_absolute_residual(self.get_location(), self.constraints,
                                              slope=self.slope)
                       * KM_PER_MS / self.slope)
 
-        if len(self.constraints) < 3:
-            # Trilateration bound: with fewer than 3 VPs the position is
-            # geometrically ambiguous no matter how well the RTTs fit
-            # (1 ping -> a ring of candidates, 2 pings -> two mirror
-            # intersection points).  Without this floor, two consistent
-            # pings give a near-zero gaussian residual and the region
-            # falsely reports "geolocated".  Floor the reported
-            # uncertainty at the best ping's model-implied distance.
+        # Trilateration bound: with fewer than 3 VPs the position is
+        # geometrically ambiguous no matter how well the RTTs fit
+        # (1 ping -> a ring of candidates, 2 pings -> two mirror
+        # intersection points).  Without this floor, two consistent
+        # pings give a near-zero gaussian residual and the region
+        # falsely reports "geolocated".  Floor the reported
+        # uncertainty at the best ping's model-implied distance.
+        # Additive mode counts DISTINCT VPs — replicated samples of one
+        # pair are several constraints but zero extra geometry.
+        if self.mode == ADDITIVE:
+            n_geom = len({src for _, src, _ in self.constraints})
+        else:
+            n_geom = len(self.constraints)
+        if n_geom < 3:
             result = max(result, self._min_implied_distance_km())
 
         self._cached_region_size = result
@@ -238,7 +255,8 @@ class FeasibleRegion:
         new_region = FeasibleRegion(self.target_id, mode=self.mode,
                                     radius_multiplier=self.radius_multiplier,
                                     slope=self.slope,
-                                    noise_model=self.noise_model)
+                                    noise_model=self.noise_model,
+                                    model=self.model)
         new_region.prior_slope = self.prior_slope
         new_region.fitted_sigma_ms = self.fitted_sigma_ms
         new_region.best_guess = self.best_guess.copy()
@@ -250,12 +268,25 @@ class FeasibleRegion:
         """Great-circle distance from the current estimate to vp_loc (km)."""
         return get_distance(vp_loc, self.get_location())
 
+    def reoptimize(self) -> None:
+        """Re-run the location fit under the current model parameters.
+        The additive model owner calls this after a refit — the shared
+        (μ, σ²) changed under the region's feet, so both the MAP location
+        and the cached size are stale."""
+        self._cached_region_size = None
+        self._update_estimate()
+
     def _min_implied_distance_km(self) -> float:
         """Model-implied distance of the best (lowest-RTT) constraint.
         Hard constraints store the radius = implied distance × multiplier,
         so the implied distance is recovered by undoing the multiplier."""
         if self.mode == HARD_CIRCLE:
             return min(radius for _, radius in self.constraints) / self.radius_multiplier
+        if self.mode == ADDITIVE:
+            return min(
+                max(0.0, rtt - self.model.mean_offset(src, self.target_id))
+                * KM_PER_MS
+                for _, src, rtt in self.constraints)
         return min(self.implied_distance_km(rtt) for _, _, rtt in self.constraints)
 
     # ------------------------------------------------------------------
@@ -444,14 +475,76 @@ class FeasibleRegion:
         return mu, sigma
 
     # ------------------------------------------------------------------
+    # Internal — additive mode (shared two-way src/dst model)
+    # ------------------------------------------------------------------
+
+    def _additive_rows(self) -> list:
+        """(vp_loc, rtt, mean_offset, var_sum) rows for the MAP objective."""
+        t = self.target_id
+        return [(vp_loc, rtt, self.model.mean_offset(src, t),
+                 self.model.var_sum(src, t))
+                for vp_loc, src, rtt in self.constraints]
+
+    def _nn_anchor(self) -> LatLon:
+        """Location of the lowest-RTT constraint — the NN start that keeps
+        multi-start MAP from being trapped by an early wrong fixed point."""
+        return min(self.constraints, key=lambda c: c[2])[0]
+
+    def _update_estimate_additive(self) -> None:
+        # Distinct VPs, not raw constraints: replicated samples of one pair
+        # are one bearing.  Optimising a single-VP set would park the
+        # estimate on an arbitrary ring point at the model-implied distance,
+        # whose near-zero residuals then rob μ̂_t of the offset it should
+        # claim (the params-first pitfall through the back door).  Anchor at
+        # the VP itself instead.
+        if len({src for _, src, _ in self.constraints}) == 1:
+            self.best_guess = np.array(self.constraints[0][0])
+            return
+        estimate = additive_map_location(
+            self._additive_rows(),
+            [self.get_location(), self._nn_anchor()])
+        self.best_guess = np.array(estimate)
+
+    def _additive_region_size(self) -> float:
+        """
+        Uncertainty proxy in km, precision-aware so the greedy's utility
+        (expected size reduction of a simulated ping) inherits the σ̂
+        signal:
+
+          fit_ms   = precision-WEIGHTED rms residual at the estimate.  A
+                     simulated zero-residual ping to a pathological target
+                     carries weight 1/(σ_s² + σ̂_t²) ≈ 0, so it cannot fake
+                     a reduction the way an unweighted mean would.
+          floor_ms = 1/sqrt(Σ w) — the statistical uncertainty of the
+                     pooled constraint set.  Another ping to a high-σ̂_t
+                     target adds almost no precision, so its expected gain
+                     vanishes and the greedy redirects budget.
+        """
+        estimate = self.get_location()
+        w_sum = 0.0
+        wr2_sum = 0.0
+        for vp_loc, rtt, mean_off, var_sum in self._additive_rows():
+            r = rtt - get_distance(estimate, vp_loc) / KM_PER_MS - mean_off
+            w = 1.0 / var_sum
+            w_sum += w
+            wr2_sum += w * r * r
+        fit_ms = math.sqrt(wr2_sum / w_sum)
+        floor_ms = math.sqrt(1.0 / w_sum)
+        return (fit_ms + floor_ms) * KM_PER_MS
+
+    # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
 
     def _append_constraint(
-        self, vp_loc: LatLon, min_rtt: float, sigma_ms: float
+        self, vp_loc: LatLon, min_rtt: float, sigma_ms: float,
+        src: Optional[str] = None,
     ) -> None:
         if self.mode == HARD_CIRCLE:
             self._append_constraint_hard(vp_loc, min_rtt)
+        elif self.mode == ADDITIVE:
+            self.constraints.append((vp_loc, src, min_rtt))
+            self._cached_region_size = None
         else:
             # gaussian and em_gaussian share the ProbConstraint format
             self._append_constraint_gaussian(vp_loc, min_rtt, sigma_ms)
@@ -463,5 +556,7 @@ class FeasibleRegion:
             self._update_estimate_hard()
         elif self.mode == EM_GAUSSIAN:
             self._update_estimate_em()
+        elif self.mode == ADDITIVE:
+            self._update_estimate_additive()
         else:
             self._update_estimate_gaussian()

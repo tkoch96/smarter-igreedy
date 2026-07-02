@@ -8,64 +8,51 @@ maintain a "done" list here.
 
 ## ⏭️ Immediate (see `.claude/HANDOFF_next_steps.md` for full context)
 
-### 0a. Additive model under greedy selection
+### 0. Real-mesh run of greedy_additive
 
-The additive src/dst estimator currently runs only under a shared RANDOM
-measurement order (`run_additive_budget_seed`) because it needs per-source
-state shared across targets, which per-target `FeasibleRegion`s can't
-hold. Integrate it into `Iterative_Greedy_Geolocator` via a shared model
-object, use σ̂_dst in the utility (fixes the measured budget-sink), then
-add `greedy_additive` lines to both budget figures.
-(Note: `error_over_measurements_adaptive.pdf` already uses greedy
-selection — only the new additive figure is random-order, as a stopgap.)
-
-### 0b. Additive methodology on the real mesh
-
-Run the additive estimator on RIPE data via `assess_geolocators`
-(recommended: a cross-target `'additive_em'` converter mode) against
-NN / per-target-em / em_asymmetric. Reference numbers, replication
-caveats and pitfalls are in the handoff.
+The additive model is now integrated into the greedy (shared
+`AdditiveLatencyModel`, σ̂_dst-discounted utility — fixes the budget sink
+on synthetic data) and the additive_em ESTIMATOR is validated on the real
+mesh (best model-based median at n=20 and n=100; beats NN outright at
+n=20). The missing piece is the whole-SYSTEM real-mesh comparison: add an
+`Iterative_Greedy_Geolocator(region_mode=ADDITIVE)` variant to
+`Geolocator_Comparator.self.geolocators` and rerun
+`assess_geolocators.run()` at n=100 against greedy_em / random+NN.
+Watch: per-ping model refits are O(pairs) each — bump `model_refit_every`
+(constructor param) to ~10-25 at real-mesh scale.
 
 ---
 
 ## 🔴 High priority
 
-### 1. Per-VP extension of the EM framework + real-data performance
+### 1. Additive model on real data — robustness follow-ups
 
-`FeasibleRegion(mode='em_gaussian')` fits a per-TARGET (μ, σ) online. The
-ADDITIVE two-way model rtt = SOL + X_src + X_dst (X_n ~ N(μ_n, σ_n²)) is
-now implemented and validated on synthetic data
-(`probabilistic_helpers.fit_additive_params` +
-`tests/test_e2e_additive_em.py`): it identifies pathological destinations
-via σ̂_dst 100% of the time (the honest "stop wasting pings here" signal
-for selection), and halves the per-target EM's location error (512 vs
-1149 km mean). Key implementation lesson recorded in the test: run the
-PARAMETER step before the location step each EM iteration, otherwise a
-pathological target's offset gets absorbed into distance (a wrong
-self-consistent fixed point; μ̂_t collapse).
+Real residuals are one-sided and heavy-tailed; the additive M-step
+(`fit_additive_params`) uses plain shrunk means, so detours inflate μ̂ and
+σ̂. At n=100 the additive median is the best model-based one, but
+em_asymmetric still wins the MEAN at high budget (1702 vs 2081 at 2500) —
+the gaussian additive parameter step is feeling the detours the
+asymmetric noise model shrugs off.
 
 Next steps:
 
-1. Integrate the additive model into the greedy (shared per-source state
-   across targets — this is the LatencyModel interface, see #4 below) and
-   use σ̂_dst in the utility to fix the budget-sink pathology.
-2. Fix the EM × robust-noise interaction: under heavy detour
+1. Robustify the additive parameter step (median/trimmed means, or
+   likelihood-weighted residuals) the way the per-target EM's M-step
+   already handles non-gaussian noise models.
+2. Replication: the cached mesh stores ONE rtt per pair; per-pair variance
+   from a single residual pools weakly. Lift the `fni == 10` early-exit in
+   `load_parsed_target_data` (see #9) to get more hourly samples.
+3. Fix the EM × robust-noise interaction: under heavy detour
    contamination, EM's μ-fit absorbs some detour bias, so robust noise +
    fixed slope currently beats robust noise + EM (asymmetric: 213 vs
    300km median). Candidate fixes: fit μ on the trimmed/lower-quantile
    residuals, or down-weight detour-suspect measurements in the M-step
    using the likelihood itself.
-3. Re-run the real-data sweep (`assess_probabilistic.py`) with the slope +
-   EM + asymmetric-noise estimators; the old catastrophic 10,000km
-   failures came from the slope-1.0 gaussian placing rings ~6700km too far
-   out. (`noise_model=ASYMMETRIC_NOISE` is likely the right default for
-   real data.)
-4. General predictive-model interface: estimation and selection both
-   consume "what RTT do I expect and how sure am I" — a `LatencyModel`
-   protocol with `nll(vp, rtt, candidate_loc)`, `predict(vp, loc) →
-   (expected_rtt, sigma)`, and `update(vp, rtt, loc_estimate, weight)`
-   would let slope/EM/per-VP-affine/learned models swap freely under
-   FeasibleRegion and the greedy. Sketched, not implemented.
+4. General predictive-model interface: `AdditiveLatencyModel` now realises
+   the shared-model idea for the additive class (`predict(src, dst, d) →
+   (expected_rtt, var)`, `record`, `refit`); a common protocol so slope /
+   EM / per-VP-affine models can swap under FeasibleRegion and the greedy
+   the same way is still open (see #4 below).
 
 ### 2. Oracle's estimation half is unclear
 

@@ -7,7 +7,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
 from utils import LatLon, get_distance
-from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, DEFAULT_SLOPE, TARGET_OF_INTEREST
+from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, ADDITIVE, DEFAULT_SLOPE, TARGET_OF_INTEREST
+from probabilistic_helpers import AdditiveLatencyModel, ADDITIVE_PRIOR_VAR_MS2
 
 DEBUG = False
 
@@ -88,6 +89,54 @@ def default_utility_evaluator(
 	return area_reduction
 
 
+def additive_utility_evaluator(
+	vp: str,
+	dst: str,
+	target_region: FeasibleRegion,
+	vp_loc: LatLon,
+	current_size: float,
+	rtt_model_func: Callable,
+	verb: bool,
+) -> float:
+	"""
+	Utility for additive-mode regions.  Same structure as the default
+	evaluator, but the expected RTT comes from the shared additive model
+	(d/100 + μ̂_s + μ̂_t instead of slope × d/100), and the simulated
+	constraint carries the candidate's src id so the clone weights it by
+	1/(σ̂_s² + σ̂_t²).
+
+	σ̂_dst enters twice.  Implicitly: the simulated ping's precision weight
+	means it cannot fake a fit improvement on a noisy target.  Explicitly:
+	the raw km reduction is discounted by a trust factor
+	prior_var / (prior_var + σ̂_t²).  Without the discount a pathological
+	target actually OUTBIDS finished ones — its statistical floor is huge,
+	so one more ping promises a large absolute reduction (averaging does
+	help under gaussian noise) — but that promise scales with σ̂_t exactly
+	when the model deserves the least trust (real pathological routing is
+	structured, not averaging-friendly).  The discount makes expected gain
+	shrink as σ̂_t grows, which is what redirects budget away from
+	hopeless targets.
+	"""
+	if current_size < BASICALLY_GEOLOCATED:
+		distance = get_distance(vp_loc, target_region.get_location())
+		return -1000000.0 + current_size + 1.0 / (distance + 1.0)
+
+	dist_km = get_distance(vp_loc, target_region.get_location())
+	expected_rtt, _var = target_region.model.predict(vp, dst, dist_km)
+
+	temp_region = target_region.clone()
+	temp_region.add_measurement(vp_loc, expected_rtt, src=vp)
+	new_size = temp_region.get_region_size()
+	area_reduction = current_size - new_size
+
+	if area_reduction <= 0.001:
+		return 1.0 / (dist_km + 1.0)
+
+	var_t = target_region.model.var_t.get(dst, ADDITIVE_PRIOR_VAR_MS2)
+	trust = ADDITIVE_PRIOR_VAR_MS2 / (ADDITIVE_PRIOR_VAR_MS2 + var_t)
+	return area_reduction * trust
+
+
 def _evaluate_vp_worker(
 	vp: str,
 	dst: str,
@@ -114,6 +163,7 @@ class Iterative_Greedy_Geolocator:
 		region_mode: str = HARD_CIRCLE,
 		region_slope: float = DEFAULT_SLOPE,
 		name: Optional[str] = None,
+		model_refit_every: int = 1,
 	) -> None:
 		# Distinct names let several differently-configured greedys coexist
 		# in one Geolocator_Comparator run (plot keys / cache filenames).
@@ -128,8 +178,18 @@ class Iterative_Greedy_Geolocator:
 		# BASICALLY_GEOLOCATED and the size sentinels apply uniformly.
 		self.region_mode = region_mode
 		self.region_slope = region_slope
+		# ADDITIVE mode: one shared AdditiveLatencyModel across all target
+		# regions (X_src pools over targets), refit from all accumulated
+		# measurements every `model_refit_every` actual pings.
+		self.latency_model: Optional[AdditiveLatencyModel] = None
+		self.model_refit_every = model_refit_every
 
-		self.utility_func: Callable = utility_func or default_utility_evaluator
+		if utility_func is not None:
+			self.utility_func: Callable = utility_func
+		elif region_mode == ADDITIVE:
+			self.utility_func = additive_utility_evaluator
+		else:
+			self.utility_func = default_utility_evaluator
 		self.rtt_func: Callable = rtt_func or AdaptiveRTTModel()
 
 		if max_workers is None:
@@ -180,9 +240,12 @@ class Iterative_Greedy_Geolocator:
 		if not self.targets:
 			return
 
+		if self.region_mode == ADDITIVE:
+			self.latency_model = AdditiveLatencyModel()   # fresh per solve
 		self.target_regions = {
 			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
-			                    mode=self.region_mode, slope=self.region_slope)
+			                    mode=self.region_mode, slope=self.region_slope,
+			                    model=self.latency_model)
 			for dst in self.targets
 		}
 		self.measurements_used = {dst: set() for dst in self.targets}
@@ -286,9 +349,31 @@ class Iterative_Greedy_Geolocator:
 			min_actual_rtt = min(actual_rtts)
 			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
-			self.target_regions[best_global_dst].add_measurement(self.vp_locations[best_global_src], min_actual_rtt)
+			# Constrain on min-of-reps even in additive mode (all reps go to
+			# the MODEL below).  Feeding every rep to the region lets its
+			# location step absorb the pair's full mean offset into distance,
+			# zeroing the residuals the parameter refit needs — μ̂_t collapses
+			# into the wrong-fixed-point failure (measured: patho μ̂_t 8.2 vs
+			# true 35.1, errors 4400+ km).  The min-vs-mean gap keeps recorded
+			# residuals positive so the parameter step can claim the offset.
+			self.target_regions[best_global_dst].add_measurement(
+				self.vp_locations[best_global_src], min_actual_rtt,
+				src=best_global_src)
 			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
+
+			if self.latency_model is not None:
+				# Shared-model bookkeeping: pool ALL samples of the pair
+				# (replication sharpens the variance decomposition), refit
+				# the per-node (μ, σ²) from every accumulated measurement
+				# against the CURRENT estimates — parameters claim a
+				# pathological target's offset before its location can —
+				# then re-run the pinged region's MAP under the new fit.
+				self.latency_model.record(best_global_src, best_global_dst, actual_rtts)
+				if len(self.measurement_history) % self.model_refit_every == 0:
+					self.latency_model.refit(self.vp_locations,
+					                         self.get_current_estimates())
+					self.target_regions[best_global_dst].reoptimize()
 
 			new_actual_size = self.target_regions[best_global_dst].get_region_size()
 			actual_utility = size_before - new_actual_size
@@ -350,6 +435,15 @@ class Iterative_Greedy_Geolocator:
 				print("="*70 + "\n")
 				if np.random.random() > .99:
 					exit(0)
+
+		if self.latency_model is not None:
+			# Non-pinged targets' MAP locations were last fitted under older
+			# model parameters; re-run every region's location step under the
+			# final fit before estimates are read off.  (Cheap: one
+			# Nelder-Mead per constrained target.)
+			for region in self.target_regions.values():
+				if region.constraints:
+					region.reoptimize()
 
 		meas_dict: MeasData = {}
 		for src, dst in self.measurement_history[:budget]:

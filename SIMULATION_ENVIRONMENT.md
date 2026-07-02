@@ -219,19 +219,31 @@ Every claim below is pinned by tests (see `CLAUDE.md` for file names).
    fitted by pooling residuals across the mesh (honest: uses estimated
    locations only). The only model class that beats nearest-neighbour
    under additive ground truth, and σ̂_dst identifies pathological
-   destinations 100% of the time — the signal selection needs to stop
-   sinking budget into hopeless targets. NOT yet integrated into the
-   greedy (per-source state is shared across targets; see
-   `.claude/HANDOFF_next_steps.md`).
+   destinations 100% of the time. Integrated into the greedy via a shared
+   `AdditiveLatencyModel` (`region_mode=ADDITIVE`): regions consult the
+   model for offsets and per-measurement precision, and the selection
+   utility discounts a candidate's simulated gain by
+   `prior_var/(prior_var + σ̂_t²)`. On the real mesh it is the best
+   model-based estimator by median at both tested scales and beats NN
+   outright at sparse coverage (n=20).
 
 Selection findings so far (multi-target shared budget): greedy allocation
 beats random ordering decisively in the early-budget regime and, with the
 em estimator underneath, at every budget on synthetic data (statistically
 tying the parameter-oracle). Estimation quality gates selection quality —
 the same greedy loop on hard-circle regions chooses worse than random.
-On the real mesh, the measured failure mode is a budget SINK: over-promising
+On the real mesh, the measured failure mode was a budget SINK: over-promising
 utilities concentrate pings on hopeless targets (one target absorbed 52
-pings while the median got 3); the additive σ̂_dst is the planned fix.
+pings while the median got 3). The additive greedy's σ̂_dst-discounted
+utility fixes this on synthetic data (pathological ping share 0.20-0.30
+vs em-greedy's 0.33-0.50, fair share 0.25) — the real-mesh greedy rerun is
+the open item. Two subtleties worth knowing: (a) without the trust
+discount the fix inverts — a high-σ̂ target's statistical floor promises
+LARGE absolute km reductions, so the greedy chases exactly the targets it
+should abandon; (b) the greedy's regions must constrain on min-of-reps
+while the shared model records all reps — per-rep constraints let the
+location step zero out the residuals the parameter fit needs, and μ̂_t
+collapses into the wrong fixed point.
 
 ---
 
