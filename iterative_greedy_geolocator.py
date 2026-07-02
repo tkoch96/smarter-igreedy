@@ -1,86 +1,163 @@
-import numpy as np, multiprocessing,time, os, pickle
+import numpy as np
+import multiprocessing
+import time
+import os
+import pickle
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from utils import *
+from typing import Any, Callable, Optional
+
+from utils import LatLon, get_distance
 from feasible_region_maintainer import FeasibleRegion
 
+DEBUG = False
 
-def default_expected_rtt_model(vp_loc, target_region):
+TargetData = dict[str, Any]
+MeasData = dict[str, dict[str, list[float]]]
+# (best_src, utility_score)
+VPCacheEntry = tuple[Optional[str], float]
+
+
+class AdaptiveRTTModel:
+	def __init__(self, alpha: float = 0.3) -> None:
+		# 0.3 means 30% weight to the newest ping, 70% to history.
+		self.alpha = alpha
+		self.target_errors: dict[str, float] = {}
+		self.debug = DEBUG
+
+	def __call__(self, vp_loc: LatLon, target_region: FeasibleRegion, dst: Optional[str] = None) -> float:
+		current_guess_loc = target_region.get_location()
+		distance_to_guess = get_distance(vp_loc, current_guess_loc)
+		base_rtt = distance_to_guess * 1.5 / 100.0
+
+		error_inflation = 0.0
+		if dst is not None and dst in self.target_errors:
+			error_inflation = self.target_errors[dst]
+
+		return max(0.01, base_rtt + error_inflation)
+
+	def update_error(self, dst: str, predicted_rtt: float, actual_rtt: float) -> None:
+		"""Updates the moving average of the error for a given target."""
+		current_error = actual_rtt - predicted_rtt
+		if dst not in self.target_errors:
+			self.target_errors[dst] = current_error
+		else:
+			self.target_errors[dst] = (self.alpha * current_error) + ((1 - self.alpha) * self.target_errors[dst])
+		if self.debug:
+			print("Current error for {} is now {}".format(dst, self.target_errors[dst]))
+
+
+BASICALLY_GEOLOCATED = 200  # km, we've essentially geolocated this IP address
+
+
+def default_expected_rtt_model(vp_loc: LatLon, target_region: FeasibleRegion) -> float:
 	"""Default geometric RTT estimation."""
 	current_guess_loc = target_region.get_location()
 	distance_to_guess = get_distance(vp_loc, current_guess_loc)
 	return distance_to_guess * 1.5 / 100.0
 
-def default_utility_evaluator(vp, target_region, vp_loc, current_size, rtt_model_func):
-	"""Default utility calculation simulating region reduction."""
-	expected_rtt = rtt_model_func(vp_loc, target_region)
-	
-	# Clone and simulate
-	temp_region = target_region.clone()
-	temp_region.constraints.append((vp_loc, expected_rtt * 100.0))
-	temp_region._update_estimate()
-	
-	new_size = temp_region.get_region_size()
-	return current_size - new_size
 
-def _evaluate_vp_worker(vp, target_region, vp_loc, current_size, utility_func, rtt_func):
-	"""
-	The standalone worker. It dynamically calls whatever utility_func 
-	and rtt_func were injected into the system.
-	"""
+def default_utility_evaluator(
+	vp: str,
+	dst: str,
+	target_region: FeasibleRegion,
+	vp_loc: LatLon,
+	current_size: float,
+	rtt_model_func: Callable,
+	verb: bool,
+) -> float:
+	if current_size < BASICALLY_GEOLOCATED:
+		return -1000000.0
+
+	expected_rtt = rtt_model_func(vp_loc, target_region, dst)
+
+	temp_region = target_region.clone()
+	temp_region.add_measurement(vp_loc, expected_rtt)
+	new_size = temp_region.get_region_size()
+	area_reduction = current_size - new_size
+
+	if area_reduction <= 0.001:
+		distance = get_distance(vp_loc, target_region.get_location())
+		return 1.0 / (distance + 1.0)
+
+	return area_reduction
+
+
+def _evaluate_vp_worker(
+	vp: str,
+	dst: str,
+	target_region: FeasibleRegion,
+	vp_loc: LatLon,
+	current_size: float,
+	utility_func: Callable,
+	rtt_func: Callable,
+	verb: bool,
+) -> tuple[str, float]:
 	if not target_region.constraints:
-		return vp, 1000000.0 
-	
-	# Delegate the actual math to the injected modular function
-	utility_score = utility_func(vp, target_region, vp_loc, current_size, rtt_func)
+		return vp, 1000000.0
+
+	utility_score = utility_func(vp, dst, target_region, vp_loc, current_size, rtt_func, verb)
 	return vp, utility_score
 
 
 class Iterative_Greedy_Geolocator:
-	def __init__(self, max_workers=None, utility_func=None, rtt_func=None):
+	def __init__(
+		self,
+		max_workers: Optional[int] = None,
+		utility_func: Optional[Callable] = None,
+		rtt_func: Optional[Callable] = None,
+	) -> None:
 		self.name = "iterative_greedy"
-		self.data = None
-		self.vp_locations = {}
-		
-		# Use provided functions or fall back to defaults
-		self.utility_func = utility_func or default_utility_evaluator
-		self.rtt_func = rtt_func or default_expected_rtt_model
-	
+		self.data: Optional[TargetData] = None
+		self.vp_locations: dict[str, LatLon] = {}
+		self.debug = DEBUG
+
+		self.utility_func: Callable = utility_func or default_utility_evaluator
+		self.rtt_func: Callable = rtt_func or AdaptiveRTTModel()
+
 		if max_workers is None:
-			max_workers = multiprocessing.cpu_count()		
+			max_workers = multiprocessing.cpu_count()
 		self.max_workers = max_workers
 		self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
-		
-		# --- STATE VARIABLES ---
-		self.measurement_history = []  
-		self.target_regions = {}
-		self.measurements_used = {}
-		self.current_region_sizes = {}
-		self.best_vp_cache = {}
 
+		self.measurement_history: list[tuple[str, str]] = []
+		self.target_regions: dict[str, FeasibleRegion] = {}
+		self.measurements_used: dict[str, set[str]] = {}
+		self.current_region_sizes: dict[str, float] = {}
+		self.best_vp_cache: dict[str, VPCacheEntry] = {}
 
-		self.available_measurements = {}
-		self.targets = []
-		self.utility_tracking = []
+		self.iter = 0
 
-	def set_data(self, data):
+		self.available_measurements: dict[str, list[str]] = {}
+		self.targets: list[str] = []
+		self.utility_tracking: list[dict[str, Any]] = []
+
+	def set_data(self, data: TargetData) -> None:
 		self.data = data
 		self.vp_locations = data.get('address_to_loc', {})
 
-	def get_prior_guess(self, dst):
+	def get_prior_guess(self, dst: str) -> LatLon:
 		return (0.0, 0.0)
 
-	def solve(self):
+	def get_current_estimates(self) -> dict[str, LatLon]:
+		"""Returns the live, already-calculated locations to save time."""
+		return {
+			dst: region.get_location()
+			for dst, region in self.target_regions.items()
+			if region.constraints
+		}
+
+	def solve(self) -> None:
 		self.measurement_history = []
-		loc_loc_meas = self.data.get('loc_loc_meas', {})
-		self.available_measurements = {} 
-		
+		loc_loc_meas: MeasData = self.data.get('loc_loc_meas', {})
+		self.available_measurements = {}
+
 		for src, dsts in loc_loc_meas.items():
 			for dst, rtts in dsts.items():
 				if rtts:
 					if dst not in self.available_measurements:
 						self.available_measurements[dst] = []
 					self.available_measurements[dst].append(src)
-		
+
 		self.targets = list(self.available_measurements.keys())
 		if not self.targets:
 			return
@@ -89,92 +166,117 @@ class Iterative_Greedy_Geolocator:
 		self.measurements_used = {dst: set() for dst in self.targets}
 		self.current_region_sizes = {dst: 20037.0 for dst in self.targets}
 		self.best_vp_cache = {}
-		
+
 		for dst in self.targets:
 			self._update_best_vp_for_target(dst)
 
-		cache_fn = os.path.join(CACHE_DIR, f"{self.name}_initial_pass_{len(self.targets)}_targets.pkl")
-
-		if os.path.exists(cache_fn):
-			with open(cache_fn, 'rb') as f:
-				self.best_vp_cache = pickle.load(f)
-		else:
-			for dst in self.targets:
-				self._update_best_vp_for_target(dst)
-			with open(cache_fn, 'wb') as f:
-				pickle.dump(self.best_vp_cache, f)
-
-	def _update_best_vp_for_target(self, dst):
-		best_src = None
+	def _update_best_vp_for_target(self, dst: str) -> None:
+		best_src: Optional[str] = None
 		best_utility = -float('inf')
-		
-		available_srcs = [s for s in self.available_measurements[dst] if s not in self.measurements_used.get(dst,[])]
-		
+
+		try:
+			target_region = self.target_regions[dst]
+		except KeyError:
+			return
+
+		current_size = target_region.get_region_size()
+
+		if current_size <= BASICALLY_GEOLOCATED:
+			if dst in self.best_vp_cache:
+				del self.best_vp_cache[dst]
+			return
+
+		available_srcs = [s for s in self.available_measurements[dst] if s not in self.measurements_used.get(dst, [])]
+
 		if not available_srcs:
 			self.best_vp_cache[dst] = (None, -float('inf'))
 			return
-		
+
 		try:
 			target_region = self.target_regions[dst]
 		except KeyError:
 			return
 		current_size = target_region.get_region_size()
-		
-		# Pass the injected functions into the worker
+		verbs = [np.random.random() > .999 and self.iter > len(self.targets) for s in available_srcs]
+
 		futures = [
 			self.executor.submit(
-				_evaluate_vp_worker, 
-				src, 
-				target_region, 
-				self.vp_locations[src], 
+				_evaluate_vp_worker,
+				src,
+				dst,
+				target_region,
+				self.vp_locations[src],
 				current_size,
-				self.utility_func,  # <-- Injected utility module
-				self.rtt_func       # <-- Injected RTT module
+				self.utility_func,
+				self.rtt_func,
+				v,
 			)
-			for src in available_srcs
+			for src, v in zip(available_srcs, verbs)
 		]
 
-		for future in as_completed(futures):
+		for future, v in zip(as_completed(futures), verbs):
 			src, utility = future.result()
 			if utility > best_utility:
 				best_utility = utility
 				best_src = src
-	
+
 		self.best_vp_cache[dst] = (best_src, best_utility)
 
-	def measurements(self, budget):
-		loc_loc_meas = self.data.get('loc_loc_meas', {})
-		
+	def measurements(self, budget: int, focus_batch_size: int = 500, pings_per_batch: int = 50) -> MeasData:
+		loc_loc_meas: MeasData = self.data.get('loc_loc_meas', {})
+
+		pings_in_current_batch = 0
+		focus_group: list[str] = []
+
 		while len(self.measurement_history) < budget:
-			best_global_dst = None
-			best_global_src = None
+			self.iter = len(self.measurement_history)
+			if pings_in_current_batch == 0 or not focus_group:
+				sorted_cache = sorted(
+					self.best_vp_cache.items(),
+					key=lambda item: item[1][1] if item[1][0] is not None else -float('inf'),
+					reverse=True,
+				)
+				focus_group = [item[0] for item in sorted_cache[:focus_batch_size]]
+				pings_in_current_batch = 0
+
+			best_global_dst: Optional[str] = None
+			best_global_src: Optional[str] = None
 			best_global_utility = -float('inf')
-			
-			for dst, (src, utility) in self.best_vp_cache.items():
+
+			for dst in focus_group:
+				src, utility = self.best_vp_cache.get(dst, (None, -float('inf')))
 				if src is not None and utility > best_global_utility:
 					best_global_utility = utility
 					best_global_dst = dst
 					best_global_src = src
-					
+
 			if best_global_dst is None:
-				break 
+				focus_group = []
+				continue
 
 			size_before = self.current_region_sizes[best_global_dst]
 			expected_utility = best_global_utility
-				
+
 			self.measurements_used[best_global_dst].add(best_global_src)
-			actual_rtts = loc_loc_meas[best_global_src][best_global_dst]
-			
+			actual_rtts: list[float] = loc_loc_meas[best_global_src][best_global_dst]
+
 			min_actual_rtt = min(actual_rtts)
+			if best_global_dst == '85.93.215.0':
+				print(len(self.target_regions[best_global_dst].constraints))
 			self.target_regions[best_global_dst].add_measurement(self.vp_locations[best_global_src], min_actual_rtt)
+			if best_global_dst == '85.93.215.0':
+				print(len(self.target_regions[best_global_dst].constraints))
 
 			new_actual_size = self.target_regions[best_global_dst].get_region_size()
 			actual_utility = size_before - new_actual_size
-			
+
 			predicted_rtt_used = self.rtt_func(
-				self.vp_locations[best_global_src], 
-				self.target_regions[best_global_dst]
+				self.vp_locations[best_global_src],
+				self.target_regions[best_global_dst],
 			)
+
+			if hasattr(self.rtt_func, 'update_error'):
+				self.rtt_func.update_error(best_global_dst, predicted_rtt_used, min_actual_rtt)
 
 			self.current_region_sizes[best_global_dst] = new_actual_size
 
@@ -186,35 +288,54 @@ class Iterative_Greedy_Geolocator:
 				'actual_util': actual_utility,
 				'error': expected_utility - actual_utility,
 				'predicted_rtt': predicted_rtt_used,
-				'actual_rtt': min_actual_rtt
+				'actual_rtt': min_actual_rtt,
 			})
-			
+
 			self._update_best_vp_for_target(best_global_dst)
 			self.measurement_history.append((best_global_src, best_global_dst))
 
-			actual_pings = len(self.measurement_history)
+			pings_in_current_batch += 1
+			if pings_in_current_batch >= pings_per_batch:
+				pings_in_current_batch = 0
 
-			if actual_pings % 500 == 0: # Print a debug snapshot every 500 pings
-				print(f"      [DEBUG] --- Utility Reality Check at Ping {actual_pings} ---")
-				recent_pings = self.utility_tracking[-500:]
-				avg_expected = sum(p['expected_util'] for p in recent_pings) / len(recent_pings)
-				avg_actual = sum(p['actual_util'] for p in recent_pings) / len(recent_pings)
-				print(f"      [DEBUG] Average Expected Utility (Last 500): {avg_expected:.2f} km^2 reduction")
-				print(f"      [DEBUG] Average Actual Utility (Last 500):   {avg_actual:.2f} km^2 reduction")
-				worst_delusion = max(recent_pings, key=lambda x: abs(x['error']))
-				print(f"      [DEBUG] Biggest Hallucination: Ping {worst_delusion['ping_num']}")
-				print(f"      [DEBUG]    -> Expected drop of {worst_delusion['expected_util']:.2f}, actually dropped by {worst_delusion['actual_util']:.2f}")
-				print(f"      [DEBUG]    -> Algorithm assumed RTT: {worst_delusion['predicted_rtt']:.2f}ms | Real RTT: {worst_delusion['actual_rtt']:.2f}ms")
-				print("      [DEBUG] --------------------------------------------------")
+			if self.iter > len(self.targets) and self.debug:
+				target_guess = self.target_regions[best_global_dst].get_location()
+				vp_loc = self.vp_locations[best_global_src]
+				dist_km = get_distance(vp_loc, target_guess)
+				predicted_rtt = self.rtt_func(vp_loc, self.target_regions[best_global_dst], dst=best_global_dst)
+				simulated_radius = predicted_rtt * 100.0
 
-		meas_dict = {}
+				print("\n" + "="*70)
+				print(f"🕵️  DEEP DIVE: Ping {self.iter}")
+				print(f"Target: {best_global_dst} | Source VP: {best_global_src}")
+				print("-" * 70)
+				print("--- (a) WHY IT WAS SELECTED (The Expectation) ---")
+				print(f"Target Current Guess (Lat/Lon) : {target_guess[0]:.4f}, {target_guess[1]:.4f}")
+				print(f"VP Location (Lat/Lon)          : {vp_loc[0]:.4f}, {vp_loc[1]:.4f}")
+				print(f"Distance (VP to Guess)         : {dist_km:.2f} km")
+				print(f"Current Region Size            : {size_before:.2f} km^2")
+				print(f"Algorithm's Expected RTT       : {predicted_rtt:.2f} ms")
+				print(f"Simulated Constraint Radius    : {simulated_radius:.2f} km")
+				print(f"--> Expected Area Reduction    : {expected_utility:.2f} km^2")
+
+				actual_radius = min_actual_rtt * 100.0
+				print("--- (b) WHAT IT ACTUALLY DID (The Reality) ---")
+				print(f"Actual RTT Measured            : {min_actual_rtt:.2f} ms")
+				print(f"Actual Constraint Radius       : {actual_radius:.2f} km")
+				print(f"New Region Size                : {new_actual_size:.2f} km^2")
+				print(f"--> Actual Area Reduction      : {actual_utility:.2f} km^2")
+				print("="*70 + "\n")
+				if np.random.random() > .99:
+					exit(0)
+
+		meas_dict: MeasData = {}
 		for src, dst in self.measurement_history[:budget]:
 			if src not in meas_dict:
 				meas_dict[src] = {}
 			meas_dict[src][dst] = loc_loc_meas[src][dst]
-			
+
 		return meas_dict
 
-	def cleanup(self):
+	def cleanup(self) -> None:
 		if self.executor:
 			self.executor.shutdown(wait=True)

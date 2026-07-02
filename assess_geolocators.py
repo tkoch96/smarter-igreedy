@@ -5,14 +5,15 @@ from perfect_geolocator import Perfect_Geolocator
 from pull_ripe_atlas_measurement_data import RipeAtlasPipeline
 from random_geolocator import Random_Geolocator
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
-from feasible_region_maintainer import FeasibleRegion
+from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN
+from probabilistic_helpers import GLOBAL_SIGMA_MS
 
 from plot_results import *
 
 class Geolocator_Comparator:
 	def __init__(self):
-		self.geolocators = [Perfect_Geolocator(), Random_Geolocator(), Iterative_Greedy_Geolocator()]
-		self.measurement_converter_mode = 'great_circle_overlap_centroid' # setting this to 'great_circle_overlap_centroid' really hurts performance, why?
+		self.geolocators = [Iterative_Greedy_Geolocator(), Perfect_Geolocator(), Random_Geolocator()]
+		self.measurement_converter_mode = 'nearest_neighbor'
 		self.target_data = None
 		self.errors = {}
 
@@ -51,26 +52,20 @@ class Geolocator_Comparator:
 				if closest_src in address_to_loc:
 					estimated_locations[dst] = address_to_loc[closest_src]
 
-			elif self.measurement_converter_mode == 'great_circle_overlap_centroid':
-				# Use the new FeasibleRegion object for batch estimation
-				region = FeasibleRegion(target_id=dst)
-				
-				batch_measurements = []
+			elif self.measurement_converter_mode in ('hard_circle', 'great_circle_overlap_centroid'):
+				region = FeasibleRegion(target_id=dst, mode=HARD_CIRCLE)
 				for src, rtt in src_rtts.items():
 					if src in address_to_loc:
-						batch_measurements.append((address_to_loc[src], rtt))
-				
-				if not batch_measurements:
-					continue
-				elif len(batch_measurements) == 1:
-					estimated_locations[dst] = batch_measurements[0][0]
-				else:
-					# Seed an initial guess before optimizing (optional but helps convergence)
-					lat_guess = sum(m[0][0] for m in batch_measurements) / len(batch_measurements)
-					lon_guess = sum(m[0][1] for m in batch_measurements) / len(batch_measurements)
-					region.best_guess = np.array([lat_guess, lon_guess])
-					
-					region.add_measurements_batch(batch_measurements)
+						region.add_measurement(address_to_loc[src], max(0.0, rtt))
+				if region.constraints:
+					estimated_locations[dst] = region.get_location()
+
+			elif self.measurement_converter_mode == 'gaussian':
+				region = FeasibleRegion(target_id=dst, mode=GAUSSIAN)
+				for src, rtt in src_rtts.items():
+					if src in address_to_loc:
+						region.add_measurement(address_to_loc[src], rtt, sigma_ms=GLOBAL_SIGMA_MS)
+				if region.constraints:
 					estimated_locations[dst] = region.get_location()
 
 			else:
@@ -78,11 +73,30 @@ class Geolocator_Comparator:
 
 		return estimated_locations
 
+	def get_random_subsample(self, n=100):
+		## Gets a random sample of all the measurement data, for testing
+		print("Grabbing random subsample of {} sources".format(n))
+		all_srcs = list(self.target_data['loc_loc_meas'])
+		np.random.shuffle(all_srcs)
+		all_srcs_subsample = all_srcs[0:n]
+		new_target_data = {s:{} for s in all_srcs_subsample}
+		for src in all_srcs_subsample:
+			for dst in self.target_data['loc_loc_meas'][src]:
+				if src == dst: continue
+				try:
+					new_target_data[dst]
+					new_target_data[src][dst] = self.target_data['loc_loc_meas'][src][dst]
+				except KeyError:
+					pass
+		self.target_data['loc_loc_meas'] = new_target_data
+
 	def do_cache(self, geolocator):
 		return {'smart_perfect': True, 'random': True}.get(geolocator.name, False)
 
 	def run(self, min_budget=100, max_budget=2500, step=100):
 		self.load_target_measurement_data()
+
+		self.get_random_subsample()
 		
 		address_to_loc = self.target_data.get('address_to_loc', {})
 		all_targets = set()
@@ -108,7 +122,12 @@ class Geolocator_Comparator:
 			
 			for budget in range(min_budget, max_budget + 1, step):
 				budgeted_measurements = geolocator.measurements(budget)
-				estimated_locations = self.convert_measurements_to_locations(budgeted_measurements)
+				
+				# Use the pre-calculated estimates if the geolocator supports it
+				if hasattr(geolocator, 'get_current_estimates'):
+					estimated_locations = geolocator.get_current_estimates()
+				else:
+					estimated_locations = self.convert_measurements_to_locations(budgeted_measurements)
 
 				errors = []
 				for dst in all_targets:
@@ -139,6 +158,7 @@ class Geolocator_Comparator:
 		plot_error_over_budget(self.plot_data, os.path.join(FIG_DIR, "geolocator_results.pdf"))
 
 if __name__ == "__main__":
+	np.random.seed(31415)
 	gc = Geolocator_Comparator()
 	
 	# 1. Load the data into gc.target_data

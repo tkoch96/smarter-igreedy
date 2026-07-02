@@ -6,14 +6,19 @@ import bz2
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from pull_ripe_atlas_probe_data import RipeAtlasProbePipeline
+from typing import Optional, Any
+from pull_ripe_atlas_probe_data import RipeAtlasProbePipeline, ProbeDict
 from utils import *
 
 DATA_DIR = "data"
 FIG_DIR = "figures"
 
+MeasData = dict[str, dict[str, list[float]]]
+TargetData = dict[str, Any]
+
+
 class RipeAtlasPipeline:
-	def __init__(self, start_date, end_date, max_workers=2):
+	def __init__(self, start_date: str, end_date: str, max_workers: int = 2) -> None:
 		self.start_date_str = start_date
 		self.end_date_str = end_date
 		self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
@@ -34,7 +39,7 @@ class RipeAtlasPipeline:
 		probe_metadata_obj = RipeAtlasProbePipeline(start_date=self.start_date_str, end_date=self.end_date_str)
 		self.probe_metadata = probe_metadata_obj.export_latest_probes()
 
-	def _get_hourly_targets(self):
+	def _get_hourly_targets(self) -> list[tuple[datetime, int]]:
 		"""Generate a list of (date_obj, hour) tuples for the requested range."""
 		delta = self.end_date - self.start_date
 		targets = []
@@ -45,7 +50,7 @@ class RipeAtlasPipeline:
 				targets.append((current_date, hour))
 		return targets
 
-	def _build_url(self, target_date, hour):
+	def _build_url(self, target_date: datetime, hour: int) -> tuple[str, str]:
 		"""Construct the URL for the hourly data-store format."""
 		date_str = target_date.strftime("%Y-%m-%d")
 		hour_str = f"{hour:02d}00" 
@@ -54,7 +59,7 @@ class RipeAtlasPipeline:
 		url = f"{self.base_url}/{date_str}/{filename}"
 		return url, filename
 
-	def download_dump(self, target_tuple):
+	def download_dump(self, target_tuple: tuple[datetime, int]) -> Optional[str]:
 		"""Downloads the raw .bz2 file, but skips entirely if already parsed."""
 		target_date, hour = target_tuple
 		url, filename = self._build_url(target_date, hour)
@@ -109,7 +114,7 @@ class RipeAtlasPipeline:
 			
 		return None
 
-	def process_dump(self, raw_path):
+	def process_dump(self, raw_path: Optional[str]) -> Optional[str]:
 		"""Streams the .bz2 archive, aggregates on the fly, and saves a tiny summary."""
 		if not raw_path:
 			return None
@@ -168,7 +173,7 @@ class RipeAtlasPipeline:
 		
 		return parsed_path
 
-	def export_latest_measurements(self):
+	def export_latest_measurements(self) -> dict[str, MeasData]:
 		"""Merges the tiny summary files into a single export dictionary."""
 		self.execute()
 		export = {
@@ -193,7 +198,7 @@ class RipeAtlasPipeline:
 
 		return export
 
-	def load_parsed_target_data(self, mesh_coverage_ratio=0.8, full_mesh_probe_meas={}):
+	def load_parsed_target_data(self, mesh_coverage_ratio: float = 0.8, full_mesh_probe_meas: MeasData = {}) -> TargetData:
 		"""
 		Filters the dataset against physical limitations directly from disk to save RAM,
 		and applies an iterative pruning filter to extract a highly dense, bi-directional mesh.
@@ -318,7 +323,7 @@ class RipeAtlasPipeline:
 			'loc_loc_meas': dense_mesh_meas,
 		}
 
-	def execute(self):
+	def execute(self) -> None:
 		"""Orchestrates the downloading and parsing of hourly dumps."""
 		targets = self._get_hourly_targets()
 		raw_files = []

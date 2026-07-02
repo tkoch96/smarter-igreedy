@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.DS_Store
+cache/
+figures/
+out.txt
+tests/error_over_measurements.pdf
