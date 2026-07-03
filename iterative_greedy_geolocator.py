@@ -191,6 +191,16 @@ RELIABILITY_ALPHA = 0.3      # EWMA weight of the newest realized/promised ratio
 RELIABILITY_FLOOR = 0.05     # never fully write a target off — new VPs appear
 RELIABILITY_MIN_PROMISE_KM = 50.0   # don't score tiny promises
 
+# Phase switch for selection='phased' (marginal-returns rule, Pandora's-box
+# style): exploit while the EWMA of REALIZED believed-size reduction per
+# ping stays above the threshold; below it, spend pings as uniform random
+# draws over unpinged pairs (the exploration action whose yield the
+# exploit tape is implicitly compared against — what random+NN does by
+# accident). Non-sticky: an exploration ping that re-opens large gains
+# lifts the tape and flips the greedy back to exploiting.
+MARGINAL_EWMA_ALPHA = 0.25
+MARGINAL_SWITCH_KM = 50.0
+
 
 def _hypothesis_benefits(target_region: FeasibleRegion, vp: str, dst: str,
                          vp_loc: LatLon) -> Optional[list]:
@@ -306,10 +316,12 @@ class Iterative_Greedy_Geolocator:
 		self.model_refit_every = model_refit_every
 		# ADDITIVE selection flavour: 'simulate' (clone + expected-rtt ping,
 		# size reduction), 'info_gain' (mean per-hypothesis partition
-		# benefit — exploration-aware, cheaper: no per-candidate NM) or
+		# benefit — exploration-aware, cheaper: no per-candidate NM),
 		# 'risk_gain' (info_gain's benefit distribution scored at its 25th
-		# percentile × the target's realized/promised track record).
-		if selection not in ('simulate', 'info_gain', 'risk_gain'):
+		# percentile × the target's realized/promised track record) or
+		# 'phased' (risk_gain while the marginal-return tape is healthy,
+		# random exploration of unpinged pairs when it collapses).
+		if selection not in ('simulate', 'info_gain', 'risk_gain', 'phased'):
 			raise ValueError(f"selection {selection!r} not understood")
 		self.selection = selection
 
@@ -317,7 +329,7 @@ class Iterative_Greedy_Geolocator:
 			self.utility_func: Callable = utility_func
 		elif region_mode == ADDITIVE and selection == 'info_gain':
 			self.utility_func = info_gain_utility_evaluator
-		elif region_mode == ADDITIVE and selection == 'risk_gain':
+		elif region_mode == ADDITIVE and selection in ('risk_gain', 'phased'):
 			self.utility_func = risk_adjusted_utility_evaluator
 		elif region_mode == ADDITIVE:
 			self.utility_func = additive_utility_evaluator
@@ -388,11 +400,15 @@ class Iterative_Greedy_Geolocator:
 
 		if self.region_mode == ADDITIVE:
 			self.latency_model = AdditiveLatencyModel()   # fresh per solve
+		# Marginal-return tape + deterministic exploration order ('phased')
+		self.marginal_gain_ewma: Optional[float] = None
+		self._explore_rng = np.random.default_rng(31415)
 		self.target_regions = {
 			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
 			                    mode=self.region_mode, slope=self.region_slope,
 			                    model=self.latency_model,
-			                    hypothesis_size=(self.selection in ('info_gain', 'risk_gain')))
+			                    hypothesis_size=(self.selection in
+			                                     ('info_gain', 'risk_gain', 'phased')))
 			for dst in self.targets
 		}
 		self.measurements_used = {dst: set() for dst in self.targets}
@@ -455,6 +471,20 @@ class Iterative_Greedy_Geolocator:
 
 		while len(self.measurement_history) < budget:
 			self.iter = len(self.measurement_history)
+
+			explore_pick = None
+			if (self.selection == 'phased'
+			        and self.marginal_gain_ewma is not None
+			        and self.marginal_gain_ewma < MARGINAL_SWITCH_KM):
+				# Exploit returns have collapsed — spend this ping on
+				# uniform exploration of unpinged pairs instead.
+				cand = [(s, d) for d in self.targets
+				        for s in self.available_measurements[d]
+				        if s not in self.measurements_used[d]]
+				if not cand:
+					break
+				explore_pick = cand[int(self._explore_rng.integers(len(cand)))]
+
 			focus_group_refreshed = False
 			if pings_in_current_batch == 0 or not focus_group:
 				sorted_cache = sorted(
@@ -470,12 +500,16 @@ class Iterative_Greedy_Geolocator:
 			best_global_src: Optional[str] = None
 			best_global_utility = -float('inf')
 
-			for dst in focus_group:
-				src, utility = self.best_vp_cache.get(dst, (None, -float('inf')))
-				if src is not None and utility > best_global_utility:
-					best_global_utility = utility
-					best_global_dst = dst
-					best_global_src = src
+			if explore_pick is not None:
+				best_global_src, best_global_dst = explore_pick
+				best_global_utility = 0.0
+			else:
+				for dst in focus_group:
+					src, utility = self.best_vp_cache.get(dst, (None, -float('inf')))
+					if src is not None and utility > best_global_utility:
+						best_global_utility = utility
+						best_global_dst = dst
+						best_global_src = src
 
 			if best_global_dst is None:
 				if focus_group_refreshed:
@@ -540,6 +574,16 @@ class Iterative_Greedy_Geolocator:
 
 			new_actual_size = self.target_regions[best_global_dst].get_region_size()
 			actual_utility = size_before - new_actual_size
+
+			if self.latency_model is not None:
+				# Marginal-return tape: what did this ping actually earn, in
+				# believed-size km? (Post-hoc, so surprises count — unlike
+				# the promises the auction runs on.)
+				realized = max(0.0, actual_utility)
+				self.marginal_gain_ewma = (
+					realized if self.marginal_gain_ewma is None
+					else (1.0 - MARGINAL_EWMA_ALPHA) * self.marginal_gain_ewma
+					+ MARGINAL_EWMA_ALPHA * realized)
 
 			predicted_rtt_used = self.rtt_func(
 				self.vp_locations[best_global_src],

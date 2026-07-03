@@ -50,6 +50,7 @@ LABELS = {
     'greedy_additive': 'GREEDY selection + additive em (σ̂_dst in utility)',
     'greedy_additive_info': 'GREEDY info-gain selection (mean benefit)',
     'greedy_additive_risk': 'GREEDY risk-adjusted (p25 benefit × track record)',
+    'greedy_additive_phased': 'GREEDY phased (risk-adjusted → random explore)',
     'oracle':         'oracle (Perfect_Geolocator selection + true μ, σ)',
 }
 STYLES = {
@@ -60,6 +61,7 @@ STYLES = {
     'greedy_additive': dict(color='darkviolet', linewidth=2.2),
     'greedy_additive_info': dict(color='deeppink', linewidth=1.6, linestyle='--'),
     'greedy_additive_risk': dict(color='forestgreen', linewidth=2.4),
+    'greedy_additive_phased': dict(color='saddlebrown', linewidth=2.4),
     'oracle':         dict(color='black',      linestyle='-.'),
 }
 

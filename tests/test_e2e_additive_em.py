@@ -319,7 +319,7 @@ TOTAL_PINGS = len(VP_LOCS) * N_TARGETS                   # 80
 BUDGET_GRID = (5, 10, 15, 20, 30, 40, 50, 60, 70, 80)
 SWEEP_STRATEGIES = ('random_nn', 'const_gaussian', 'per_target_em',
                     'additive_em', 'greedy_additive', 'greedy_additive_info',
-                    'greedy_additive_risk', 'oracle')
+                    'greedy_additive_risk', 'greedy_additive_phased', 'oracle')
 
 
 def run_greedy_additive_seed(sc: dict, selection: str = 'simulate') -> tuple[list[float], dict]:
@@ -459,6 +459,8 @@ def run_additive_budget_seed(seed: int) -> dict:
         run_greedy_additive_seed(sc, selection='info_gain')
     curves['greedy_additive_risk'], risk_patho_share = \
         run_greedy_additive_seed(sc, selection='risk_gain')
+    curves['greedy_additive_phased'], _ = \
+        run_greedy_additive_seed(sc, selection='phased')
 
     return {'scenario': sc, 'curves': curves,
             'greedy_patho_share': patho_share,
@@ -567,6 +569,16 @@ class TestAdditiveBudgetSweep:
                 1.25 * _sweep_mean(sweep_results, 'greedy_additive', b)
         assert _sweep_mean(sweep_results, 'greedy_additive_risk', 80) <= \
             1.02 * _sweep_mean(sweep_results, 'additive_em', 80)
+
+    def test_phased_no_harm_vs_risk(self, sweep_results):
+        """The marginal-return phase switch (exploit → random exploration
+        when the realized-gain tape collapses) must not cost anything in a
+        world with no flat segment to escape (calibrated 1948/1322/706 vs
+        risk's 1948/1325/706 — near-identical; its value is the real-mesh
+        late-budget regime where risk_gain flatlines)."""
+        for b in (10, 40, 80):
+            assert _sweep_mean(sweep_results, 'greedy_additive_phased', b) <= \
+                1.05 * _sweep_mean(sweep_results, 'greedy_additive_risk', b)
 
     def test_greedy_does_not_sink_budget_into_pathological_targets(self, sweep_results):
         """THE payoff of σ̂_dst in the utility (trust-discounted gain): the
