@@ -8,21 +8,40 @@ maintain a "done" list here.
 
 ## ⏭️ Immediate (see `.claude/HANDOFF_next_steps.md` for full context)
 
-### 0. Break the real-mesh greedy plateau
+### 0. Break the real-mesh greedy plateau — DIAGNOSED 2026-07-03
 
-The whole-system n=100 run (2026-07-03, seed 31415) is DONE:
-greedy_additive is the best honest strategy at b=100 (3,942 vs random's
-7,185) and reaches 2,731 by b=600, but then plateaus ~2,800-2,990 —
-PARITY with greedy_em on means, not the hoped-for break. Two suspects,
-in test order:
+Hindsight debug run (n=100, b=1000, belief trail joined with truth):
 
-1. Robust additive M-step (see #1 below) — real detours are one-sided
-   and the gaussian fit chases them; em_asymmetric beats additive on
-   MEANS in the estimator-only comparison for exactly this reason.
-2. Median reporting in `Geolocator_Comparator.run()` — means are
-   dominated by isolated targets (Guam-class); the additive model's
-   demonstrated advantage is in the median, which run() never prints.
-   Store per-target errors in plot_data and report both.
+- **Median vindicated**: greedy_additive median 859 km BEATS random+NN's
+  907 at the same budget; its mean (3,087 vs 2,090) is entirely the tail
+  — the worst 10 targets carry 46% of total error.
+- **Dominant failure = out-of-mesh identifiability, not detours.** The
+  catastrophic targets (Mangalore, Colombo, Cape Town, ...) sit far
+  outside the Europe-heavy VP cluster. With every VP in one cluster,
+  a shared offset and extra distance are EXACTLY confounded (moving away
+  along the cluster bearing mimics +offset for all VPs at once); the fit
+  absorbs the offset into distance (μ̂ fitted 5-100 ms vs needed 44-197),
+  residuals then read ≈ 0, believed region size reads 550-970 km while
+  the true error is 12-18,000 km. Overconfidence also wastes budget
+  (10-13 pings each on "improvable" hopeless targets) and evades the
+  trust discount (clean residuals → low σ̂_t).
+- Detour chasing is real but SECONDARY: pings with residual > +20 ms
+  moved the estimate away from truth 54% of the time vs 47% baseline.
+- Batch polish is load-bearing on real data: median 1,901 → 859.
+- No cheap estimate-level fix: SOL clamp recovers ~150 km of mean (the
+  bound is too loose at 150-220 ms best-RTTs); a perfect per-target
+  min(MAP, NN) switch only reaches mean 2,318 — these targets' own NN
+  floor is 5-10,000 km. The n=100 MEAN is geometry-bound; median is the
+  honest headline metric.
+
+Fix directions, in value order:
+1. Report MEDIANS in `Geolocator_Comparator.run()` (store per-target
+   errors in plot_data) — the current mean-only print hides the win.
+2. Honest region size under cluster-degenerate geometry: when all of a
+   target's VPs span a narrow bearing cone, the ring ambiguity should
+   floor the size (stops both the overconfidence and the 10-13-ping
+   waste; frees ~8% of budget).
+3. Robust additive M-step (see #1) for the secondary detour effect.
 
 ---
 
