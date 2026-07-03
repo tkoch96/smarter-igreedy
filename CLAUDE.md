@@ -360,6 +360,18 @@ python3 -m pytest tests/ -v
   floor promises big absolute reductions). Measured effect: patho ping
   share median 0.29 / max 0.375 (fair 0.25) vs em-greedy's 0.33-0.50 on
   identical scenarios.
+- `selection='info_gain'` (ADDITIVE only): exploration-aware utility
+  `log(1 + Var_hypotheses[predicted rtt]/(σ̂_s²+σ̂_t²))` over a per-region
+  hypothesis SUPPORT SET (MAP + NN anchor + rings around the best VP,
+  scored by PROFILED NLL — offset marginalised out, clamped ≥ 0; fixed
+  offsets would wrongly reject the near end of a ridge). Fixes the
+  measured geometry-blindness of the simulate utility (real mesh: ~90
+  candidates within 0.35%, the ridge-collapsing 7 km VP ranked #9 and
+  never pinged). Regression test: TestRidgeEscape — info-gain pings the
+  lone VP as the far target's 2nd ping in 9/10 seeds (err 477 km vs
+  simulate's 3068, which finds it in 0/10). Parity in ridge-free worlds
+  (pinned no-harm ≤ 1.10×), cheaper than simulate (no per-candidate NM),
+  and `hypothesis_size=True` folds ridge length into get_region_size().
 - `BASICALLY_GEOLOCATED` (200km region size) DEPRIORITISES a target rather
   than dropping it: done targets rank below every unfinished one, and
   leftover budget flows to the least-certain done target via its nearest

@@ -50,6 +50,7 @@ LABELS = {
     'greedy_gaussian_105': 'greedy, gaussian slope=1.05',
     'greedy_em':           'greedy, em_gaussian regions',
     'greedy_additive':     'greedy, additive regions (shared src/dst model)',
+    'greedy_additive_info': 'greedy, additive + info-gain selection',
     'oracle':              'oracle (Perfect_Geolocator selection + true μ, σ)',
 }
 STYLES = {
@@ -59,6 +60,7 @@ STYLES = {
     'greedy_gaussian_105': dict(color='mediumseagreen', linestyle='--'),
     'greedy_em':           dict(color='crimson',    linewidth=2.2),
     'greedy_additive':     dict(color='darkviolet', linewidth=2.0),
+    'greedy_additive_info': dict(color='deeppink',  linewidth=2.2),
     'oracle':              dict(color='black',      linestyle='-.'),
 }
 

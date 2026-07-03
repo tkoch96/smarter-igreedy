@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import multiprocessing
 import time
@@ -9,7 +10,7 @@ from typing import Any, Callable, Optional
 from utils import LatLon, get_distance
 from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, ADDITIVE, DEFAULT_SLOPE, TARGET_OF_INTEREST
 from probabilistic_helpers import (
-	AdditiveLatencyModel, ADDITIVE_PRIOR_VAR_MS2, additive_batch_em,
+	AdditiveLatencyModel, ADDITIVE_PRIOR_VAR_MS2, additive_batch_em, KM_PER_MS,
 )
 
 DEBUG = False
@@ -139,6 +140,48 @@ def additive_utility_evaluator(
 	return area_reduction * trust
 
 
+def info_gain_utility_evaluator(
+	vp: str,
+	dst: str,
+	target_region: FeasibleRegion,
+	vp_loc: LatLon,
+	current_size: float,
+	rtt_model_func: Callable,
+	verb: bool,
+) -> float:
+	"""
+	Selection by expected information, not simulated size reduction.
+
+	Utility = log(1 + Var_hypotheses[predicted rtt] / (σ̂_s² + σ̂_t²)) —
+	how much the region's plausible locations DISAGREE about what this VP
+	would read, relative to the noise the reading carries anyway.  The
+	per-target offset is common to all hypotheses, so it cancels inside
+	the variance.
+
+	This is the fix for the measured geometry-blindness of the simulate
+	utility (all ~90 real-mesh candidates within 0.35% of each other,
+	while the one VP that would collapse a 12,000 km ridge ranked #9): a
+	discriminating VP predicts wildly different RTTs across the ridge and
+	scores orders of magnitude above its peers.  The old trust discount
+	and done-sinking fall out of the formula — noisy targets have a big
+	denominator, solved targets a ~zero numerator.
+	"""
+	if current_size < BASICALLY_GEOLOCATED:
+		distance = get_distance(vp_loc, target_region.get_location())
+		return -1000000.0 + current_size + 1.0 / (distance + 1.0)
+
+	hyps = target_region.hypotheses or [target_region.get_location()]
+	preds = [get_distance(vp_loc, h) / KM_PER_MS for h in hyps]
+	var_pred = float(np.var(preds)) if len(preds) > 1 else 0.0
+	noise_var = target_region.model.var_sum(vp, dst)
+	info = math.log1p(var_pred / noise_var)
+
+	if info <= 1e-6:
+		distance = get_distance(vp_loc, target_region.get_location())
+		return 1.0 / (distance + 1.0)
+	return info
+
+
 def _evaluate_vp_worker(
 	vp: str,
 	dst: str,
@@ -166,6 +209,7 @@ class Iterative_Greedy_Geolocator:
 		region_slope: float = DEFAULT_SLOPE,
 		name: Optional[str] = None,
 		model_refit_every: int = 1,
+		selection: str = 'simulate',
 	) -> None:
 		# Distinct names let several differently-configured greedys coexist
 		# in one Geolocator_Comparator run (plot keys / cache filenames).
@@ -185,9 +229,17 @@ class Iterative_Greedy_Geolocator:
 		# measurements every `model_refit_every` actual pings.
 		self.latency_model: Optional[AdditiveLatencyModel] = None
 		self.model_refit_every = model_refit_every
+		# ADDITIVE selection flavour: 'simulate' (clone + expected-rtt ping,
+		# size reduction) or 'info_gain' (hypothesis-set disagreement /
+		# noise — exploration-aware, and cheaper: no per-candidate NM).
+		if selection not in ('simulate', 'info_gain'):
+			raise ValueError(f"selection {selection!r} not understood")
+		self.selection = selection
 
 		if utility_func is not None:
 			self.utility_func: Callable = utility_func
+		elif region_mode == ADDITIVE and selection == 'info_gain':
+			self.utility_func = info_gain_utility_evaluator
 		elif region_mode == ADDITIVE:
 			self.utility_func = additive_utility_evaluator
 		else:
@@ -247,7 +299,8 @@ class Iterative_Greedy_Geolocator:
 		self.target_regions = {
 			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
 			                    mode=self.region_mode, slope=self.region_slope,
-			                    model=self.latency_model)
+			                    model=self.latency_model,
+			                    hypothesis_size=(self.selection == 'info_gain'))
 			for dst in self.targets
 		}
 		self.measurements_used = {dst: set() for dst in self.targets}

@@ -51,6 +51,19 @@ GAUSSIAN    = 'gaussian'
 EM_GAUSSIAN = 'em_gaussian'
 ADDITIVE    = 'additive'
 
+# Hypothesis-set settings (additive mode): a small support set of plausible
+# locations, kept alongside the MAP point. On cluster-degenerate geometry
+# the likelihood has a flat ridge (offset and distance exactly confounded),
+# which is invisible to any local measure — the set is built from the
+# ambiguity structure (rings around the best VP) and scored with the
+# PROFILED objective (per-target offset marginalised out, clamped ≥ 0:
+# rtt cannot beat SOL).
+HYP_RING_BEARINGS = 8      # ring sample density around the best VP
+HYP_RADIUS_FACTORS = (0.4, 0.7, 1.0)   # inward fractions — fits overshoot OUT
+HYP_SUPPORT_DELTA = 2.0    # keep candidates within this NLL of the best
+HYP_MAX = 8                # support-set size cap
+HYP_MIN_SEP_KM = 200.0     # dedupe near-identical hypotheses
+
 # EM (adaptive gaussian) settings
 EM_ITERS = 4               # E/M alternations per measurement update
 EM_MU_PRIOR_STRENGTH = 3.0     # pseudo-measurements anchoring μ to the prior
@@ -117,6 +130,7 @@ class FeasibleRegion:
         slope: float = DEFAULT_SLOPE,
         noise_model: str = GAUSSIAN_NOISE,
         model: Optional[AdditiveLatencyModel] = None,
+        hypothesis_size: bool = False,
     ) -> None:
         self.target_id = target_id
         self.mode = mode
@@ -140,6 +154,12 @@ class FeasibleRegion:
         self.model = model
         if mode == ADDITIVE and model is None:
             self.model = AdditiveLatencyModel()   # standalone/test use
+        # Support set of plausible locations (additive mode; maintained by
+        # _update_estimate_additive). `hypothesis_size=True` additionally
+        # folds the set's spread into get_region_size() — the ridge-aware
+        # honest uncertainty used by info-gain selection.
+        self.hypotheses: list[LatLon] = []
+        self.hypothesis_size = hypothesis_size
         self.best_guess: np.ndarray = np.array(prior_guess)
         # hard_circle: list[HardConstraint]   (vp_loc, max_radius_km)
         # gaussian:    list[ProbConstraint]   (vp_loc, sigma_ms, rtt_ms)
@@ -225,6 +245,10 @@ class FeasibleRegion:
             result = self._hard_circle_region_size()
         elif self.mode == ADDITIVE:
             result = self._additive_region_size()
+            if self.hypothesis_size:
+                # Ridge-aware honesty: a self-consistent wrong fit has
+                # clean residuals, but its support set stays spread.
+                result = max(result, self.hypothesis_spread_km())
         else:
             result = (mean_absolute_residual(self.get_location(), self.constraints,
                                              slope=self.slope)
@@ -262,11 +286,13 @@ class FeasibleRegion:
                                     radius_multiplier=self.radius_multiplier,
                                     slope=self.slope,
                                     noise_model=self.noise_model,
-                                    model=self.model)
+                                    model=self.model,
+                                    hypothesis_size=self.hypothesis_size)
         new_region.prior_slope = self.prior_slope
         new_region.fitted_sigma_ms = self.fitted_sigma_ms
         new_region.best_guess = self.best_guess.copy()
         new_region.constraints = self.constraints.copy()
+        new_region.hypotheses = list(self.hypotheses)
         new_region._cached_region_size = self._cached_region_size
         return new_region
 
@@ -511,11 +537,75 @@ class FeasibleRegion:
         # the VP itself instead.
         if len({src for _, src, _ in self.constraints}) == 1:
             self.best_guess = np.array(self.constraints[0][0])
+            self._update_hypotheses()
             return
         estimate = additive_map_location(
             self._additive_rows(),
             [self.get_location(), self._nn_anchor()])
         self.best_guess = np.array(estimate)
+        self._update_hypotheses()
+
+    def _profiled_nll(self, x: LatLon) -> float:
+        """Fit score of candidate location x with the per-target offset
+        MARGINALISED OUT (clamped ≥ 0 — rtt cannot beat SOL).  On a ridge
+        the shared offset absorbs any common distance shift, so this is
+        flat along the ridge (the point) while ordinary NLL under FIXED
+        offsets wrongly rejects its near end."""
+        offs, ws = [], []
+        t = self.target_id
+        for vp_loc, src, rtt in self.constraints:
+            offs.append(rtt - get_distance(x, vp_loc) / KM_PER_MS
+                        - self.model.mu_s.get(src, 5.0))
+            ws.append(1.0 / self.model.var_sum(src, t))
+        w = np.array(ws)
+        r = np.array(offs)
+        mu_prof = max(0.0, float(np.sum(w * r) / np.sum(w)))
+        return float(np.sum(w * (r - mu_prof) ** 2) / 2.0)
+
+    def _update_hypotheses(self) -> None:
+        """Rebuild the support set: MAP + NN anchor + rings around the best
+        (lowest-RTT) VP, scored by profiled NLL, kept within
+        HYP_SUPPORT_DELTA of the best.  Bowl targets collapse to ~1 point;
+        ridge targets keep a spread — which is exactly the signal info-gain
+        selection and honest sizing need."""
+        if not self.constraints:
+            self.hypotheses = []
+            return
+        best_vp_loc, best_src, best_rtt = min(self.constraints,
+                                              key=lambda c: c[2])
+        implied = max(0.0, best_rtt - self.model.mean_offset(
+            best_src, self.target_id)) * KM_PER_MS
+        map_pt = self.get_location()
+        d_map = get_distance(best_vp_loc, map_pt)
+
+        pool: list[LatLon] = [map_pt, best_vp_loc]
+        radii = {round(implied * f) for f in HYP_RADIUS_FACTORS}
+        radii.add(round(d_map))
+        for r_km in radii:
+            if r_km < HYP_MIN_SEP_KM:
+                continue
+            for bearing in np.linspace(0.0, 2 * np.pi, HYP_RING_BEARINGS,
+                                       endpoint=False):
+                pool.append(_destination_point(best_vp_loc, bearing, r_km))
+
+        scored = sorted((self._profiled_nll(p), i, p)
+                        for i, p in enumerate(pool))
+        best_nll = scored[0][0]
+        support: list[LatLon] = []
+        for nll, _, p in scored:
+            if nll > best_nll + HYP_SUPPORT_DELTA or len(support) >= HYP_MAX:
+                break
+            if all(get_distance(p, q) >= HYP_MIN_SEP_KM for q in support):
+                support.append(p)
+        self.hypotheses = support
+
+    def hypothesis_spread_km(self) -> float:
+        """Largest distance between two support points — the ridge length."""
+        if len(self.hypotheses) < 2:
+            return 0.0
+        return max(get_distance(p, q)
+                   for i, p in enumerate(self.hypotheses)
+                   for q in self.hypotheses[i + 1:])
 
     def _additive_region_size(self) -> float:
         """

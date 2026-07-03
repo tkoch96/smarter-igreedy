@@ -51,18 +51,21 @@ structurally cannot value a measurement whose worth is falsifying the
 model.
 
 Fix directions, in value order:
-1. Exploration-aware utility: score candidates by outcome VARIANCE under
-   the predictive distribution (location-ridge + σ̂), not by simulated
-   zero-residual size reduction — a candidate whose measurement could
-   drastically move the estimate carries the information; bearing/
-   distance novelty is the cheap proxy. This is the plateau-breaker.
+1. DONE (2026-07-03, synthetic): info-gain selection
+   (`selection='info_gain'`) — hypothesis-set disagreement / noise, with
+   ridge-aware region size riding along. Validated by TestRidgeEscape
+   (lone VP found as 2nd ping 9/10 seeds, err 477 vs 3068 km; simulate
+   finds it 0/10) and no-harm pins in both ridge-free worlds.
+   REMAINING: the real-mesh acceptance run — rerun the b=1000 hindsight
+   debug driver and the n=100 comparator with
+   `Iterative_Greedy_Geolocator(region_mode=ADDITIVE,
+   selection='info_gain', model_refit_every=25)`; check the 7 km VP
+   (103.69.212.0 → 128.0.113.0) actually gets pinged and the mean drops
+   toward random+NN/oracle territory.
 2. Report MEDIANS in `Geolocator_Comparator.run()` (store per-target
    errors in plot_data) — greedy already wins medians at b=1000
    (859 vs 907) and the mean-only print hides it.
-3. Honest region size under cluster-degenerate geometry (narrow bearing
-   cone → ring-ambiguity floor): stops the overconfidence and the
-   10-13-ping waste on unfixable-looking-fixable targets.
-4. Robust additive M-step (see #1) for the secondary detour effect.
+3. Robust additive M-step (see #1) for the secondary detour effect.
 
 ---
 

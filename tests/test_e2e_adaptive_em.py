@@ -383,7 +383,7 @@ MULTI_SIGMA_RANGE = SIGMA_RANGE
 
 MULTI_STRATEGIES = ('random_nn', 'greedy_hard', 'greedy_gaussian',
                     'greedy_gaussian_105', 'greedy_em', 'greedy_additive',
-                    'oracle')
+                    'greedy_additive_info', 'oracle')
 
 
 def make_multi_scenario(seed: int, mu_range=MULTI_MU_RANGE,
@@ -445,9 +445,11 @@ def _run_random_nn(sc: dict, snapshot_ks=()) -> tuple[list[float], dict]:
 
 
 def _run_greedy(sc: dict, region_mode: str, snapshot_ks=(),
-                region_slope: float = DEFAULT_SLOPE) -> tuple[list[float], dict]:
+                region_slope: float = DEFAULT_SLOPE,
+                selection: str = 'simulate') -> tuple[list[float], dict]:
     ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=region_mode,
-                                     region_slope=region_slope)
+                                     region_slope=region_slope,
+                                     selection=selection)
     ig.set_data(sc['data'])
     ig.solve()
     errs, snaps = [], {}
@@ -509,6 +511,8 @@ def run_multi_seed(seed: int, snapshot_ks=(), mu_range=MULTI_MU_RANGE,
                                                    region_slope=1.05),
         'greedy_em':       lambda: _run_greedy(sc, EM_GAUSSIAN, snapshot_ks),
         'greedy_additive': lambda: _run_greedy(sc, ADDITIVE, snapshot_ks),
+        'greedy_additive_info': lambda: _run_greedy(sc, ADDITIVE, snapshot_ks,
+                                                    selection='info_gain'),
         'oracle':          lambda: _run_oracle(sc, snapshot_ks),
     }
     for name, run in runners.items():
@@ -539,9 +543,14 @@ class TestMultiTargetBudgetAllocation:
     medians (deterministic seeds), with BASICALLY_GEOLOCATED acting as a
     deprioritisation rather than a hard stop:
 
-        k=10: random=1214  g_hard=1025  g_gauss=1022  g_em=1042  g_add= 821  oracle=325
-        k=25: random= 699  g_hard= 772  g_gauss= 657  g_em= 561  g_add= 508  oracle=211
-        k=50: random= 462  g_hard= 392  g_gauss= 521  g_em= 222  g_add= 266  oracle=148
+        k=10: random=1214  g_hard=1025  g_gauss=1022  g_em=1042  g_add= 821  g_info= 931  oracle=325
+        k=25: random= 699  g_hard= 772  g_gauss= 657  g_em= 561  g_add= 508  g_info= 492  oracle=211
+        k=50: random= 462  g_hard= 392  g_gauss= 521  g_em= 222  g_add= 266  g_info= 266  oracle=148
+
+    greedy_additive_info (hypothesis-set info-gain selection) is at parity
+    with the simulate utility here — targets sit inside the VP span, so
+    there are no likelihood ridges to explore. Its regression test is
+    TestRidgeEscape in test_e2e_additive_em.py.
 
     greedy_additive (shared src/dst model) plays an AWAY game here — the
     world is multiplicative (per-target slope), which an additive offset
@@ -657,6 +666,13 @@ class TestMultiTargetBudgetAllocation:
     def test_greedy_additive_beats_random_at_full_budget(self, multi_results):
         assert _multi_med(multi_results, 'greedy_additive', TOTAL_BUDGET) < \
             0.75 * _multi_med(multi_results, 'random_nn', TOTAL_BUDGET)
+
+    def test_info_gain_no_harm_in_multiplicative_world(self, multi_results):
+        """Exploration-aware selection must not cost budget where there is
+        nothing to explore (calibrated 931/492/266 vs 821/508/266)."""
+        for k in (25, TOTAL_BUDGET):
+            assert _multi_med(multi_results, 'greedy_additive_info', k) <= \
+                1.10 * _multi_med(multi_results, 'greedy_additive', k)
 
     def test_em_stays_ahead_of_additive_in_multiplicative_world(self, multi_results):
         """Model class matches world: per-target slope em keeps the lead at

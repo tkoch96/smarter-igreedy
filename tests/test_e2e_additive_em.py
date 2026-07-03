@@ -318,10 +318,11 @@ MISSING_PENALTY_KM = 10_000.0
 TOTAL_PINGS = len(VP_LOCS) * N_TARGETS                   # 80
 BUDGET_GRID = (5, 10, 15, 20, 30, 40, 50, 60, 70, 80)
 SWEEP_STRATEGIES = ('random_nn', 'const_gaussian', 'per_target_em',
-                    'additive_em', 'greedy_additive', 'oracle')
+                    'additive_em', 'greedy_additive', 'greedy_additive_info',
+                    'oracle')
 
 
-def run_greedy_additive_seed(sc: dict) -> tuple[list[float], dict]:
+def run_greedy_additive_seed(sc: dict, selection: str = 'simulate') -> tuple[list[float], dict]:
     """Greedy selection + additive estimation over BUDGET_GRID.
     Returns (error curve, cumulative pathological ping share per budget)."""
     loc_loc_meas: dict[str, dict[str, list[float]]] = {}
@@ -330,7 +331,8 @@ def run_greedy_additive_seed(sc: dict) -> tuple[list[float], dict]:
     data = {'address_to_loc': dict(VP_LOCS), 'loc_loc_meas': loc_loc_meas}
     patho = {t for t, tp in sc['targets'].items() if tp['pathological']}
 
-    ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE)
+    ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE,
+                                     selection=selection)
     ig.set_data(data)
     ig.solve()
     errs, patho_share = [], {}
@@ -453,8 +455,12 @@ def run_additive_budget_seed(seed: int) -> dict:
         curves['oracle'].append(avg_err(orc))
 
     curves['greedy_additive'], patho_share = run_greedy_additive_seed(sc)
+    curves['greedy_additive_info'], info_patho_share = \
+        run_greedy_additive_seed(sc, selection='info_gain')
 
-    return {'scenario': sc, 'curves': curves, 'greedy_patho_share': patho_share}
+    return {'scenario': sc, 'curves': curves,
+            'greedy_patho_share': patho_share,
+            'greedy_info_patho_share': info_patho_share}
 
 
 N_SWEEP_SEEDS = 10
@@ -501,6 +507,11 @@ class TestAdditiveBudgetSweep:
     # it. Selection dominates the early regime; at full coverage the
     # greedy's batch polish IS the additive_em estimator on identical
     # data, hence the exactly matching 706.
+    #
+    # greedy_additive_info (hypothesis-set info-gain selection): 1991 →
+    # 1077 → 706 — parity here BY DESIGN: these targets sit inside the VP
+    # span, so there are no ridges to exploit. Its home turf is
+    # TestRidgeEscape below; this world pins "no harm".
 
     def test_greedy_selection_beats_random_order_early(self, sweep_results):
         """The point of selection: at b=10 the greedy places its pings
@@ -531,6 +542,14 @@ class TestAdditiveBudgetSweep:
         assert _sweep_mean(sweep_results, 'greedy_additive', 80) <= \
             1.02 * _sweep_mean(sweep_results, 'additive_em', 80)
 
+    def test_info_gain_no_harm_in_ridge_free_world(self, sweep_results):
+        """Info-gain selection must not cost anything where there is
+        nothing to explore (calibrated: 1991/1077/706 vs simulate's
+        1932/1129/706)."""
+        for b in (10, 40, 80):
+            assert _sweep_mean(sweep_results, 'greedy_additive_info', b) <= \
+                1.10 * _sweep_mean(sweep_results, 'greedy_additive', b)
+
     def test_greedy_does_not_sink_budget_into_pathological_targets(self, sweep_results):
         """THE payoff of σ̂_dst in the utility (trust-discounted gain): the
         pathological targets' share of greedy pings stays near their fair
@@ -549,3 +568,128 @@ class TestAdditiveBudgetSweep:
         path = make_figure(sweep_results, OUT_PATH)
         assert os.path.exists(path)
         assert os.path.getsize(path) > 5_000
+
+
+# ===========================================================================
+# Ridge escape — the regression test for the real-mesh selection failure
+# ===========================================================================
+#
+# Miniature of the measured pathology: a VP cluster (Europe) plus ONE far
+# target with ONE lone VP near it. From the cluster alone, the target's
+# offset and its distance are exactly confounded (a flat likelihood ridge);
+# the lone VP is the only measurement that collapses the ridge. Measured on
+# the real mesh: the simulate utility scored ~90 candidates within 0.35% of
+# each other and ranked the 7 km / 0.7 ms VP #9 — it was never pinged and
+# the target finished 12,450 km wrong. Info-gain selection scores candidates
+# by hypothesis disagreement, which is exactly "how much of the ridge does
+# this ping destroy" — the lone VP should dominate.
+
+RIDGE_VP_LOCS: dict[str, LatLon] = {
+    'london':    (51.50,  -0.10),
+    'paris':     (48.85,   2.35),
+    'berlin':    (52.52,  13.41),
+    'madrid':    (40.42,  -3.70),
+    'warsaw':    (52.23,  21.01),
+    'rome':      (41.90,  12.50),
+    # lone VP near the far target — inserted LAST so dict/list ordering
+    # never gifts it a free first ping
+    'kochi':     (9.93,  76.26),
+}
+RIDGE_FAR_TARGET_LOC = (13.01, 74.80)     # ~Mangalore, 460 km from kochi
+RIDGE_N_EUR_TARGETS = 3
+RIDGE_BUDGET = 16                         # 4 targets x 7 VPs = 28 pairs max
+
+
+def make_ridge_scenario(seed: int) -> dict:
+    rng = np.random.default_rng(seed + 5_000_000)
+    targets = {'far_0': {'loc': RIDGE_FAR_TARGET_LOC}}
+    for i in range(RIDGE_N_EUR_TARGETS):
+        targets[f'eur_{i}'] = {
+            'loc': (float(rng.uniform(*TARGET_LAT_RANGE)),
+                    float(rng.uniform(*TARGET_LON_RANGE)))}
+    for tp in targets.values():
+        tp['mu'] = float(rng.uniform(*DST_MU_RANGE))
+        tp['sigma'] = float(rng.uniform(*DST_SIGMA_RANGE))
+    sources = {
+        s: {'mu': float(rng.uniform(*SRC_MU_RANGE)),
+            'sigma': float(rng.uniform(*SRC_SIGMA_RANGE))}
+        for s in RIDGE_VP_LOCS
+    }
+    loc_loc_meas: dict[str, dict[str, list[float]]] = {}
+    for s, sp in sources.items():
+        loc_loc_meas[s] = {}
+        for t, tp in targets.items():
+            sol = get_distance(RIDGE_VP_LOCS[s], tp['loc']) / KM_PER_MS
+            loc_loc_meas[s][t] = [
+                sol
+                + max(0.0, float(rng.normal(sp['mu'], sp['sigma'])))
+                + max(0.0, float(rng.normal(tp['mu'], tp['sigma'])))]
+    data = {'address_to_loc': dict(RIDGE_VP_LOCS), 'loc_loc_meas': loc_loc_meas}
+    return {'targets': targets, 'data': data}
+
+
+def run_ridge_seed(seed: int, selection: str) -> dict:
+    sc = make_ridge_scenario(seed)
+    ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE,
+                                     selection=selection)
+    ig.set_data(sc['data'])
+    ig.solve()
+    ig.measurements(RIDGE_BUDGET)
+    est = ig.get_current_estimates()
+    far_srcs = [s for s, t in ig.measurement_history if t == 'far_0']
+    ig.cleanup()
+    return {
+        'kochi_pos': (far_srcs.index('kochi') + 1
+                      if 'kochi' in far_srcs else None),   # 1-based, in far_0's pings
+        'far_pings': len(far_srcs),
+        'far_err': get_distance(est['far_0'], RIDGE_FAR_TARGET_LOC),
+    }
+
+
+N_RIDGE_SEEDS = 10
+
+
+@pytest.fixture(scope='module')
+def ridge_results():
+    return {sel: [run_ridge_seed(seed, sel) for seed in range(N_RIDGE_SEEDS)]
+            for sel in ('simulate', 'info_gain')}
+
+
+class TestRidgeEscape:
+    def test_summary(self, ridge_results):
+        for sel, rows in ridge_results.items():
+            found = [r['kochi_pos'] for r in rows]
+            errs = [r['far_err'] for r in rows]
+            print(f"\n{sel:9s}: kochi_pos={found}  "
+                  f"far_err med={np.median(errs):7.1f} max={max(errs):8.1f}")
+
+    def test_info_gain_finds_the_lone_vp_early(self, ridge_results):
+        """The discriminating VP should be among far_0's first pings —
+        hypothesis disagreement makes it score far above cluster VPs."""
+        rows = ridge_results['info_gain']
+        hits = sum(1 for r in rows
+                   if r['kochi_pos'] is not None and r['kochi_pos'] <= 3)
+        assert hits >= 0.8 * N_RIDGE_SEEDS
+
+    def test_info_gain_solves_the_far_target(self, ridge_results):
+        """Calibrated median 477 km — essentially the 460 km distance from
+        kochi to the target, i.e. the best any method could do from these
+        VPs. simulate: 3068 km."""
+        errs = [r['far_err'] for r in ridge_results['info_gain']]
+        assert float(np.median(errs)) < 700.0
+
+    def test_simulate_utility_is_ridge_blind(self, ridge_results):
+        """Pin the failure this feature fixes: the simulate utility treats
+        all candidates alike (measured 0.35% spread on the real mesh), so
+        it reaches the lone VP no better than chance and its far-target
+        error stays ~ridge-sized. If this ever starts passing the
+        info-gain criteria, the simulate path learned geometry — update
+        the docs."""
+        rows = ridge_results['simulate']
+        hits = sum(1 for r in rows
+                   if r['kochi_pos'] is not None and r['kochi_pos'] <= 3)
+        errs = [r['far_err'] for r in rows]
+        assert hits <= 0.5 * N_RIDGE_SEEDS
+        assert float(np.median(errs)) > \
+            2.0 * float(np.median([r['far_err']
+                                   for r in ridge_results['info_gain']]))
