@@ -43,7 +43,7 @@ import matplotlib.pyplot as plt
 OUT_PATH = os.path.join(os.path.dirname(__file__), 'error_over_measurements_additive.pdf')
 
 LABELS = {
-    'random_nn':      'nearest neighbour',
+    'random_nn':      'random order + nearest neighbour (the assess_geolocators "random")',
     'const_gaussian': 'gaussian, slope = 1.3 (constant)',
     'per_target_em':  'per-target em (multiplicative μ_t, σ_t)',
     'additive_em':    'additive em (per-source AND per-dest μ, σ)',
