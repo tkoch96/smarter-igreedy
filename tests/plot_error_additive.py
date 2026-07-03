@@ -66,32 +66,37 @@ STYLES = {
 }
 
 
-def make_figure(rows=None, output_path: str = OUT_PATH) -> str:
+def make_figure(rows=None, output_path: str = OUT_PATH,
+                budget_grid=None, strategies=None, title=None,
+                n_targets=None, ylim=4600) -> str:
     from test_e2e_additive_em import (
         run_additive_budget_seed, BUDGET_GRID, SWEEP_STRATEGIES,
         N_SWEEP_SEEDS, N_TARGETS, N_PATHOLOGICAL,
     )
     if rows is None:
         rows = [run_additive_budget_seed(seed) for seed in range(N_SWEEP_SEEDS)]
+    budget_grid = budget_grid or BUDGET_GRID
+    strategies = strategies or SWEEP_STRATEGIES
+    n_targets = n_targets or N_TARGETS
 
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    for s in SWEEP_STRATEGIES:
+    for s in strategies:
         mean = [float(np.mean([r['curves'][s][i] for r in rows]))
-                for i in range(len(BUDGET_GRID))]
-        ax.plot(BUDGET_GRID, mean, marker='.', label=LABELS[s], **STYLES[s])
+                for i in range(len(budget_grid))]
+        ax.plot(budget_grid, mean, marker='.', label=LABELS[s], **STYLES[s])
 
     ax.set_xlabel('total measurements spent (across all targets)')
-    ax.set_ylabel(f'mean avg geolocation error over {N_TARGETS} targets (km)')
-    ax.set_title(
+    ax.set_ylabel(f'mean avg geolocation error over {n_targets} targets (km)')
+    ax.set_title(title or (
         f'Additive world: rtt = SOL + X_src + X_dst, per-node hidden (μ, σ), '
         f'{N_PATHOLOGICAL} pathological destinations —\n'
         f'{len(rows)} seeds, identical random order for every estimator '
-        f'except greedy_additive, which selects its own pings',
+        f'except greedy_additive, which selects its own pings'),
         fontsize=10,
     )
     # High enough to show the early regime where selection separates from
-    # the random-order estimators (means sit at 3500-4300 km at b=10).
-    ax.set_ylim(0, 4600)
+    # the random-order estimators.
+    ax.set_ylim(0, ylim)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=9)
     fig.tight_layout()
