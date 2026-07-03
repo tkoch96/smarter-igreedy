@@ -34,14 +34,35 @@ Hindsight debug run (n=100, b=1000, belief trail joined with truth):
   floor is 5-10,000 km. The n=100 MEAN is geometry-bound; median is the
   honest headline metric.
 
+Second finding (closest-VP trace, same debug run): the additive
+utility is GEOMETRY-BLIND, so selection cannot recover from a wrong
+estimate. Reconstructing the b=1000 state and ranking all ~90 candidate
+VPs through additive_utility_evaluator: every candidate scores within
+0.35% of every other (the simulated ping is added at the model-expected
+RTT — zero surprise — so only σ̂_s differentiates candidates), and the
+predicted RTT for the truly-closest VP is computed from distance to the
+WRONG estimate (197 ms predicted where reality is 0.7 ms from 7 km
+away; it ranked #9/88 and was never pinged). The oracle's 615 km mean
+with plain-NN estimation proves close VPs exist for nearly every
+target: the plateau is an EXPLORATION failure, not a geometry floor.
+Random+NN keeps improving with budget precisely because random sampling
+stumbles onto the close VPs; expected-utility-under-the-current-model
+structurally cannot value a measurement whose worth is falsifying the
+model.
+
 Fix directions, in value order:
-1. Report MEDIANS in `Geolocator_Comparator.run()` (store per-target
-   errors in plot_data) — the current mean-only print hides the win.
-2. Honest region size under cluster-degenerate geometry: when all of a
-   target's VPs span a narrow bearing cone, the ring ambiguity should
-   floor the size (stops both the overconfidence and the 10-13-ping
-   waste; frees ~8% of budget).
-3. Robust additive M-step (see #1) for the secondary detour effect.
+1. Exploration-aware utility: score candidates by outcome VARIANCE under
+   the predictive distribution (location-ridge + σ̂), not by simulated
+   zero-residual size reduction — a candidate whose measurement could
+   drastically move the estimate carries the information; bearing/
+   distance novelty is the cheap proxy. This is the plateau-breaker.
+2. Report MEDIANS in `Geolocator_Comparator.run()` (store per-target
+   errors in plot_data) — greedy already wins medians at b=1000
+   (859 vs 907) and the mean-only print hides it.
+3. Honest region size under cluster-degenerate geometry (narrow bearing
+   cone → ring-ambiguity floor): stops the overconfidence and the
+   10-13-ping waste on unfixable-looking-fixable targets.
+4. Robust additive M-step (see #1) for the secondary detour effect.
 
 ---
 
