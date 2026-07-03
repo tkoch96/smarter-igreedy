@@ -504,6 +504,7 @@ class Iterative_Greedy_Geolocator:
 					best_global_dst = dst
 					best_global_src = src
 
+			was_explore = False
 			if (self.selection == 'phased'
 			        and best_global_utility < MARGINAL_SWITCH_KM):
 				# The board's best honest promise is negligible — divert
@@ -516,6 +517,7 @@ class Iterative_Greedy_Geolocator:
 						cand[int(self._explore_rng.integers(len(cand)))]
 					best_global_utility = 0.0
 					self.explore_pings += 1
+					was_explore = True
 
 			if best_global_dst is None:
 				if focus_group_refreshed:
@@ -605,6 +607,7 @@ class Iterative_Greedy_Geolocator:
 				'ping_num': len(self.measurement_history) + 1,
 				'target': best_global_dst,
 				'src': best_global_src,
+				'explore': was_explore,
 				'expected_util': expected_utility,
 				'actual_util': actual_utility,
 				'error': expected_utility - actual_utility,
