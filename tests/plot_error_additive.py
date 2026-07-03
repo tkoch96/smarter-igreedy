@@ -14,7 +14,12 @@ greedy_additive, which selects its own pings:
                      class that can represent this world
     greedy_additive  Iterative_Greedy_Geolocator + shared AdditiveLatencyModel,
                      σ̂_dst-discounted utility (selection + estimation system)
-    oracle           true per-node parameters (explicit cheat)
+    oracle           true per-node parameters (ESTIMATION-only cheat: it
+                     still consumes the shared random order, so the greedy
+                     legitimately beats it in the early regime)
+
+Plots the MEAN across seeds of the per-seed avg-over-targets error — the
+same statistic assess_geolocators.run() reports.
 
 Run directly:
     cd ~/Documents/smarter-igreedy
@@ -43,7 +48,7 @@ LABELS = {
     'per_target_em':  'per-target em (multiplicative μ_t, σ_t)',
     'additive_em':    'additive em (per-source AND per-dest μ, σ)',
     'greedy_additive': 'GREEDY selection + additive em (σ̂_dst in utility)',
-    'oracle':         'oracle (true per-node μ, σ)',
+    'oracle':         'oracle params (true μ, σ — random order, no selection)',
 }
 STYLES = {
     'random_nn':      dict(color='grey',       linestyle=':'),
@@ -65,12 +70,12 @@ def make_figure(rows=None, output_path: str = OUT_PATH) -> str:
 
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
     for s in SWEEP_STRATEGIES:
-        med = [float(np.median([r['curves'][s][i] for r in rows]))
-               for i in range(len(BUDGET_GRID))]
-        ax.plot(BUDGET_GRID, med, marker='.', label=LABELS[s], **STYLES[s])
+        mean = [float(np.mean([r['curves'][s][i] for r in rows]))
+                for i in range(len(BUDGET_GRID))]
+        ax.plot(BUDGET_GRID, mean, marker='.', label=LABELS[s], **STYLES[s])
 
     ax.set_xlabel('total measurements spent (across all targets)')
-    ax.set_ylabel(f'median of avg geolocation error over {N_TARGETS} targets (km)')
+    ax.set_ylabel(f'mean avg geolocation error over {N_TARGETS} targets (km)')
     ax.set_title(
         f'Additive world: rtt = SOL + X_src + X_dst, per-node hidden (μ, σ), '
         f'{N_PATHOLOGICAL} pathological destinations —\n'
@@ -78,7 +83,9 @@ def make_figure(rows=None, output_path: str = OUT_PATH) -> str:
         f'except greedy_additive, which selects its own pings',
         fontsize=10,
     )
-    ax.set_ylim(0, 3000)
+    # High enough to show the early regime where selection separates from
+    # the random-order estimators (means sit at 3500-4300 km at b=10).
+    ax.set_ylim(0, 4600)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=9)
     fig.tight_layout()

@@ -290,10 +290,15 @@ class TestAdditiveModel:
 #
 # Same random measurement ORDER for every strategy (pings = (src, dst)
 # pairs, one sample each); strategies differ only in estimation. The
-# additive EM is the only model class that can represent this world and
-# wins among the MODEL-BASED estimators once cross-target data has
+# oracle is an ESTIMATION oracle only — true per-node (μ, σ), same random
+# order — so greedy selection legitimately beats it in the early regime.
+# All stats are means across seeds of the per-seed avg-over-targets error
+# (matching the figure and assess_geolocators.run()).
+#
+# The additive EM is the only model class that can represent this world
+# and wins among the MODEL-BASED estimators once cross-target data has
 # accumulated. Nearest-neighbour keeps the full-coverage lead in this
-# small single-sample synthetic (614 vs 722 median at b=80) — with 10 VPs
+# small single-sample synthetic (646 vs 706 mean at b=80) — with 10 VPs
 # there is only ~8-10 pairs of pooling per node, and NN error is bounded
 # by VP density. On the real n=20 mesh (19 pairs/node) the additive
 # estimator DOES beat NN outright; see assess_additive_real.py numbers in
@@ -432,57 +437,65 @@ def sweep_results():
     return [run_additive_budget_seed(seed) for seed in range(N_SWEEP_SEEDS)]
 
 
-def _sweep_med(rows, strategy, budget):
+def _sweep_mean(rows, strategy, budget):
+    """Mean across seeds of the per-seed avg-over-targets error — same
+    statistic the figure plots and assess_geolocators.run() reports."""
     i = BUDGET_GRID.index(budget)
-    return float(np.median([r['curves'][strategy][i] for r in rows]))
+    return float(np.mean([r['curves'][strategy][i] for r in rows]))
 
 
 class TestAdditiveBudgetSweep:
     def test_summary(self, sweep_results):
         for b in (10, 40, 80):
-            line = "  ".join(f"{s}={_sweep_med(sweep_results, s, b):7.1f}"
+            line = "  ".join(f"{s}={_sweep_mean(sweep_results, s, b):7.1f}"
                              for s in SWEEP_STRATEGIES)
             print(f"\nb={b:3d}: {line}")
 
     def test_additive_wins_among_models_at_full_budget(self, sweep_results):
-        """Best MODEL-BASED estimator at full coverage (722 vs 1655/1686).
-        NN (614) stays ahead in this small single-sample synthetic — see the
+        """Best MODEL-BASED estimator at full coverage (706 vs 1686/1702).
+        NN (646) stays ahead in this small single-sample synthetic — see the
         section comment; the real n=20 mesh flips that."""
-        add = _sweep_med(sweep_results, 'additive_em', 80)
+        add = _sweep_mean(sweep_results, 'additive_em', 80)
         for other in ('const_gaussian', 'per_target_em'):
-            assert add < _sweep_med(sweep_results, other, 80)
+            assert add < _sweep_mean(sweep_results, other, 80)
 
     def test_additive_beats_per_target_em_from_mid_budget(self, sweep_results):
-        assert _sweep_med(sweep_results, 'additive_em', 40) < \
-            _sweep_med(sweep_results, 'per_target_em', 40)
+        assert _sweep_mean(sweep_results, 'additive_em', 40) < \
+            _sweep_mean(sweep_results, 'per_target_em', 40)
 
     def test_oracle_bounds_additive_at_full_budget(self, sweep_results):
-        assert _sweep_med(sweep_results, 'oracle', 80) <= \
-            _sweep_med(sweep_results, 'additive_em', 80)
+        assert _sweep_mean(sweep_results, 'oracle', 80) <= \
+            _sweep_mean(sweep_results, 'additive_em', 80)
 
     # -- greedy_additive: selection + estimation as one system --------------
-    # Calibrated medians (10 seeds): greedy 1968 → 1064 → 722 over
-    # b = 10/40/80 vs random-order additive_em's 4455 → 1110 → 722 and
-    # random_nn's 3627 → 736 → 614. Selection dominates the early regime
-    # (greedy at b=10 ≈ NN at b=30-40); at full coverage the greedy's batch
-    # polish IS the additive_em estimator on identical data, hence the
-    # exactly matching 722.
+    # Calibrated means (10 seeds): greedy 1932 → 1129 → 706 over
+    # b = 10/40/80 vs random-order additive_em's 4281 → 1172 → 706 and
+    # random_nn's 3475 → 752 → 646. Selection dominates the early regime
+    # (greedy at b=10 even beats the estimation-oracle's 3480 — perfect
+    # parameters can't fix randomly placed pings); at full coverage the
+    # greedy's batch polish IS the additive_em estimator on identical
+    # data, hence the exactly matching 706.
 
     def test_greedy_selection_beats_random_order_early(self, sweep_results):
         """The point of selection: at b=10 the greedy places its pings
-        better than the shared random order feeds ANY estimator (1968 vs
-        additive_em's 4455 and random+NN's 3627)."""
-        assert _sweep_med(sweep_results, 'greedy_additive', 10) < \
-            0.6 * _sweep_med(sweep_results, 'additive_em', 10)
-        assert _sweep_med(sweep_results, 'greedy_additive', 10) < \
-            0.6 * _sweep_med(sweep_results, 'random_nn', 10)
+        better than the shared random order feeds ANY estimator (1932 vs
+        additive_em's 4281 and random+NN's 3475 — even the estimation
+        oracle at 3480)."""
+        assert _sweep_mean(sweep_results, 'greedy_additive', 10) < \
+            0.6 * _sweep_mean(sweep_results, 'additive_em', 10)
+        assert _sweep_mean(sweep_results, 'greedy_additive', 10) < \
+            0.6 * _sweep_mean(sweep_results, 'random_nn', 10)
+        # Selection beats even perfect parameters on a random order: the
+        # sweep's oracle cheats on ESTIMATION only, not on ping placement.
+        assert _sweep_mean(sweep_results, 'greedy_additive', 10) < \
+            _sweep_mean(sweep_results, 'oracle', 10)
 
     def test_greedy_matches_additive_em_at_full_budget(self, sweep_results):
         """At full coverage both have seen every pair, and the greedy's
         final batch polish is the same estimator — no estimation premium
         for having selected greedily."""
-        assert _sweep_med(sweep_results, 'greedy_additive', 80) <= \
-            1.02 * _sweep_med(sweep_results, 'additive_em', 80)
+        assert _sweep_mean(sweep_results, 'greedy_additive', 80) <= \
+            1.02 * _sweep_mean(sweep_results, 'additive_em', 80)
 
     def test_greedy_does_not_sink_budget_into_pathological_targets(self, sweep_results):
         """THE payoff of σ̂_dst in the utility (trust-discounted gain): the
