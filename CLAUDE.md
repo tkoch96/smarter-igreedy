@@ -205,6 +205,18 @@ Result caches include the subsample size in the filename
 subsample sizes are not interchangeable (a stale-cache bug once mixed
 20-probe baselines into a 100-probe figure).
 
+Real-mesh scaling result (2026-07-04, means at b=2500, seed 31415;
+figures/geolocator_results_n{200,300}.pdf): greedy_additive_risk breaks
+the greedy plateau at scale — n=200: 2,265 vs greedy_em/simulate's
+~3,240 and beats random+NN at every budget until b≈2,100 (2.5× budget
+efficiency: risk@800 ≈ random@2000); n=300: 2,398, ahead of random
+(2,628) even at full budget (random is coverage-starved at 8.3
+pings/target) with an 800-1,200 km lead through the mid-range;
+greedy_em closes to 2,413 only at the very end. The mesh floor
+(smart_perfect) tightens 615 → 424 → 382 across n=100/200/300.
+risk_gain's known flat segment from b≈800 (n=200) is the phased
+selection's target regime.
+
 Real-mesh findings at n=100 (means; medians are far kinder — isolated
 targets dominate means, and run() does not report medians yet):
 greedy_em drops to ~2,650 by b=300 and plateaus ~2,800; greedy_additive
