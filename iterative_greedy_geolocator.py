@@ -342,6 +342,19 @@ class Iterative_Greedy_Geolocator:
 		self.targets: list[str] = []
 		self.utility_tracking: list[dict[str, Any]] = []
 
+	def __getstate__(self):
+		# Live ProcessPoolExecutors don't pickle; drop it so whole
+		# geolocators can be shipped to a child process (the comparator's
+		# parallel path) and recreate it lazily on the other side.
+		state = self.__dict__.copy()
+		state['executor'] = None
+		return state
+
+	def __setstate__(self, state):
+		self.__dict__.update(state)
+		if self.executor is None:
+			self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
+
 	def set_data(self, data: TargetData) -> None:
 		self.data = data
 		self.vp_locations = data.get('address_to_loc', {})

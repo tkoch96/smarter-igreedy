@@ -1,3 +1,5 @@
+import multiprocessing
+import traceback
 import numpy as np, pickle, os
 from scipy.optimize import minimize
 from utils import *
@@ -11,6 +13,119 @@ from probabilistic_helpers import (
 )
 
 from plot_results import *
+
+def convert_measurements(measurements, target_data, mode):
+	"""Module-level (picklable, comparator-free) estimation of measured
+	targets — see Geolocator_Comparator.convert_measurements_to_locations
+	for the semantics of each mode."""
+	address_to_loc = target_data.get('address_to_loc', {})
+
+	if mode == 'additive_em':
+		pairs = {}
+		for src, dsts in measurements.items():
+			for dst, rtts in dsts.items():
+				if rtts:
+					pairs[(src, dst)] = [float(r) for r in rtts]
+		estimates, _, _, _, _ = additive_batch_em(pairs, address_to_loc)
+		return estimates
+
+	estimated_locations = {}
+	dst_to_src_rtts = {}
+	for src, dsts in measurements.items():
+		for dst, rtts in dsts.items():
+			if not rtts:
+				continue
+			dst_to_src_rtts.setdefault(dst, {})[src] = min(rtts)
+
+	for dst, src_rtts in dst_to_src_rtts.items():
+		if mode == 'nearest_neighbor':
+			closest_src = min(src_rtts, key=src_rtts.get)
+			if closest_src in address_to_loc:
+				estimated_locations[dst] = address_to_loc[closest_src]
+
+		elif mode in ('hard_circle', 'great_circle_overlap_centroid'):
+			region = FeasibleRegion(target_id=dst, mode=HARD_CIRCLE)
+			for src, rtt in src_rtts.items():
+				if src in address_to_loc:
+					region.add_measurement(address_to_loc[src], max(0.0, rtt))
+			if region.constraints:
+				estimated_locations[dst] = region.get_location()
+
+		elif mode == 'gaussian':
+			region = FeasibleRegion(target_id=dst, mode=GAUSSIAN)
+			for src, rtt in src_rtts.items():
+				if src in address_to_loc:
+					region.add_measurement(address_to_loc[src], rtt, sigma_ms=GLOBAL_SIGMA_MS)
+			if region.constraints:
+				estimated_locations[dst] = region.get_location()
+
+		elif mode in ('em_gaussian', 'em_asymmetric'):
+			noise = (ASYMMETRIC_NOISE if mode == 'em_asymmetric'
+			         else GAUSSIAN_NOISE)
+			region = FeasibleRegion(target_id=dst, mode=EM_GAUSSIAN,
+			                        noise_model=noise)
+			batch = [(address_to_loc[src], rtt)
+			         for src, rtt in src_rtts.items() if src in address_to_loc]
+			if batch:
+				region.add_measurements_batch(batch)
+				estimated_locations[dst] = region.get_location()
+
+		else:
+			raise ValueError(f"measurement_converter_mode {mode} not understood")
+
+	return estimated_locations
+
+
+def evaluate_geolocator(geolocator, target_data, converter_mode, budgets):
+	"""Run one geolocator over the budget grid; returns its plot_data.
+	Module-level and self-contained so the parallel path can run each
+	(independent) geolocator in its own process."""
+	address_to_loc = target_data.get('address_to_loc', {})
+	all_targets = set()
+	for dsts in target_data.get('loc_loc_meas', {}).values():
+		all_targets.update(dsts.keys())
+
+	geolocator.set_data(target_data)
+	geolocator.solve()
+
+	plot_data = {'budgets': [], 'errors': []}
+	for budget in budgets:
+		budgeted_measurements = geolocator.measurements(budget)
+		if hasattr(geolocator, 'get_current_estimates'):
+			estimated_locations = geolocator.get_current_estimates()
+		else:
+			estimated_locations = convert_measurements(
+				budgeted_measurements, target_data, converter_mode)
+
+		errors = []
+		for dst in all_targets:
+			if dst not in address_to_loc:
+				continue
+			if dst in estimated_locations:
+				errors.append(get_distance(estimated_locations[dst], address_to_loc[dst]))
+			else:
+				errors.append(10000.0)
+
+		if errors:
+			avg_error = np.mean(errors)
+			print(f"[{geolocator.name}] Budget: {budget:4d} | "
+			      f"Targets Estimated: {len(estimated_locations):4d}/{len(all_targets)} | "
+			      f"Avg Error: {avg_error:.2f} km", flush=True)
+			plot_data['budgets'].append(budget)
+			plot_data['errors'].append(avg_error)
+	return plot_data
+
+
+def _parallel_worker(geolocator, target_data, converter_mode, budgets, q):
+	try:
+		pd = evaluate_geolocator(geolocator, target_data, converter_mode, budgets)
+		q.put((geolocator.name, pd, None))
+	except Exception:
+		q.put((geolocator.name, None, traceback.format_exc()))
+	finally:
+		if hasattr(geolocator, 'cleanup'):
+			geolocator.cleanup()
+
 
 class Geolocator_Comparator:
 	def __init__(self):
@@ -68,81 +183,8 @@ class Geolocator_Comparator:
 		estimator (Iterative_Greedy via get_current_estimates) never enter
 		this function.
 		"""
-		estimated_locations = {}
-		address_to_loc = self.target_data.get('address_to_loc', {})
-
-		if self.measurement_converter_mode == 'additive_em':
-			# Cross-target fit: the additive model pools X_src across ALL
-			# targets, so it cannot live in the per-dst loop below.
-			return self._convert_additive_em(measurements)
-
-		# Invert measurements to be dst -> src -> min_rtt
-		dst_to_src_rtts = {}
-		for src, dsts in measurements.items():
-			for dst, rtts in dsts.items():
-				if not rtts: 
-					continue
-				min_rtt = min(rtts)
-				if dst not in dst_to_src_rtts:
-					dst_to_src_rtts[dst] = {}
-				dst_to_src_rtts[dst][src] = min_rtt
-
-		for dst, src_rtts in dst_to_src_rtts.items():
-			if self.measurement_converter_mode == 'nearest_neighbor':
-				closest_src = min(src_rtts, key=src_rtts.get)
-				if closest_src in address_to_loc:
-					estimated_locations[dst] = address_to_loc[closest_src]
-
-			elif self.measurement_converter_mode in ('hard_circle', 'great_circle_overlap_centroid'):
-				region = FeasibleRegion(target_id=dst, mode=HARD_CIRCLE)
-				for src, rtt in src_rtts.items():
-					if src in address_to_loc:
-						region.add_measurement(address_to_loc[src], max(0.0, rtt))
-				if region.constraints:
-					estimated_locations[dst] = region.get_location()
-
-			elif self.measurement_converter_mode == 'gaussian':
-				region = FeasibleRegion(target_id=dst, mode=GAUSSIAN)
-				for src, rtt in src_rtts.items():
-					if src in address_to_loc:
-						region.add_measurement(address_to_loc[src], rtt, sigma_ms=GLOBAL_SIGMA_MS)
-				if region.constraints:
-					estimated_locations[dst] = region.get_location()
-
-			elif self.measurement_converter_mode in ('em_gaussian', 'em_asymmetric'):
-				# Per-target online EM (μ_t, σ_t); asymmetric variant uses the
-				# one-sided noise model that matches real RTT overhead.
-				noise = (ASYMMETRIC_NOISE
-				         if self.measurement_converter_mode == 'em_asymmetric'
-				         else GAUSSIAN_NOISE)
-				region = FeasibleRegion(target_id=dst, mode=EM_GAUSSIAN,
-				                        noise_model=noise)
-				batch = [(address_to_loc[src], rtt)
-				         for src, rtt in src_rtts.items() if src in address_to_loc]
-				if batch:
-					region.add_measurements_batch(batch)
-					estimated_locations[dst] = region.get_location()
-
-			else:
-				raise ValueError(f"measurement_converter_mode {self.measurement_converter_mode} not understood")
-
-		return estimated_locations
-
-	def _convert_additive_em(self, measurements):
-		"""
-		Estimation under the additive two-way model rtt = d/100 + X_src +
-		X_dst via `probabilistic_helpers.additive_batch_em` — a fresh
-		params-first, NN-anchored alternation per call (no state across
-		budget points; the paid-for pitfalls live in the helper).
-		"""
-		address_to_loc = self.target_data.get('address_to_loc', {})
-		pairs = {}
-		for src, dsts in measurements.items():
-			for dst, rtts in dsts.items():
-				if rtts:
-					pairs[(src, dst)] = [float(r) for r in rtts]
-		estimates, _, _, _, _ = additive_batch_em(pairs, address_to_loc)
-		return estimates
+		return convert_measurements(measurements, self.target_data,
+		                            self.measurement_converter_mode)
 
 	def get_random_subsample(self, n=100):
 		## Gets a random sample of all the measurement data, for testing
@@ -164,7 +206,8 @@ class Geolocator_Comparator:
 	def do_cache(self, geolocator):
 		return {'smart_perfect': True, 'random': True}.get(geolocator.name, False)
 
-	def run(self, min_budget=100, max_budget=2500, step=100, n_subsample=100):
+	def run(self, min_budget=100, max_budget=2500, step=100, n_subsample=100,
+	        parallel=False):
 		## Two-phase comparison, analogous to a train/test split:
 		##   (a) selection  - geolocator.measurements(budget) decides which pings
 		##       to spend, under realistic information limits (no ground truth;
@@ -180,67 +223,57 @@ class Geolocator_Comparator:
 		self.load_target_measurement_data()
 
 		self.get_random_subsample(n=n_subsample)
-		
-		address_to_loc = self.target_data.get('address_to_loc', {})
-		all_targets = set()
-		for dsts in self.target_data.get('loc_loc_meas', {}).values():
-			all_targets.update(dsts.keys())
-		
-		# Dictionary to hold the plotting data
+
+		budgets = list(range(min_budget, max_budget + 1, step))
 		self.plot_data = {}
 
-		for geolocator in self.geolocators:
-			print(f"\n--- Running {geolocator.name} ---")
-			
+		def cache_fn(geolocator):
 			# n_subsample is part of the cache key: results from different
 			# subsample sizes are not interchangeable.
-			cache_fn = os.path.join(CACHE_DIR, f"cached_results_{geolocator.name}_{self.measurement_converter_mode}_n{n_subsample}.pkl")
-			
-			if os.path.exists(cache_fn) and self.do_cache(geolocator):
-				self.plot_data[geolocator.name] = pickle.load(open(cache_fn, 'rb'))
-				continue
-			
-			geolocator.set_data(self.target_data)
-			geolocator.solve()
-			
-			self.plot_data[geolocator.name] = {'budgets': [], 'errors': []}
-			
-			for budget in range(min_budget, max_budget + 1, step):
-				budgeted_measurements = geolocator.measurements(budget)
-				
-				# A geolocator with get_current_estimates() brings its own
-				# estimation method (the greedy's live FeasibleRegion overlap
-				# estimates); everything else is paired with the converter-mode
-				# estimator (nearest_neighbor for the baselines).
-				if hasattr(geolocator, 'get_current_estimates'):
-					estimated_locations = geolocator.get_current_estimates()
-				else:
-					estimated_locations = self.convert_measurements_to_locations(budgeted_measurements)
+			return os.path.join(CACHE_DIR, f"cached_results_{geolocator.name}_{self.measurement_converter_mode}_n{n_subsample}.pkl")
 
-				errors = []
-				for dst in all_targets:
-					if dst not in address_to_loc:
-						continue 
-						
-					actual_location = address_to_loc[dst]
-					
-					if dst in estimated_locations:
-						error_km = get_distance(estimated_locations[dst], actual_location)
-						errors.append(error_km)
-					else:
-						# Penalty for missing targets
-						errors.append(10000.0) 
-				
-				if errors:
-					avg_error = np.mean(errors)
-					targets_found = len(estimated_locations)
-					print(f"Budget: {budget:4d} | Targets Estimated: {targets_found:4d}/{len(all_targets)} | Avg Error: {avg_error:.2f} km")
-					
-					# Store the results
-					self.plot_data[geolocator.name]['budgets'].append(budget)
-					self.plot_data[geolocator.name]['errors'].append(avg_error)
-			if self.do_cache(geolocator):
-				pickle.dump(self.plot_data[geolocator.name], open(cache_fn, 'wb'))
+		to_run = []
+		for geolocator in self.geolocators:
+			if os.path.exists(cache_fn(geolocator)) and self.do_cache(geolocator):
+				self.plot_data[geolocator.name] = pickle.load(open(cache_fn(geolocator), 'rb'))
+			else:
+				to_run.append(geolocator)
+
+		if parallel:
+			# Geolocators are independent objects — one child process each.
+			# Plain (non-daemonic) Processes, not a Pool: the greedys spawn
+			# their own inner worker pools, which daemonic pool workers are
+			# not allowed to do. Watch CPU oversubscription: each greedy's
+			# inner pool defaults to cpu_count workers — pass max_workers
+			# to the greedy constructors when running many in parallel.
+			q = multiprocessing.get_context('spawn').Queue()
+			procs = []
+			for geolocator in to_run:
+				print(f"\n--- Launching {geolocator.name} (parallel) ---")
+				p = multiprocessing.get_context('spawn').Process(
+					target=_parallel_worker,
+					args=(geolocator, self.target_data,
+					      self.measurement_converter_mode, budgets, q))
+				p.start()
+				procs.append(p)
+			for _ in procs:
+				name, pd, err = q.get()
+				if err is not None:
+					raise RuntimeError(f"{name} failed in parallel run:\n{err}")
+				self.plot_data[name] = pd
+			for p in procs:
+				p.join()
+		else:
+			for geolocator in to_run:
+				print(f"\n--- Running {geolocator.name} ---")
+				self.plot_data[geolocator.name] = evaluate_geolocator(
+					geolocator, self.target_data,
+					self.measurement_converter_mode, budgets)
+
+		for geolocator in to_run:
+			if self.do_cache(geolocator) and geolocator.name in self.plot_data:
+				pickle.dump(self.plot_data[geolocator.name],
+				            open(cache_fn(geolocator), 'wb'))
 
 		# Call the plotting function after all geolocators have run (or loaded)
 		plot_error_over_budget(self.plot_data, os.path.join(FIG_DIR, "geolocator_results.pdf"))
