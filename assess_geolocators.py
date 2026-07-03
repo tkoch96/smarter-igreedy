@@ -5,7 +5,7 @@ from perfect_geolocator import Perfect_Geolocator
 from pull_ripe_atlas_measurement_data import RipeAtlasPipeline
 from random_geolocator import Random_Geolocator
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
-from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN, EM_GAUSSIAN
+from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN, EM_GAUSSIAN, ADDITIVE
 from probabilistic_helpers import (
 	GLOBAL_SIGMA_MS, GAUSSIAN_NOISE, ASYMMETRIC_NOISE, additive_batch_em,
 )
@@ -24,6 +24,12 @@ class Geolocator_Comparator:
 			                            name='greedy_gaussian_1.05'),
 			Iterative_Greedy_Geolocator(region_mode=EM_GAUSSIAN,
 			                            name='greedy_em'),
+			# Shared-src/dst additive model; per-ping refits are O(pairs),
+			# so throttle at real-mesh scale (selection reads slightly stale
+			# params between refits; estimates come from the batch polish).
+			Iterative_Greedy_Geolocator(region_mode=ADDITIVE,
+			                            model_refit_every=25,
+			                            name='greedy_additive'),
 			Perfect_Geolocator(),
 			Random_Geolocator(),
 		]
