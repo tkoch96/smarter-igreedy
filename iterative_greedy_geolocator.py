@@ -349,6 +349,8 @@ class Iterative_Greedy_Geolocator:
 			actual_rtts: list[float] = loc_loc_meas[best_global_src][best_global_dst]
 
 			min_actual_rtt = min(actual_rtts)
+			est_before = (self.target_regions[best_global_dst].get_location()
+			              if self.target_regions[best_global_dst].constraints else None)
 			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
 			# Additive mode defers the location step: the parameter refit
@@ -388,7 +390,7 @@ class Iterative_Greedy_Geolocator:
 
 			self.current_region_sizes[best_global_dst] = new_actual_size
 
-			self.utility_tracking.append({
+			row = {
 				'ping_num': len(self.measurement_history) + 1,
 				'target': best_global_dst,
 				'src': best_global_src,
@@ -397,7 +399,37 @@ class Iterative_Greedy_Geolocator:
 				'error': expected_utility - actual_utility,
 				'predicted_rtt': predicted_rtt_used,
 				'actual_rtt': min_actual_rtt,
-			})
+			}
+			if self.latency_model is not None:
+				# The additive greedy's full belief state at selection time,
+				# for post-hoc debugging (a driver with ground truth joins
+				# these rows to see where beliefs went wrong; truth itself
+				# never enters here).
+				model = self.latency_model
+				dist_before = (get_distance(self.vp_locations[best_global_src], est_before)
+				               if est_before is not None else 0.0)
+				model_pred_rtt, model_pred_var = model.predict(
+					best_global_src, best_global_dst, dist_before)
+				var_t = model.var_t.get(best_global_dst, ADDITIVE_PRIOR_VAR_MS2)
+				row.update({
+					'est_before': est_before,
+					'est_after': self.target_regions[best_global_dst].get_location(),
+					'size_before': size_before,
+					'size_after': new_actual_size,
+					'sigma_dst': model.sigma_dst(best_global_dst),
+					'trust': ADDITIVE_PRIOR_VAR_MS2 / (ADDITIVE_PRIOR_VAR_MS2 + var_t),
+					'mean_offset': model.mean_offset(best_global_src, best_global_dst),
+					'model_pred_rtt': model_pred_rtt,
+					'model_residual': min_actual_rtt - model_pred_rtt,
+				})
+				if os.environ.get('ADDITIVE_GREEDY_DEBUG'):
+					print(f"[add-dbg] #{row['ping_num']:4d} {best_global_dst} <- {best_global_src}  "
+					      f"exp_util={expected_utility:9.1f} act_util={actual_utility:9.1f}  "
+					      f"size {size_before:7.0f}->{new_actual_size:7.0f}km  "
+					      f"sig_t={row['sigma_dst']:6.2f} trust={row['trust']:.2f}  "
+					      f"pred={model_pred_rtt:7.2f}ms act={min_actual_rtt:7.2f}ms "
+					      f"resid={row['model_residual']:+8.2f}ms", flush=True)
+			self.utility_tracking.append(row)
 
 			self._update_best_vp_for_target(best_global_dst)
 			self.measurement_history.append((best_global_src, best_global_dst))
