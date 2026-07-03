@@ -416,10 +416,12 @@ tests/test_e2e_additive_em.py         additive two-way model rtt = SOL + X_src +
                                       model-based estimator (917 vs 1647 mean batch;
                                       722 vs 1655/1686 in the sweep) though NN keeps
                                       the full-coverage lead in this small synthetic
-                                      (614) — the real n=20 mesh flips that. Greedy
-                                      sweep: selection dominates early (1968 vs 3627+
-                                      at b=10), matches additive_em at full coverage,
-                                      patho ping share ≤ 0.375 (fair 0.25)
+                                      (646 mean) — the real n=20 mesh flips that.
+                                      Greedy sweep: selection dominates early (1932 vs
+                                      3475+ at b=10), matches additive_em at full
+                                      coverage, patho ping share ≤ 0.375 (fair 0.25).
+                                      Oracle = Perfect_Geolocator selection + true
+                                      (μ, σ), pinned to dominate at every budget
 tests/plot_error_additive.py          error-vs-budget curves under the additive world
                                       (writes tests/error_over_measurements_additive.pdf)
 tests/test_e2e_adaptive_em.py         online-EM e2e (single-target estimator comparison

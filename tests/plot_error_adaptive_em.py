@@ -10,7 +10,7 @@ geolocation error. Strategies are whole systems — selection + estimation:
     greedy_hard      Iterative_Greedy_Geolocator, hard_circle regions
     greedy_gaussian  Iterative_Greedy_Geolocator, gaussian regions
     greedy_em        Iterative_Greedy_Geolocator, em_gaussian regions
-    oracle           closest-VP-first per target + true (μ_t, σ_t)  (cheat)
+    oracle           Perfect_Geolocator selection + true (μ_t, σ_t)  (cheat)
 
 Median stop-markers (▼) show where the greedy variants declare every target
 geolocated and stop spending budget — the curves are flat after that point.
@@ -50,7 +50,7 @@ LABELS = {
     'greedy_gaussian_105': 'greedy, gaussian slope=1.05',
     'greedy_em':           'greedy, em_gaussian regions',
     'greedy_additive':     'greedy, additive regions (shared src/dst model)',
-    'oracle':              'oracle (true locations & μ, σ)',
+    'oracle':              'oracle (Perfect_Geolocator selection + true μ, σ)',
 }
 STYLES = {
     'random_nn':           dict(color='grey',       linestyle=':'),

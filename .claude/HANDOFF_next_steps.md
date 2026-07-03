@@ -36,15 +36,24 @@ X_src/X_dst model per-node path inefficiency that repetition cannot
 average away. (An earlier 3-replicate version let estimators exploit
 noise structure that doesn't exist in practice; removed 2026-07-03.)
 
-Synthetic additive world (10 seeds, budgets in pairs, max 80):
-greedy_additive 1968 → 1064 → 722 km over b = 10/40/80 vs random-order
-additive_em 4455 → 1110 → 722 and random+NN 3627 → 736 → 614. Selection
-dominates early (greedy at b=10 ≈ NN at b=30-40); at full coverage greedy
-= additive_em exactly (same estimator, same data). NN keeps the
-full-coverage lead in this small synthetic (only ~8-10 pairs of pooling
-per node) — the real n=20 mesh flips that. Budget sink FIXED:
-pathological ping share median 0.29 / max 0.375 (fair 0.25) vs
-em-greedy's 0.33-0.50 on identical scenarios.
+Synthetic additive world (10 seeds, budgets in pairs, max 80; all stats
+MEANS across seeds): greedy_additive 1932 → 1129 → 706 km over
+b = 10/40/80 vs random-order additive_em 4281 → 1172 → 706 and random+NN
+3475 → 752 → 646. Selection dominates early (greedy at b=10 ≈ NN at
+b=30-40); at full coverage greedy = additive_em exactly (same estimator,
+same data). NN keeps the full-coverage lead in this small synthetic
+(only ~8-10 pairs of pooling per node) — the real n=20 mesh flips that.
+Budget sink FIXED: pathological ping share median 0.29 / max 0.375
+(fair 0.25) vs em-greedy's 0.33-0.50 on identical scenarios.
+
+Oracle convention (both test files AND assess_geolocators): selection by
+`Perfect_Geolocator` — the single selection-oracle implementation, fed
+ground truth via its address_to_loc — paired in the tests with true-(μ,σ)
+MAP estimation. Pinned to dominate every strategy at every budget
+(sweep oracle 676 → 390 → 374): if an honest strategy beat it, the
+oracle should have picked what that strategy picked. The batch
+`run_param_oracle` in test_e2e_additive_em.py is NOT a selection oracle
+— it is the parameter-estimation bound on full data.
 
 Real mesh (seed 31415; `cache/additive_real_results_n{20,100}.pkl`):
 - n=20 full coverage: additive mean 1927 / median 575 — FIRST model-based

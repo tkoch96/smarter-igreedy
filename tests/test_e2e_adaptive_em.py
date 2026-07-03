@@ -39,8 +39,8 @@ Multi-target budget allocation (second half of this file)
 run_multi_seed / TestMultiTargetBudgetAllocation measure the actual project
 objective: N_TARGETS targets share one TOTAL ping budget, minimise AVERAGE
 error. Strategies are whole systems (selection + estimation): random+NN,
-Iterative_Greedy_Geolocator with hard/gaussian/em regions, and a
-closest-VP-first + true-(μ,σ) oracle. BASICALLY_GEOLOCATED deprioritises
+Iterative_Greedy_Geolocator with hard/gaussian/em/additive regions, and a
+Perfect_Geolocator-selection + true-(μ,σ) oracle. BASICALLY_GEOLOCATED deprioritises
 "done" targets instead of hard-stopping, so leftover budget refines the
 least-certain ones. Per-target μ_t ~ U(1.0, 2.0) — wide enough that the
 fixed 1.3 slope is genuinely wrong for many targets. Findings: greedy wins
@@ -365,6 +365,7 @@ class TestNoiseModelsUnderContamination:
 # solely for scoring (and by the labelled oracle).
 
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
+from perfect_geolocator import Perfect_Geolocator
 from feasible_region_maintainer import HARD_CIRCLE, ADDITIVE
 
 N_TARGETS = 5
@@ -468,15 +469,16 @@ def _run_greedy(sc: dict, region_mode: str, snapshot_ks=(),
 
 
 def _run_oracle(sc: dict, snapshot_ks=()) -> tuple[list[float], dict]:
-    """Selection cheat: closest-VP-first per target (true distances),
-    round-robin across targets. Estimation cheat: true (μ_t, σ_t)."""
-    ranked = {
-        tid: sorted(VP_NAMES,
-                    key=lambda v: get_distance(sc['vp_locs'][v], t['loc']))
-        for tid, t in sc['targets'].items()
-    }
-    order = [(ranked[tid][r], tid)
-             for r in range(len(VP_NAMES)) for tid in sc['targets']]
+    """Whole-system cheat: Perfect_Geolocator selection (error-guided
+    greedy on ground truth — THE selection-oracle implementation, shared
+    with assess_geolocators) + gaussian MAP estimation with the true
+    (μ_t, σ_t)."""
+    cheat_locs = dict(sc['vp_locs'])
+    cheat_locs.update({tid: t['loc'] for tid, t in sc['targets'].items()})
+    pg = Perfect_Geolocator()
+    pg.set_data({'address_to_loc': cheat_locs,
+                 'loc_loc_meas': sc['data']['loc_loc_meas']})
+    order = pg.measurement_order
 
     regions = {tid: FeasibleRegion(tid, mode=GAUSSIAN, slope=t['mu'])
                for tid, t in sc['targets'].items()}
@@ -537,8 +539,8 @@ class TestMultiTargetBudgetAllocation:
     medians (deterministic seeds), with BASICALLY_GEOLOCATED acting as a
     deprioritisation rather than a hard stop:
 
-        k=10: random=1214  g_hard=1025  g_gauss=1022  g_em=1042  g_add= 821  oracle=358
-        k=25: random= 699  g_hard= 772  g_gauss= 657  g_em= 561  g_add= 508  oracle=236
+        k=10: random=1214  g_hard=1025  g_gauss=1022  g_em=1042  g_add= 821  oracle=325
+        k=25: random= 699  g_hard= 772  g_gauss= 657  g_em= 561  g_add= 508  oracle=211
         k=50: random= 462  g_hard= 392  g_gauss= 521  g_em= 222  g_add= 266  oracle=148
 
     greedy_additive (shared src/dst model) plays an AWAY game here — the

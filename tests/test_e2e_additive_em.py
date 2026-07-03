@@ -48,6 +48,7 @@ from feasible_region_maintainer import (
     FeasibleRegion, GAUSSIAN, EM_GAUSSIAN, ADDITIVE, _normalize_latlon,
 )
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
+from perfect_geolocator import Perfect_Geolocator
 from probabilistic_helpers import KM_PER_MS, fit_additive_params
 from utils import get_distance, LatLon
 
@@ -180,8 +181,11 @@ def run_additive_em(scenario: dict) -> dict:
             'mu_t': mu_t, 'var_t': var_t}
 
 
-def run_oracle(scenario: dict) -> dict:
-    """Location MAP with the TRUE per-node parameters (explicit cheat)."""
+def run_param_oracle(scenario: dict) -> dict:
+    """PARAMETER-oracle estimation bound: location MAP with the TRUE
+    per-node (μ, σ) on the FULL data (explicit cheat). No selection is
+    involved here — every estimator in this batch comparison sees every
+    pair. The selection oracle everywhere else is Perfect_Geolocator."""
     estimates = {}
     for t, tp in scenario['targets'].items():
         rows = []
@@ -222,7 +226,7 @@ def run_additive_seed(seed: int) -> dict:
             'const_gaussian': errs(run_baseline(sc, GAUSSIAN)['estimates']),
             'per_target_em':  errs(run_baseline(sc, EM_GAUSSIAN)['estimates']),
             'additive_em':    errs(additive['estimates']),
-            'oracle':         errs(run_oracle(sc)['estimates']),
+            'oracle':         errs(run_param_oracle(sc)['estimates']),
         },
     }
     return out
@@ -290,8 +294,9 @@ class TestAdditiveModel:
 #
 # Same random measurement ORDER for every strategy (pings = (src, dst)
 # pairs, one sample each); strategies differ only in estimation. The
-# oracle is an ESTIMATION oracle only — true per-node (μ, σ), same random
-# order — so greedy selection legitimately beats it in the early regime.
+# oracle cheats on BOTH halves: Perfect_Geolocator selection (error-guided
+# greedy on ground truth) + MAP with the true per-node (μ, σ) — a
+# whole-system upper bound that no honest strategy should beat.
 # All stats are means across seeds of the per-seed avg-over-targets error
 # (matching the figure and assess_geolocators.run()).
 #
@@ -347,11 +352,30 @@ def run_greedy_additive_seed(sc: dict) -> tuple[list[float], dict]:
     return errs, patho_share
 
 
+def oracle_measurement_order(sc: dict) -> list[tuple[str, str]]:
+    """Selection order from Perfect_Geolocator — THE selection-oracle
+    implementation (the same one assess_geolocators runs; no parallel
+    reimplementations). Its licensed cheat is ground truth in
+    address_to_loc, which guides its error-driven greedy choices. An
+    oracle must cheat on BOTH halves — selection and estimation — or it
+    is not an upper bound and honest strategies can legitimately beat it."""
+    cheat_locs = dict(VP_LOCS)
+    cheat_locs.update({t: tp['loc'] for t, tp in sc['targets'].items()})
+    loc_loc_meas: dict[str, dict[str, list[float]]] = {}
+    for (s, t), rs in sc['rtts'].items():
+        loc_loc_meas.setdefault(s, {})[t] = list(rs)
+    pg = Perfect_Geolocator()
+    pg.set_data({'address_to_loc': cheat_locs, 'loc_loc_meas': loc_loc_meas})
+    return pg.measurement_order
+
+
 def run_additive_budget_seed(seed: int) -> dict:
     sc = make_additive_scenario(seed)
     rng = np.random.default_rng(seed + 4_000_000)
     pings = [(s, t) for s in sc['sources'] for t in sc['targets']]
     rng.shuffle(pings)
+
+    oracle_order = oracle_measurement_order(sc)
 
     seen: dict[tuple, list[float]] = {}
     curves = {name: [] for name in SWEEP_STRATEGIES}
@@ -413,16 +437,19 @@ def run_additive_budget_seed(seed: int) -> dict:
                 add_est[t2] = _map_location(rows, [add_est[t2], nn_est[t2]])
         curves['additive_em'].append(avg_err(add_est))
 
-        # oracle (true per-node params)
+        # oracle: true per-node params on its own (cheating) selection order
+        orc_by_t: dict[str, list[str]] = {}
+        for s2, t2 in oracle_order[:b]:
+            orc_by_t.setdefault(t2, []).append(s2)
         orc = {}
-        for t2 in measured:
+        for t2, srcs in orc_by_t.items():
             tp = sc['targets'][t2]
             rows = [(VP_LOCS[s2], r,
                      sc['sources'][s2]['mu'] + tp['mu'],
                      sc['sources'][s2]['sigma'] ** 2 + tp['sigma'] ** 2)
-                    for (s2, tt), v in seen.items() if tt == t2
-                    for r in v]
-            orc[t2] = _map_location(rows, [nn_est[t2], (48.0, 10.0)])
+                    for s2 in srcs for r in sc['rtts'][(s2, t2)]]
+            nn0 = VP_LOCS[min(srcs, key=lambda s2: min(sc['rtts'][(s2, t2)]))]
+            orc[t2] = _map_location(rows, [nn0, (48.0, 10.0)])
         curves['oracle'].append(avg_err(orc))
 
     curves['greedy_additive'], patho_share = run_greedy_additive_seed(sc)
@@ -470,25 +497,32 @@ class TestAdditiveBudgetSweep:
     # -- greedy_additive: selection + estimation as one system --------------
     # Calibrated means (10 seeds): greedy 1932 → 1129 → 706 over
     # b = 10/40/80 vs random-order additive_em's 4281 → 1172 → 706 and
-    # random_nn's 3475 → 752 → 646. Selection dominates the early regime
-    # (greedy at b=10 even beats the estimation-oracle's 3480 — perfect
-    # parameters can't fix randomly placed pings); at full coverage the
+    # random_nn's 3475 → 752 → 646; oracle 676 → 390 → 374 bounds all of
+    # it. Selection dominates the early regime; at full coverage the
     # greedy's batch polish IS the additive_em estimator on identical
     # data, hence the exactly matching 706.
 
     def test_greedy_selection_beats_random_order_early(self, sweep_results):
         """The point of selection: at b=10 the greedy places its pings
-        better than the shared random order feeds ANY estimator (1932 vs
-        additive_em's 4281 and random+NN's 3475 — even the estimation
-        oracle at 3480)."""
+        better than the shared random order feeds ANY honest estimator
+        (1932 vs additive_em's 4281 and random+NN's 3475)."""
         assert _sweep_mean(sweep_results, 'greedy_additive', 10) < \
             0.6 * _sweep_mean(sweep_results, 'additive_em', 10)
         assert _sweep_mean(sweep_results, 'greedy_additive', 10) < \
             0.6 * _sweep_mean(sweep_results, 'random_nn', 10)
-        # Selection beats even perfect parameters on a random order: the
-        # sweep's oracle cheats on ESTIMATION only, not on ping placement.
-        assert _sweep_mean(sweep_results, 'greedy_additive', 10) < \
-            _sweep_mean(sweep_results, 'oracle', 10)
+
+    def test_oracle_dominates_every_strategy_at_every_budget(self, sweep_results):
+        """An oracle that cheats on both selection and estimation must be
+        an upper bound everywhere — if an honest strategy beat it, the
+        oracle should have picked whatever that strategy picked. (2%
+        slack: MAP location is multi-start Nelder-Mead, not exact.)"""
+        for b in BUDGET_GRID:
+            orc = _sweep_mean(sweep_results, 'oracle', b)
+            for s in SWEEP_STRATEGIES:
+                if s == 'oracle':
+                    continue
+                assert orc <= 1.02 * _sweep_mean(sweep_results, s, b), \
+                    f"oracle {orc:.0f} beaten by {s} at b={b}"
 
     def test_greedy_matches_additive_em_at_full_budget(self, sweep_results):
         """At full coverage both have seen every pair, and the greedy's

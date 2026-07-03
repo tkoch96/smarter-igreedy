@@ -14,9 +14,9 @@ greedy_additive, which selects its own pings:
                      class that can represent this world
     greedy_additive  Iterative_Greedy_Geolocator + shared AdditiveLatencyModel,
                      σ̂_dst-discounted utility (selection + estimation system)
-    oracle           true per-node parameters (ESTIMATION-only cheat: it
-                     still consumes the shared random order, so the greedy
-                     legitimately beats it in the early regime)
+    oracle           whole-system cheat: Perfect_Geolocator selection
+                     (error-guided greedy on ground truth) + true per-node
+                     parameters — an upper bound at every budget
 
 Plots the MEAN across seeds of the per-seed avg-over-targets error — the
 same statistic assess_geolocators.run() reports.
@@ -48,7 +48,7 @@ LABELS = {
     'per_target_em':  'per-target em (multiplicative μ_t, σ_t)',
     'additive_em':    'additive em (per-source AND per-dest μ, σ)',
     'greedy_additive': 'GREEDY selection + additive em (σ̂_dst in utility)',
-    'oracle':         'oracle params (true μ, σ — random order, no selection)',
+    'oracle':         'oracle (Perfect_Geolocator selection + true μ, σ)',
 }
 STYLES = {
     'random_nn':      dict(color='grey',       linestyle=':'),
