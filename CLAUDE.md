@@ -206,12 +206,17 @@ subsample sizes are not interchangeable (a stale-cache bug once mixed
 20-probe baselines into a 100-probe figure).
 
 Real-mesh findings at n=100 (means; medians are far kinder — isolated
-targets dominate means): greedy_em ~2,850 km from 2 pings/target onward
-(best model-based, ~3× less budget than random for equal error);
-fixed-slope greedys DIVERGE (4,171→4,731 and 4,324→5,211); random+NN
-grinds to 1,620 at budget 2,000; per-target-em's full-coverage floor is
-2,601 — the estimator ceiling, which the additive src/dst model is meant
-to break (see handoff).
+targets dominate means, and run() does not report medians yet):
+greedy_em drops to ~2,650 by b=300 and plateaus ~2,800; greedy_additive
+(2026-07-03 run) starts best of all honest strategies (3,942 at b=100 vs
+random+NN's 7,185), dips to 2,731 at b=600 and plateaus ~2,750-2,990 —
+PARITY with greedy_em on means, the plateau is not broken. Suspected
+causes: the gaussian additive M-step feels real one-sided detours (same
+reason em_asymmetric wins means in the estimator-only comparison), and
+means bury the additive model's median advantage. Fixed-slope greedys
+DIVERGE (4,161→4,778 and 4,426→5,433); random+NN grinds to 1,620 at
+b=2,000 and wins means from ~b=900 on; smart_perfect (scored through the
+NN converter) sits at ~615.
 
 `get_random_subsample(n=100)` **mutates `target_data` in place** — subsequent
 re-runs operate on already-pruned data.

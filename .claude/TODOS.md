@@ -8,18 +8,21 @@ maintain a "done" list here.
 
 ## ⏭️ Immediate (see `.claude/HANDOFF_next_steps.md` for full context)
 
-### 0. Real-mesh run of greedy_additive
+### 0. Break the real-mesh greedy plateau
 
-The additive model is now integrated into the greedy (shared
-`AdditiveLatencyModel`, σ̂_dst-discounted utility — fixes the budget sink
-on synthetic data) and the additive_em ESTIMATOR is validated on the real
-mesh (best model-based median at n=20 and n=100; beats NN outright at
-n=20). The missing piece is the whole-SYSTEM real-mesh comparison: add an
-`Iterative_Greedy_Geolocator(region_mode=ADDITIVE)` variant to
-`Geolocator_Comparator.self.geolocators` and rerun
-`assess_geolocators.run()` at n=100 against greedy_em / random+NN.
-Watch: per-ping model refits are O(pairs) each — bump `model_refit_every`
-(constructor param) to ~10-25 at real-mesh scale.
+The whole-system n=100 run (2026-07-03, seed 31415) is DONE:
+greedy_additive is the best honest strategy at b=100 (3,942 vs random's
+7,185) and reaches 2,731 by b=600, but then plateaus ~2,800-2,990 —
+PARITY with greedy_em on means, not the hoped-for break. Two suspects,
+in test order:
+
+1. Robust additive M-step (see #1 below) — real detours are one-sided
+   and the gaussian fit chases them; em_asymmetric beats additive on
+   MEANS in the estimator-only comparison for exactly this reason.
+2. Median reporting in `Geolocator_Comparator.run()` — means are
+   dominated by isolated targets (Guam-class); the additive model's
+   demonstrated advantage is in the median, which run() never prints.
+   Store per-target errors in plot_data and report both.
 
 ---
 

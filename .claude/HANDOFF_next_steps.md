@@ -86,12 +86,11 @@ Real mesh (seed 31415; `cache/additive_real_results_n{20,100}.pkl`):
 
 ## Next steps (ordered; TODOS.md #0/#1)
 
-1. **Real-mesh greedy_additive** — whole-system comparison: add
-   `Iterative_Greedy_Geolocator(region_mode=ADDITIVE, name='greedy_additive')`
-   to `Geolocator_Comparator.self.geolocators`, rerun `run()` at n=100 vs
-   greedy_em / random+NN. Bump `model_refit_every` to ~10-25 (per-ping
-   refits are O(pairs)). The n=100 greedy_em runs took hours on the laptop
-   — budget accordingly or trim the geolocator list.
+1. **DONE 2026-07-03 — real-mesh greedy_additive** (n=100, seed 31415,
+   ~2.5 h laptop run, `model_refit_every=25`): best honest start (3,942
+   at b=100), 2,731 at b=600, then plateaus 2,750-2,990 — mean-parity
+   with greedy_em, plateau NOT broken. See TODOS #0 for the two suspects
+   (robust M-step; median reporting in run()).
 2. **Robustify the additive parameter step** (median/trimmed means): real
    residuals are one-sided heavy-tailed; the gaussian M-step feels detours
    — that's why em_asymmetric still wins the n=100 MEAN. Mirror the robust
