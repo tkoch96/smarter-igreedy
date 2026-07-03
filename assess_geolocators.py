@@ -7,14 +7,8 @@ from random_geolocator import Random_Geolocator
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
 from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN, EM_GAUSSIAN
 from probabilistic_helpers import (
-	GLOBAL_SIGMA_MS, KM_PER_MS, GAUSSIAN_NOISE, ASYMMETRIC_NOISE,
-	fit_additive_params, additive_map_location,
+	GLOBAL_SIGMA_MS, GAUSSIAN_NOISE, ASYMMETRIC_NOISE, additive_batch_em,
 )
-
-# Outer parameter/location alternations for the 'additive_em' converter.
-# Each converter call is a FRESH fit (no state across budget points — early
-# fixed points must not be carried forward).
-ADDITIVE_CONVERTER_ITERS = 4
 
 from plot_results import *
 
@@ -127,52 +121,17 @@ class Geolocator_Comparator:
 	def _convert_additive_em(self, measurements):
 		"""
 		Estimation under the additive two-way model rtt = d/100 + X_src +
-		X_dst, ported from tests/test_e2e_additive_em.py::run_additive_em.
-		Uses ALL rtt samples of every measured pair (replication sharpens
-		the variance decomposition; the cached real mesh has one sample).
-
-		The two paid-for pitfalls are baked in: (1) the PARAMETER step runs
-		before the location step each iteration, so a pathological
-		destination's offset lands in μ̂_t instead of being absorbed into
-		distance; (2) every call is a fresh NN-anchored fit and the location
-		MAP multi-starts from [previous, NN] — no state is carried between
-		budget points.
+		X_dst via `probabilistic_helpers.additive_batch_em` — a fresh
+		params-first, NN-anchored alternation per call (no state across
+		budget points; the paid-for pitfalls live in the helper).
 		"""
 		address_to_loc = self.target_data.get('address_to_loc', {})
-
 		pairs = {}
 		for src, dsts in measurements.items():
-			if src not in address_to_loc:
-				continue
 			for dst, rtts in dsts.items():
 				if rtts:
 					pairs[(src, dst)] = [float(r) for r in rtts]
-		if not pairs:
-			return {}
-
-		best_vp = {}
-		for (src, dst), rtts in pairs.items():
-			r = min(rtts)
-			if dst not in best_vp or r < best_vp[dst][0]:
-				best_vp[dst] = (r, src)
-		nn_est = {dst: address_to_loc[src] for dst, (_, src) in best_vp.items()}
-		estimates = dict(nn_est)
-
-		for _ in range(ADDITIVE_CONVERTER_ITERS):
-			residuals = {
-				(s, t): [r - get_distance(address_to_loc[s], estimates[t]) / KM_PER_MS
-				         for r in rs]
-				for (s, t), rs in pairs.items()
-			}
-			mu_s, var_s, mu_t, var_t = fit_additive_params(residuals)
-			for dst in estimates:
-				rows = [(address_to_loc[s], r, mu_s[s] + mu_t[dst],
-				         var_s[s] + var_t[dst])
-				        for (s, t), rs in pairs.items() if t == dst
-				        for r in rs]
-				estimates[dst] = additive_map_location(
-					rows, [estimates[dst], nn_est[dst]])
-
+		estimates, _, _, _, _ = additive_batch_em(pairs, address_to_loc)
 		return estimates
 
 	def get_random_subsample(self, n=100):

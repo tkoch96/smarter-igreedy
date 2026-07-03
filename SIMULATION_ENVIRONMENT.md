@@ -240,10 +240,14 @@ vs em-greedy's 0.33-0.50, fair share 0.25) — the real-mesh greedy rerun is
 the open item. Two subtleties worth knowing: (a) without the trust
 discount the fix inverts — a high-σ̂ target's statistical floor promises
 LARGE absolute km reductions, so the greedy chases exactly the targets it
-should abandon; (b) the greedy's regions must constrain on min-of-reps
-while the shared model records all reps — per-rep constraints let the
-location step zero out the residuals the parameter fit needs, and μ̂_t
-collapses into the wrong fixed point.
+should abandon; (b) incremental location updates RATCHET: each per-ping
+MAP step under not-yet-converged offsets absorbs a little of a
+pathological target's offset into distance, and later parameter refits
+cannot win it back. The greedy therefore defers the pinged region's
+location update until after the refit (params-first per ping) and hands
+out estimates only after a fresh NN-anchored batch alternation
+(`additive_batch_em`) — its incremental state is trusted for selection,
+never for the final answer.
 
 ---
 

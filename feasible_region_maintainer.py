@@ -169,14 +169,20 @@ class FeasibleRegion:
         min_rtt: float,
         sigma_ms: float = GLOBAL_SIGMA_MS,
         src: Optional[str] = None,
+        update_estimate: bool = True,
     ) -> None:
         """Add a single RTT measurement and update the location estimate.
         `src` (the VP's id) is required in additive mode — the shared model
-        keys per-source parameters by it; other modes ignore it."""
+        keys per-source parameters by it; other modes ignore it.
+        `update_estimate=False` defers the location step (caller must
+        `reoptimize()` later) — the additive greedy needs the parameter
+        refit to see residuals against the PRE-ping estimate, so the offset
+        lands in μ̂_t instead of being absorbed into distance."""
         if self.target_id == TARGET_OF_INTEREST:
             print(f"[{self.target_id}] add_measurement vp={vp_loc} rtt={min_rtt:.2f}ms")
         self._append_constraint(vp_loc, min_rtt, sigma_ms, src)
-        self._update_estimate()
+        if update_estimate:
+            self._update_estimate()
 
     def add_measurements_batch(
         self,
@@ -267,6 +273,12 @@ class FeasibleRegion:
     def distance_to(self, vp_loc: LatLon) -> float:
         """Great-circle distance from the current estimate to vp_loc (km)."""
         return get_distance(vp_loc, self.get_location())
+
+    def set_location(self, loc: LatLon) -> None:
+        """Adopt an externally computed estimate (e.g. the additive batch
+        fit's MAP) and invalidate the size cache."""
+        self.best_guess = np.array(_normalize_latlon(loc[0], loc[1]))
+        self._cached_region_size = None
 
     def reoptimize(self) -> None:
         """Re-run the location fit under the current model parameters.

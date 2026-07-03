@@ -341,16 +341,20 @@ python3 -m pytest tests/ -v
   `BASICALLY_GEOLOCATED = 200` km applies uniformly.
 - `ADDITIVE` mode: one shared `AdditiveLatencyModel` across all regions,
   refit from all accumulated measurements after every actual ping
-  (`model_refit_every=`); regions constrain on MIN-of-reps while the model
-  records all reps — feeding every rep to the region lets its location step
-  absorb a pair's full mean offset and collapse μ̂_t (measured: patho μ̂_t
-  8.2 vs true 35, errors 4400+ km). `additive_utility_evaluator` predicts
-  RTT via the model and discounts the simulated km gain by
-  `prior_var/(prior_var + σ̂_t²)` — without the discount a pathological
-  target OUTBIDS finished ones (its statistical floor promises big absolute
-  reductions). Measured effect: patho ping share 0.20-0.30 (fair 0.25) vs
-  em-greedy's 0.33-0.50 on identical scenarios. All regions get a final
-  `reoptimize()` under the last fit before `measurements()` returns.
+  (`model_refit_every=`). The pinged region's location update is DEFERRED
+  until after the refit (`add_measurement(..., update_estimate=False)` +
+  `reoptimize()`) — params-first, or the location absorbs the pair's
+  offset and μ̂_t collapses. Incremental updates drive SELECTION only;
+  the estimates handed out get a final `additive_batch_em` polish at the
+  end of `measurements()` (incremental location steps ratchet offsets
+  into distance over a run; the fresh NN-anchored batch alternation
+  recovers them — measured: patho μ̂_t 16 vs true 35 before polish).
+  `additive_utility_evaluator` predicts RTT via the model and discounts
+  the simulated km gain by `prior_var/(prior_var + σ̂_t²)` — without the
+  discount a pathological target OUTBIDS finished ones (its statistical
+  floor promises big absolute reductions). Measured effect: patho ping
+  share median 0.29 / max 0.375 (fair 0.25) vs em-greedy's 0.33-0.50 on
+  identical scenarios.
 - `BASICALLY_GEOLOCATED` (200km region size) DEPRIORITISES a target rather
   than dropping it: done targets rank below every unfinished one, and
   leftover budget flows to the least-certain done target via its nearest
@@ -404,15 +408,18 @@ tests/plot_error_over_measurements.py figure generator (called by integration te
 tests/plot_gaussian_vs_hard_circle.py 3-panel map: hard-circle lenses vs gaussian
                                       posterior (called by TestGaussianVsHardCircle;
                                       writes tests/gaussian_vs_hard_circle.pdf)
-tests/test_e2e_additive_em.py         additive two-way model rtt = SOL + X_src + X_dst:
-                                      learns per-node (μ, σ); σ̂_dst flags pathological
-                                      destinations; beats per-target EM ~2× (batch) and
-                                      is the only model-based estimator to beat NN in
-                                      the budget sweep (408 vs 605 km at full budget).
-                                      Also the greedy_additive sweep: greedy selection
-                                      beats the random order early (1151 vs 1488 at
-                                      b=30) and never sinks budget into pathological
-                                      targets (share ≤ 0.30, fair = 0.25)
+tests/test_e2e_additive_em.py         additive two-way model rtt = SOL + X_src + X_dst,
+                                      ONE sample per pair (a practical ping is already
+                                      min-of-3 against queueing; X_src/X_dst model path
+                                      inefficiency that replication can't average out):
+                                      σ̂_dst flags pathological destinations 100%; best
+                                      model-based estimator (917 vs 1647 mean batch;
+                                      722 vs 1655/1686 in the sweep) though NN keeps
+                                      the full-coverage lead in this small synthetic
+                                      (614) — the real n=20 mesh flips that. Greedy
+                                      sweep: selection dominates early (1968 vs 3627+
+                                      at b=10), matches additive_em at full coverage,
+                                      patho ping share ≤ 0.375 (fair 0.25)
 tests/plot_error_additive.py          error-vs-budget curves under the additive world
                                       (writes tests/error_over_measurements_additive.pdf)
 tests/test_e2e_adaptive_em.py         online-EM e2e (single-target estimator comparison

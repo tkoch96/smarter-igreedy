@@ -450,6 +450,55 @@ def additive_map_location(constraint_rows: list, starts: list[LatLon]) -> LatLon
     return _normalize_latlon(float(best[0]), float(best[1]))
 
 
+def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
+                      n_iters: int = 4):
+    """
+    Fresh batch fit of the additive model: params-first alternation from
+    NN-anchored location inits (both paid-for pitfalls baked in — never
+    warm-start params, never let a location step run before the parameter
+    step has seen residuals against the anchors).
+
+    This is THE estimation path for the additive model.  Incremental
+    per-ping location updates ratchet: early MAP steps under prior offsets
+    absorb a pathological target's offset into distance, and later refits
+    can't win it back (measured: patho μ̂_t 16 vs true 35 after a full
+    greedy run whose final batch polish then recovers it).
+
+    rtts_by_pair: {(src, dst): [rtt_ms, ...]}
+    vp_locs:      {src: (lat, lon)} — pairs with unknown srcs are ignored.
+
+    Returns (estimates, mu_s, var_s, mu_t, var_t).
+    """
+    pairs = {(s, t): rs for (s, t), rs in rtts_by_pair.items()
+             if s in vp_locs and rs}
+    if not pairs:
+        return {}, {}, {}, {}, {}
+
+    best: dict[str, tuple[float, str]] = {}
+    for (s, t), rs in pairs.items():
+        r = min(rs)
+        if t not in best or r < best[t][0]:
+            best[t] = (r, s)
+    nn_est = {t: vp_locs[s] for t, (_, s) in best.items()}
+    estimates = dict(nn_est)
+
+    mu_s = var_s = mu_t = var_t = {}
+    for _ in range(n_iters):
+        residuals = {
+            (s, t): [r - get_distance(vp_locs[s], estimates[t]) / KM_PER_MS
+                     for r in rs]
+            for (s, t), rs in pairs.items()
+        }
+        mu_s, var_s, mu_t, var_t = fit_additive_params(residuals)
+        for t in estimates:
+            rows = [(vp_locs[s], r, mu_s[s] + mu_t[t], var_s[s] + var_t[t])
+                    for (s, t2), rs in pairs.items() if t2 == t
+                    for r in rs]
+            estimates[t] = additive_map_location(rows, [estimates[t], nn_est[t]])
+
+    return estimates, mu_s, var_s, mu_t, var_t
+
+
 class AdditiveLatencyModel:
     """
     Shared cross-target state for the additive two-way model — the

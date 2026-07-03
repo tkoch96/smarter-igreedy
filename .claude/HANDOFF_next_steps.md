@@ -16,9 +16,12 @@
    constraints, MAP weights 1/(σ̂_s²+σ̂_t²), precision-aware region size
    (weighted-rms residual + 1/sqrt(Σw) floor, km), `reoptimize()`.
 3. **Greedy integration** (`region_mode=ADDITIVE`): shared model refit per
-   ping (`model_refit_every=`), `additive_utility_evaluator` with the
-   σ̂_dst TRUST DISCOUNT `prior_var/(prior_var+σ̂_t²)`, final
-   reoptimize-all before estimates are read.
+   ping (`model_refit_every=`) with the pinged region's location update
+   DEFERRED until after the refit (params-first),
+   `additive_utility_evaluator` with the σ̂_dst TRUST DISCOUNT
+   `prior_var/(prior_var+σ̂_t²)`, and a final `additive_batch_em` polish
+   before estimates are read — incremental state drives selection, the
+   fresh batch fit produces the answers.
 4. `greedy_additive` lines + calibrated assertions in BOTH budget figures
    (`error_over_measurements_additive.pdf`, `..._adaptive.pdf`).
 5. **`'additive_em'` / `'em_gaussian'` / `'em_asymmetric'` converter
@@ -27,11 +30,21 @@
 
 ## Results (pinned by tests or cached pickles)
 
-Synthetic additive world (10 seeds): greedy_additive 1151 → 634 → 476 km
-over b = 30/120/240 vs random-order additive_em 1488 → 530 → 408.
-Selection wins early; small full-budget estimation premium (min-of-reps,
-see pitfalls). Budget sink FIXED: pathological ping share 0.20-0.30
-(fair 0.25) vs em-greedy's 0.33-0.50 on identical scenarios.
+The synthetic additive world uses ONE sample per (src, dst) pair — a
+practical ping is already min-of-~3, which strips QUEUEING delay, whereas
+X_src/X_dst model per-node path inefficiency that repetition cannot
+average away. (An earlier 3-replicate version let estimators exploit
+noise structure that doesn't exist in practice; removed 2026-07-03.)
+
+Synthetic additive world (10 seeds, budgets in pairs, max 80):
+greedy_additive 1968 → 1064 → 722 km over b = 10/40/80 vs random-order
+additive_em 4455 → 1110 → 722 and random+NN 3627 → 736 → 614. Selection
+dominates early (greedy at b=10 ≈ NN at b=30-40); at full coverage greedy
+= additive_em exactly (same estimator, same data). NN keeps the
+full-coverage lead in this small synthetic (only ~8-10 pairs of pooling
+per node) — the real n=20 mesh flips that. Budget sink FIXED:
+pathological ping share median 0.29 / max 0.375 (fair 0.25) vs
+em-greedy's 0.33-0.50 on identical scenarios.
 
 Real mesh (seed 31415; `cache/additive_real_results_n{20,100}.pkl`):
 - n=20 full coverage: additive mean 1927 / median 575 — FIRST model-based
@@ -49,15 +62,18 @@ Real mesh (seed 31415; `cache/additive_real_results_n{20,100}.pkl`):
   statistical floor is huge, so one more ping promises a large absolute
   reduction. Discount by prior_var/(prior_var+σ̂_t²)
   (`additive_utility_evaluator`).
-- **Greedy regions must constrain on MIN-of-reps** while the model records
-  all reps. Per-rep constraints let the pinged region's location step
-  absorb the pair's full mean offset → zero residuals → μ̂_t collapse
-  (measured: patho μ̂_t 8.2 vs true 35.1, errors 4400+ km). The min-vs-mean
-  gap keeps residuals positive so the parameter step claims the offset.
+- **Incremental location updates RATCHET offsets into distance.** Each
+  per-ping MAP step under not-yet-converged offsets absorbs a little of a
+  pathological target's offset; later refits can't win it back (measured:
+  patho μ̂_t 16 vs true 35 at full budget). Two-part fix: defer the pinged
+  region's location update until after the parameter refit
+  (`add_measurement(..., update_estimate=False)`), and produce reported
+  estimates via a fresh NN-anchored `additive_batch_em` at the end of
+  `measurements()` — trust incremental state for selection only.
 - **Single-VP constraint sets must anchor at the VP**, not optimise: NM
-  parks them on an arbitrary ring point whose zero residuals feed the same
-  collapse (relevant once replicated samples make len(constraints) > 1
-  with one distinct VP).
+  parks them on an arbitrary ring point whose zero residuals feed the μ̂_t
+  collapse (relevant whenever a target's constraints span one distinct VP,
+  e.g. multiple samples of the same pair).
 
 ## Next steps (ordered; TODOS.md #0/#1)
 

@@ -8,7 +8,9 @@ from typing import Any, Callable, Optional
 
 from utils import LatLon, get_distance
 from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, ADDITIVE, DEFAULT_SLOPE, TARGET_OF_INTEREST
-from probabilistic_helpers import AdditiveLatencyModel, ADDITIVE_PRIOR_VAR_MS2
+from probabilistic_helpers import (
+	AdditiveLatencyModel, ADDITIVE_PRIOR_VAR_MS2, additive_batch_em,
+)
 
 DEBUG = False
 
@@ -349,31 +351,29 @@ class Iterative_Greedy_Geolocator:
 			min_actual_rtt = min(actual_rtts)
 			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
-			# Constrain on min-of-reps even in additive mode (all reps go to
-			# the MODEL below).  Feeding every rep to the region lets its
-			# location step absorb the pair's full mean offset into distance,
-			# zeroing the residuals the parameter refit needs — μ̂_t collapses
-			# into the wrong-fixed-point failure (measured: patho μ̂_t 8.2 vs
-			# true 35.1, errors 4400+ km).  The min-vs-mean gap keeps recorded
-			# residuals positive so the parameter step can claim the offset.
+			# Additive mode defers the location step: the parameter refit
+			# below must compute residuals against the PRE-ping estimate.
+			# Updating the location first lets it absorb the pair's offset
+			# into distance, zeroing the residuals the refit needs — μ̂_t
+			# collapses into the wrong-fixed-point failure (params-first,
+			# the pitfall documented in run_additive_em).
 			self.target_regions[best_global_dst].add_measurement(
 				self.vp_locations[best_global_src], min_actual_rtt,
-				src=best_global_src)
+				src=best_global_src,
+				update_estimate=(self.latency_model is None))
 			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
 
 			if self.latency_model is not None:
-				# Shared-model bookkeeping: pool ALL samples of the pair
-				# (replication sharpens the variance decomposition), refit
-				# the per-node (μ, σ²) from every accumulated measurement
-				# against the CURRENT estimates — parameters claim a
-				# pathological target's offset before its location can —
-				# then re-run the pinged region's MAP under the new fit.
+				# Shared-model bookkeeping: record the sample, refit the
+				# per-node (μ, σ²) from every accumulated measurement against
+				# the current (pre-ping for this target) estimates, THEN run
+				# the pinged region's MAP under the new fit.
 				self.latency_model.record(best_global_src, best_global_dst, actual_rtts)
 				if len(self.measurement_history) % self.model_refit_every == 0:
 					self.latency_model.refit(self.vp_locations,
 					                         self.get_current_estimates())
-					self.target_regions[best_global_dst].reoptimize()
+				self.target_regions[best_global_dst].reoptimize()
 
 			new_actual_size = self.target_regions[best_global_dst].get_region_size()
 			actual_utility = size_before - new_actual_size
@@ -436,14 +436,23 @@ class Iterative_Greedy_Geolocator:
 				if np.random.random() > .99:
 					exit(0)
 
-		if self.latency_model is not None:
-			# Non-pinged targets' MAP locations were last fitted under older
-			# model parameters; re-run every region's location step under the
-			# final fit before estimates are read off.  (Cheap: one
-			# Nelder-Mead per constrained target.)
-			for region in self.target_regions.values():
-				if region.constraints:
-					region.reoptimize()
+		if self.latency_model is not None and self.latency_model.rtts_by_pair:
+			# Estimation polish before estimates are read off: a fresh
+			# params-first batch fit over everything measured so far (the
+			# same estimator the additive_em converter uses).  The greedy's
+			# incremental per-ping updates are good enough to DRIVE
+			# SELECTION but ratchet offsets into distance over a run; the
+			# NN-anchored batch alternation recovers them (see
+			# additive_batch_em).  The fitted params also reseed the shared
+			# model, so subsequent selection benefits.
+			estimates, mu_s, var_s, mu_t, var_t = additive_batch_em(
+				self.latency_model.rtts_by_pair, self.vp_locations)
+			self.latency_model.mu_s, self.latency_model.var_s = mu_s, var_s
+			self.latency_model.mu_t, self.latency_model.var_t = mu_t, var_t
+			for dst, est in estimates.items():
+				region = self.target_regions.get(dst)
+				if region is not None and region.constraints:
+					region.set_location(est)
 
 		meas_dict: MeasData = {}
 		for src, dst in self.measurement_history[:budget]:
