@@ -60,13 +60,19 @@ Fix directions, in value order:
    - `risk_gain` (p25 benefit × realized/promised track record):
      mean 2814 (best) / median 1092, allocation structurally fixed
      (min 2 / median 5 / max 78; high-σ̂ targets 4.3 pings vs 11.4).
-   REMAINING for risk_gain: (a) two leak targets still absorbed 67-78
-   pings — the reliability ratchet can be gamed when spread keeps
-   twitching; (b) median trails simulate (1092 vs 859) because support
-   spread understates residual error, so targets stop being refined at
-   ~5 pings once their AMBIGUITY is resolved — needs a refine-phase
-   fallback (e.g. drop to the simulate utility when benefits < threshold
-   instead of the 1/(dist+1) tie-break).
+   - `phased` (risk_gain + promise-collapse → random exploration;
+     switch on the auction's top bid — the realized-EWMA first cut was
+     wobble-corrupted, see git log): closes risk's flat segment on the
+     real mesh. n=100: 2,066 vs risk 3,312; n=200: 2,100 — beats BOTH
+     risk (2,318) and random+NN (2,184) at full budget, the greedy
+     family's first full-budget win at that scale. Random still owns
+     n=100 full budget (1,249 — 25 pings/target exhaustion regime).
+   REMAINING: (a) n=300 phased run; (b) two leak targets absorbed 67-78
+   pings under risk at n=100 — the reliability ratchet can be gamed when
+   spread keeps twitching; (c) medians still unreported by run(); (d) a
+   refine-phase fallback may claim what uniform exploration leaves on
+   the table (support spread understates residual error, so exploit
+   stops refining resolved targets at ~5 pings).
 2. Report MEDIANS in `Geolocator_Comparator.run()` (store per-target
    errors in plot_data) — greedy already wins medians at b=1000
    (859 vs 907) and the mean-only print hides it.

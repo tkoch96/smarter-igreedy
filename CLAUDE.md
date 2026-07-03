@@ -214,8 +214,14 @@ efficiency: risk@800 ≈ random@2000); n=300: 2,398, ahead of random
 pings/target) with an 800-1,200 km lead through the mid-range;
 greedy_em closes to 2,413 only at the very end. The mesh floor
 (smart_perfect) tightens 615 → 424 → 382 across n=100/200/300.
-risk_gain's known flat segment from b≈800 (n=200) is the phased
-selection's target regime.
+The phased selection (promise-collapse → random exploration) closes
+risk_gain's flat segment on the real mesh (2026-07-04 reruns, new
+promise-based switch): n=100 phased 2,066 vs risk's 3,312; n=200 phased
+2,100 vs risk 2,318 AND vs random+NN's 2,184 — the greedy family's
+first full-budget win at that scale. Random still wins n=100 full
+budget (1,249; 25 pings/target is exhaustion's home regime); the
+crossover to greedy dominance happens by n=200 (12.5 pings/target).
+Cross-run jitter on greedy curves is ~5-10% (as_completed ties).
 
 Real-mesh findings at n=100 (means; medians are far kinder — isolated
 targets dominate means, and run() does not report medians yet):
