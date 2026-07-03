@@ -360,18 +360,30 @@ python3 -m pytest tests/ -v
   floor promises big absolute reductions). Measured effect: patho ping
   share median 0.29 / max 0.375 (fair 0.25) vs em-greedy's 0.33-0.50 on
   identical scenarios.
-- `selection='info_gain'` (ADDITIVE only): exploration-aware utility
-  `log(1 + Var_hypotheses[predicted rtt]/(σ̂_s²+σ̂_t²))` over a per-region
-  hypothesis SUPPORT SET (MAP + NN anchor + rings around the best VP,
-  scored by PROFILED NLL — offset marginalised out, clamped ≥ 0; fixed
-  offsets would wrongly reject the near end of a ridge). Fixes the
-  measured geometry-blindness of the simulate utility (real mesh: ~90
-  candidates within 0.35%, the ridge-collapsing 7 km VP ranked #9 and
-  never pinged). Regression test: TestRidgeEscape — info-gain pings the
-  lone VP as the far target's 2nd ping in 9/10 seeds (err 477 km vs
-  simulate's 3068, which finds it in 0/10). Parity in ridge-free worlds
-  (pinned no-harm ≤ 1.10×), cheaper than simulate (no per-candidate NM),
-  and `hypothesis_size=True` folds ridge length into get_region_size().
+- `selection='info_gain'` (ADDITIVE only): exploration-aware utility over
+  a per-region hypothesis SUPPORT SET (MAP + NN anchor + rings around the
+  best VP, scored by PROFILED NLL — offset marginalised out, clamped ≥ 0;
+  fixed offsets would wrongly reject the near end of a ridge; tolerance
+  is misfit-scaled or the support degenerates to the MAP as constraints
+  accumulate). Utility = MEAN per-hypothesis partition benefit (km): how
+  much of the support spread a candidate's reading would eliminate.
+  Fixes the measured geometry-blindness of the simulate utility (real
+  mesh: ~90 candidates within 0.35%, the ridge-collapsing 7 km VP ranked
+  #9, never pinged). Regression test: TestRidgeEscape — lone VP found as
+  the far target's 2nd ping 9-10/10 seeds (err ~464 km vs simulate's
+  3068, 0/10). ⚠️ On the real mesh, mean-benefit selection SINKS budget
+  into uncuttable ridges (50-88 pings; median target starved to 1-2) —
+  its promises are large under a lucky hypothesis and never pay out.
+- `selection='risk_gain'`: the fix for that sink — same benefits, scored
+  at their 25th PERCENTILE ("gain I can count on in most worlds") ×
+  the target's `gain_reliability` (EWMA of realized/promised spread
+  reduction — model-free track record a bad fit cannot fake). Prefers a
+  500±100 km benefit to a 2000±5000 km one. TestUncuttableRidge: declines
+  the unpayable target at exactly 2 pings in 10/10 seeds (info_gain: 6)
+  while still finding the lone VP when it exists (9/10). Bounded premium
+  in the gaussian synthetic (patho promises DO pay there): ≤1.25× pinned.
+  Both selections: parity at full coverage (shared batch polish), cheaper
+  than simulate (no per-candidate NM).
 - `BASICALLY_GEOLOCATED` (200km region size) DEPRIORITISES a target rather
   than dropping it: done targets rank below every unfinished one, and
   leftover budget flows to the least-certain done target via its nearest

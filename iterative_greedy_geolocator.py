@@ -150,36 +150,111 @@ def info_gain_utility_evaluator(
 	verb: bool,
 ) -> float:
 	"""
-	Selection by expected information, not simulated size reduction.
+	Selection by expected ambiguity reduction (km), not simulated size
+	reduction.
 
-	Utility = log(1 + Var_hypotheses[predicted rtt] / (σ̂_s² + σ̂_t²)) —
-	how much the region's plausible locations DISAGREE about what this VP
-	would read, relative to the noise the reading carries anyway.  The
-	per-target offset is common to all hypotheses, so it cancels inside
-	the variance.
+	Utility = current hypothesis spread − expected REMAINING spread after
+	reading this VP: for each hypothesis h, the reading predicted under h
+	keeps alive only the hypotheses whose predictions are within ~2 noise
+	sd of it; the utility averages the surviving spread over h.  This
+	measures how well the candidate PARTITIONS the support set — which is
+	the actual information, and it is what raw prediction variance gets
+	wrong: a VP near the centre of a hypothesis ring predicts similar
+	RTTs everywhere on it (partitions nothing, scores ~0) even though its
+	prediction variance can look large, while a VP off to one side slices
+	the ring and scores ~the whole spread.  Measured failure this fixes:
+	a ridge target absorbed 67 pings from cluster VPs that could not cut
+	its ring while its 1,314 km neighbour (rtt 17.9 ms) sat unpinged.
 
-	This is the fix for the measured geometry-blindness of the simulate
-	utility (all ~90 real-mesh candidates within 0.35% of each other,
-	while the one VP that would collapse a 12,000 km ridge ranked #9): a
-	discriminating VP predicts wildly different RTTs across the ridge and
-	scores orders of magnitude above its peers.  The old trust discount
-	and done-sinking fall out of the formula — noisy targets have a big
-	denominator, solved targets a ~zero numerator.
+	Units are km, comparable across targets: a big-ridge target outbids
+	others only while a ridge-cutting VP EXISTS; once no candidate
+	partitions its support, it fades to the tie-break instead of sinking
+	budget.  Noisy targets fade the same way — noise widens the
+	compatibility window until nothing partitions (the old trust
+	discount, emergent).
 	"""
 	if current_size < BASICALLY_GEOLOCATED:
 		distance = get_distance(vp_loc, target_region.get_location())
 		return -1000000.0 + current_size + 1.0 / (distance + 1.0)
 
-	hyps = target_region.hypotheses or [target_region.get_location()]
-	preds = [get_distance(vp_loc, h) / KM_PER_MS for h in hyps]
-	var_pred = float(np.var(preds)) if len(preds) > 1 else 0.0
-	noise_var = target_region.model.var_sum(vp, dst)
-	info = math.log1p(var_pred / noise_var)
+	benefits = _hypothesis_benefits(target_region, vp, dst, vp_loc)
+	if benefits is not None:
+		gain_km = float(np.mean(benefits))
+		if gain_km > 1.0:
+			return gain_km
 
-	if info <= 1e-6:
+	distance = get_distance(vp_loc, target_region.get_location())
+	return 1.0 / (distance + 1.0)
+
+
+RELIABILITY_ALPHA = 0.3      # EWMA weight of the newest realized/promised ratio
+RELIABILITY_FLOOR = 0.05     # never fully write a target off — new VPs appear
+RELIABILITY_MIN_PROMISE_KM = 50.0   # don't score tiny promises
+
+
+def _hypothesis_benefits(target_region: FeasibleRegion, vp: str, dst: str,
+                         vp_loc: LatLon) -> Optional[list]:
+	"""Per-hypothesis benefit of pinging vp: for each candidate truth h,
+	how much of the support-set spread would h's predicted reading
+	eliminate (hypotheses whose predictions differ by more than ~2 noise
+	sd die).  Returns None when there is no ambiguity to reduce."""
+	hyps = target_region.hypotheses
+	if len(hyps) < 2:
+		return None
+	preds = [get_distance(vp_loc, h) / KM_PER_MS for h in hyps]
+	window = 2.0 * math.sqrt(target_region.model.var_sum(vp, dst))
+	pair_d = [[get_distance(p, q) for q in hyps] for p in hyps]
+	spread_now = max(max(row) for row in pair_d)
+	benefits = []
+	for i in range(len(hyps)):
+		alive = [j for j in range(len(hyps))
+		         if abs(preds[j] - preds[i]) <= window]
+		remaining = max(pair_d[j][k] for j in alive for k in alive)
+		benefits.append(spread_now - remaining)
+	return benefits
+
+
+def risk_adjusted_utility_evaluator(
+	vp: str,
+	dst: str,
+	target_region: FeasibleRegion,
+	vp_loc: LatLon,
+	current_size: float,
+	rtt_model_func: Callable,
+	verb: bool,
+) -> float:
+	"""
+	Prefer a 500 ± 100 km benefit to a 2000 ± 5000 km one.
+
+	Two risk terms on top of the partition benefit (see
+	info_gain_utility_evaluator, which uses the MEAN benefit):
+
+	1. Within-model: score the 25th PERCENTILE of the per-hypothesis
+	   benefits — "the gain I can count on in most worlds".  A
+	   ridge-cutting VP helps under EVERY hypothesis (high mean, LOW
+	   variance) and keeps its score; a cluster VP against a ridge helps
+	   only if the truth happens to sit at one end (high variance) and
+	   loses it.
+	2. Track record: multiply by the target's gain_reliability — an EWMA
+	   of realized/promised spread reduction maintained by the greedy.
+	   This is the model-free brake on the measured perpetual-motion
+	   failure (worse fit → wider support → bigger promises → more
+	   pings): promises that never pay out stop being bought, no matter
+	   what the model's internal uncertainty claims.
+	"""
+	if current_size < BASICALLY_GEOLOCATED:
 		distance = get_distance(vp_loc, target_region.get_location())
-		return 1.0 / (distance + 1.0)
-	return info
+		return -1000000.0 + current_size + 1.0 / (distance + 1.0)
+
+	benefits = _hypothesis_benefits(target_region, vp, dst, vp_loc)
+	if benefits is not None:
+		guaranteed = float(np.percentile(benefits, 25))
+		value = target_region.gain_reliability * guaranteed
+		if value > 1.0:
+			return value
+
+	distance = get_distance(vp_loc, target_region.get_location())
+	return 1.0 / (distance + 1.0)
 
 
 def _evaluate_vp_worker(
@@ -230,9 +305,11 @@ class Iterative_Greedy_Geolocator:
 		self.latency_model: Optional[AdditiveLatencyModel] = None
 		self.model_refit_every = model_refit_every
 		# ADDITIVE selection flavour: 'simulate' (clone + expected-rtt ping,
-		# size reduction) or 'info_gain' (hypothesis-set disagreement /
-		# noise — exploration-aware, and cheaper: no per-candidate NM).
-		if selection not in ('simulate', 'info_gain'):
+		# size reduction), 'info_gain' (mean per-hypothesis partition
+		# benefit — exploration-aware, cheaper: no per-candidate NM) or
+		# 'risk_gain' (info_gain's benefit distribution scored at its 25th
+		# percentile × the target's realized/promised track record).
+		if selection not in ('simulate', 'info_gain', 'risk_gain'):
 			raise ValueError(f"selection {selection!r} not understood")
 		self.selection = selection
 
@@ -240,6 +317,8 @@ class Iterative_Greedy_Geolocator:
 			self.utility_func: Callable = utility_func
 		elif region_mode == ADDITIVE and selection == 'info_gain':
 			self.utility_func = info_gain_utility_evaluator
+		elif region_mode == ADDITIVE and selection == 'risk_gain':
+			self.utility_func = risk_adjusted_utility_evaluator
 		elif region_mode == ADDITIVE:
 			self.utility_func = additive_utility_evaluator
 		else:
@@ -300,7 +379,7 @@ class Iterative_Greedy_Geolocator:
 			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
 			                    mode=self.region_mode, slope=self.region_slope,
 			                    model=self.latency_model,
-			                    hypothesis_size=(self.selection == 'info_gain'))
+			                    hypothesis_size=(self.selection in ('info_gain', 'risk_gain')))
 			for dst in self.targets
 		}
 		self.measurements_used = {dst: set() for dst in self.targets}
@@ -404,6 +483,7 @@ class Iterative_Greedy_Geolocator:
 			min_actual_rtt = min(actual_rtts)
 			est_before = (self.target_regions[best_global_dst].get_location()
 			              if self.target_regions[best_global_dst].constraints else None)
+			spread_before = self.target_regions[best_global_dst].hypothesis_spread_km()
 			if best_global_dst == TARGET_OF_INTEREST:
 				print(len(self.target_regions[best_global_dst].constraints))
 			# Additive mode defers the location step: the parameter refit
@@ -429,6 +509,21 @@ class Iterative_Greedy_Geolocator:
 					self.latency_model.refit(self.vp_locations,
 					                         self.get_current_estimates())
 				self.target_regions[best_global_dst].reoptimize()
+
+				if (self.selection == 'risk_gain'
+				        and expected_utility > RELIABILITY_MIN_PROMISE_KM):
+					# Track record: how much of the promised (already
+					# reliability-discounted) spread reduction actually
+					# happened?  Comparing against the discounted promise is
+					# self-correcting — a written-down target that starts
+					# delivering beats its small promises and recovers.
+					region = self.target_regions[best_global_dst]
+					realized = max(0.0, spread_before - region.hypothesis_spread_km())
+					ratio = min(1.0, realized / expected_utility)
+					region.gain_reliability = max(
+						RELIABILITY_FLOOR,
+						(1.0 - RELIABILITY_ALPHA) * region.gain_reliability
+						+ RELIABILITY_ALPHA * ratio)
 
 			new_actual_size = self.target_regions[best_global_dst].get_region_size()
 			actual_utility = size_before - new_actual_size

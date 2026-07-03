@@ -58,9 +58,9 @@ ADDITIVE    = 'additive'
 # ambiguity structure (rings around the best VP) and scored with the
 # PROFILED objective (per-target offset marginalised out, clamped ≥ 0:
 # rtt cannot beat SOL).
-HYP_RING_BEARINGS = 8      # ring sample density around the best VP
+HYP_RING_BEARINGS = 16     # ring sample density around the best VP
 HYP_RADIUS_FACTORS = (0.4, 0.7, 1.0)   # inward fractions — fits overshoot OUT
-HYP_SUPPORT_DELTA = 2.0    # keep candidates within this NLL of the best
+HYP_SUPPORT_DELTA = 2.0    # keep candidates within this (misfit-scaled) NLL
 HYP_MAX = 8                # support-set size cap
 HYP_MIN_SEP_KM = 200.0     # dedupe near-identical hypotheses
 
@@ -160,6 +160,12 @@ class FeasibleRegion:
         # honest uncertainty used by info-gain selection.
         self.hypotheses: list[LatLon] = []
         self.hypothesis_size = hypothesis_size
+        # Track record of this target's PROMISED vs REALIZED gains (EWMA of
+        # realized/promised, in [RELIABILITY_FLOOR, 1]).  Maintained by the
+        # greedy; consumed by risk-adjusted selection: a target whose
+        # promises keep failing to pay out gets its future promises
+        # discounted — model-free evidence the model cannot fake.
+        self.gain_reliability: float = 1.0
         self.best_guess: np.ndarray = np.array(prior_guess)
         # hard_circle: list[HardConstraint]   (vp_loc, max_radius_km)
         # gaussian:    list[ProbConstraint]   (vp_loc, sigma_ms, rtt_ms)
@@ -293,6 +299,7 @@ class FeasibleRegion:
         new_region.best_guess = self.best_guess.copy()
         new_region.constraints = self.constraints.copy()
         new_region.hypotheses = list(self.hypotheses)
+        new_region.gain_reliability = self.gain_reliability
         new_region._cached_region_size = self._cached_region_size
         return new_region
 
@@ -591,9 +598,18 @@ class FeasibleRegion:
         scored = sorted((self._profiled_nll(p), i, p)
                         for i, p in enumerate(pool))
         best_nll = scored[0][0]
+        # Misfit-scaled tolerance (reduced chi-square): under real,
+        # misspecified noise the per-constraint NLL differences inflate
+        # with the residual level AND accumulate with constraint count, so
+        # a fixed Δ degenerates the support to the MAP point while the
+        # geometric ambiguity is fully intact (measured: a 67-ping ridge
+        # target ended with ONE hypothesis and zero utility everywhere).
+        n_c = len(self.constraints)
+        chi2_red = max(1.0, 2.0 * best_nll / max(n_c - 1, 1))
+        delta = HYP_SUPPORT_DELTA * chi2_red * max(1.0, n_c / 8.0)
         support: list[LatLon] = []
         for nll, _, p in scored:
-            if nll > best_nll + HYP_SUPPORT_DELTA or len(support) >= HYP_MAX:
+            if nll > best_nll + delta or len(support) >= HYP_MAX:
                 break
             if all(get_distance(p, q) >= HYP_MIN_SEP_KM for q in support):
                 support.append(p)

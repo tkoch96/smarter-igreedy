@@ -30,6 +30,10 @@ class Geolocator_Comparator:
 			Iterative_Greedy_Geolocator(region_mode=ADDITIVE,
 			                            model_refit_every=25,
 			                            name='greedy_additive'),
+			Iterative_Greedy_Geolocator(region_mode=ADDITIVE,
+			                            model_refit_every=25,
+			                            selection='info_gain',
+			                            name='greedy_additive_info'),
 			Perfect_Geolocator(),
 			Random_Geolocator(),
 		]

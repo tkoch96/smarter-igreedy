@@ -319,7 +319,7 @@ TOTAL_PINGS = len(VP_LOCS) * N_TARGETS                   # 80
 BUDGET_GRID = (5, 10, 15, 20, 30, 40, 50, 60, 70, 80)
 SWEEP_STRATEGIES = ('random_nn', 'const_gaussian', 'per_target_em',
                     'additive_em', 'greedy_additive', 'greedy_additive_info',
-                    'oracle')
+                    'greedy_additive_risk', 'oracle')
 
 
 def run_greedy_additive_seed(sc: dict, selection: str = 'simulate') -> tuple[list[float], dict]:
@@ -457,10 +457,13 @@ def run_additive_budget_seed(seed: int) -> dict:
     curves['greedy_additive'], patho_share = run_greedy_additive_seed(sc)
     curves['greedy_additive_info'], info_patho_share = \
         run_greedy_additive_seed(sc, selection='info_gain')
+    curves['greedy_additive_risk'], risk_patho_share = \
+        run_greedy_additive_seed(sc, selection='risk_gain')
 
     return {'scenario': sc, 'curves': curves,
             'greedy_patho_share': patho_share,
-            'greedy_info_patho_share': info_patho_share}
+            'greedy_info_patho_share': info_patho_share,
+            'greedy_risk_patho_share': risk_patho_share}
 
 
 N_SWEEP_SEEDS = 10
@@ -544,11 +547,26 @@ class TestAdditiveBudgetSweep:
 
     def test_info_gain_no_harm_in_ridge_free_world(self, sweep_results):
         """Info-gain selection must not cost anything where there is
-        nothing to explore (calibrated: 1991/1077/706 vs simulate's
+        nothing to explore (calibrated: 1955/1124/706 vs simulate's
         1932/1129/706)."""
         for b in (10, 40, 80):
             assert _sweep_mean(sweep_results, 'greedy_additive_info', b) <= \
                 1.10 * _sweep_mean(sweep_results, 'greedy_additive', b)
+
+    def test_risk_gain_bounded_premium_in_gaussian_world(self, sweep_results):
+        """Calibrated 1948/1325/706: risk adjustment declines the
+        pathological targets, whose promises DO partially pay out under
+        genuinely gaussian noise (their floor shrinks as 1/sqrt(k)) — so
+        it pays a bounded mid-budget premium here (1325 vs simulate's
+        1129 at b=40). That is the honest cost of not trusting promises;
+        the real mesh, where those promises do NOT pay, is where it
+        collects (see TestUncuttableRidge). Full coverage is identical by
+        construction (shared batch polish)."""
+        for b in (10, 40, 80):
+            assert _sweep_mean(sweep_results, 'greedy_additive_risk', b) <= \
+                1.25 * _sweep_mean(sweep_results, 'greedy_additive', b)
+        assert _sweep_mean(sweep_results, 'greedy_additive_risk', 80) <= \
+            1.02 * _sweep_mean(sweep_results, 'additive_em', 80)
 
     def test_greedy_does_not_sink_budget_into_pathological_targets(self, sweep_results):
         """THE payoff of σ̂_dst in the utility (trust-discounted gain): the
@@ -652,7 +670,7 @@ N_RIDGE_SEEDS = 10
 @pytest.fixture(scope='module')
 def ridge_results():
     return {sel: [run_ridge_seed(seed, sel) for seed in range(N_RIDGE_SEEDS)]
-            for sel in ('simulate', 'info_gain')}
+            for sel in ('simulate', 'info_gain', 'risk_gain')}
 
 
 class TestRidgeEscape:
@@ -678,6 +696,17 @@ class TestRidgeEscape:
         errs = [r['far_err'] for r in ridge_results['info_gain']]
         assert float(np.median(errs)) < 700.0
 
+    def test_risk_gain_also_finds_the_lone_vp(self, ridge_results):
+        """Risk adjustment must NOT cost the ridge escape: the lone VP
+        helps under EVERY hypothesis (high mean, LOW variance benefit), so
+        its 25th-percentile benefit stays dominant."""
+        rows = ridge_results['risk_gain']
+        hits = sum(1 for r in rows
+                   if r['kochi_pos'] is not None and r['kochi_pos'] <= 3)
+        errs = [r['far_err'] for r in rows]
+        assert hits >= 0.8 * N_RIDGE_SEEDS
+        assert float(np.median(errs)) < 700.0
+
     def test_simulate_utility_is_ridge_blind(self, ridge_results):
         """Pin the failure this feature fixes: the simulate utility treats
         all candidates alike (measured 0.35% spread on the real mesh), so
@@ -693,3 +722,74 @@ class TestRidgeEscape:
         assert float(np.median(errs)) > \
             2.0 * float(np.median([r['far_err']
                                    for r in ridge_results['info_gain']]))
+
+
+# ===========================================================================
+# Uncuttable ridge — the flashy-uncertain case risk adjustment must decline
+# ===========================================================================
+#
+# Same geometry as TestRidgeEscape but WITHOUT the lone VP: the far
+# target's ambiguity is real but NO available measurement can reduce it
+# (every VP sees the ring from its centre). Its per-hypothesis benefits
+# are the "2000 ± 5000" shape — large under a lucky hypothesis, ~zero
+# otherwise — and its promises never pay out. Mean-benefit selection
+# (info_gain) keeps buying them (the measured real-mesh sink: 50-88 pings
+# on such targets while the median target got 1-2); the 25th-percentile ×
+# track-record value declines them, so budget flows to the reliable
+# 500 ± 100 European targets.
+
+UNCUT_VP_LOCS = {k: v for k, v in RIDGE_VP_LOCS.items() if k != 'kochi'}
+UNCUT_BUDGET = 16
+
+
+def run_uncut_seed(seed: int, selection: str) -> dict:
+    sc = make_ridge_scenario(seed)
+    # strip the lone VP: the far target becomes uncuttable
+    data = {'address_to_loc': dict(UNCUT_VP_LOCS),
+            'loc_loc_meas': {s: dsts for s, dsts in
+                             sc['data']['loc_loc_meas'].items()
+                             if s != 'kochi'}}
+    ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE,
+                                     selection=selection)
+    ig.set_data(data)
+    ig.solve()
+    ig.measurements(UNCUT_BUDGET)
+    est = ig.get_current_estimates()
+    far_pings = sum(1 for _, t in ig.measurement_history if t == 'far_0')
+    eur_errs = [get_distance(est[t], tp['loc'])
+                for t, tp in sc['targets'].items()
+                if t != 'far_0' and t in est]
+    ig.cleanup()
+    return {'far_pings': far_pings,
+            'eur_err': float(np.mean(eur_errs))}
+
+
+@pytest.fixture(scope='module')
+def uncut_results():
+    return {sel: [run_uncut_seed(seed, sel) for seed in range(N_RIDGE_SEEDS)]
+            for sel in ('info_gain', 'risk_gain')}
+
+
+class TestUncuttableRidge:
+    def test_summary(self, uncut_results):
+        for sel, rows in uncut_results.items():
+            print(f"\n{sel:9s}: far_pings={[r['far_pings'] for r in rows]}  "
+                  f"eur_err med={np.median([r['eur_err'] for r in rows]):7.1f}")
+
+    def test_risk_gain_declines_the_unpayable_promise(self, uncut_results):
+        """The far target's budget share under risk_gain stays near fair
+        share (16 pings / 4 targets = 4) instead of sinking."""
+        risk = [r['far_pings'] for r in uncut_results['risk_gain']]
+        info = [r['far_pings'] for r in uncut_results['info_gain']]
+        assert float(np.median(risk)) <= 6
+        assert float(np.median(risk)) < float(np.median(info))
+
+    def test_risk_gain_declining_does_not_hurt_reliable_targets(self, uncut_results):
+        """Calibrated 838 vs 802 km: at this mini scale the European
+        targets are already ping-saturated, so the freed budget buys ~no
+        extra accuracy HERE — the payoff of declining shows at real-mesh
+        scale, where sinks starved the median target to 1-2 pings. This
+        pin only guards that declining costs nothing."""
+        risk = float(np.median([r['eur_err'] for r in uncut_results['risk_gain']]))
+        info = float(np.median([r['eur_err'] for r in uncut_results['info_gain']]))
+        assert risk <= info * 1.10

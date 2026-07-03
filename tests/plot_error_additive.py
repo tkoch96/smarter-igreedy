@@ -48,7 +48,8 @@ LABELS = {
     'per_target_em':  'per-target em (multiplicative μ_t, σ_t)',
     'additive_em':    'additive em (per-source AND per-dest μ, σ)',
     'greedy_additive': 'GREEDY selection + additive em (σ̂_dst in utility)',
-    'greedy_additive_info': 'GREEDY info-gain selection (hypothesis disagreement)',
+    'greedy_additive_info': 'GREEDY info-gain selection (mean benefit)',
+    'greedy_additive_risk': 'GREEDY risk-adjusted (p25 benefit × track record)',
     'oracle':         'oracle (Perfect_Geolocator selection + true μ, σ)',
 }
 STYLES = {
@@ -57,7 +58,8 @@ STYLES = {
     'per_target_em':  dict(color='steelblue',  linestyle='--'),
     'additive_em':    dict(color='crimson',    linewidth=2.2),
     'greedy_additive': dict(color='darkviolet', linewidth=2.2),
-    'greedy_additive_info': dict(color='deeppink', linewidth=2.2),
+    'greedy_additive_info': dict(color='deeppink', linewidth=1.6, linestyle='--'),
+    'greedy_additive_risk': dict(color='forestgreen', linewidth=2.4),
     'oracle':         dict(color='black',      linestyle='-.'),
 }
 
