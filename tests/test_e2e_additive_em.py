@@ -47,7 +47,9 @@ from scipy.optimize import minimize
 from feasible_region_maintainer import (
     FeasibleRegion, GAUSSIAN, EM_GAUSSIAN, ADDITIVE, _normalize_latlon,
 )
-from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
+from iterative_greedy_geolocator import (
+    Iterative_Greedy_Geolocator, MARGINAL_SWITCH_KM,
+)
 from perfect_geolocator import Perfect_Geolocator
 from probabilistic_helpers import KM_PER_MS, fit_additive_params
 from utils import get_distance, LatLon
@@ -795,6 +797,43 @@ class TestUncuttableRidge:
         info = [r['far_pings'] for r in uncut_results['info_gain']]
         assert float(np.median(risk)) <= 6
         assert float(np.median(risk)) < float(np.median(info))
+
+    def test_phased_switch_mechanism(self):
+        """Direct pin of BOTH phase transitions. Emergent demonstrations
+        are out of reach at unit scale: the sweep world has no flat
+        segment (explore fires 0-7 of 80 pings, all late), and an
+        engineered stall fails because the rescue VP's partition benefit
+        gets it picked at ping ~2 — before any promises can fail. So the
+        mechanism is pinned directly; its VALUE is a real-mesh claim
+        (risk_gain's measured flat segment from b≈800, where random+NN
+        kept descending)."""
+        sc = make_ridge_scenario(0)
+        ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE,
+                                         selection='phased')
+        ig.set_data(sc['data'])
+        ig.solve()
+        try:
+            ig.measurements(8)
+            # healthy tape early: coverage/resolution gains are large
+            assert ig.explore_pings == 0
+            assert ig.marginal_gain_ewma > MARGINAL_SWITCH_KM
+
+            # exploit→explore: a collapsed tape must divert the next ping
+            # to a previously unpinged random pair
+            ig.marginal_gain_ewma = 0.0
+            pinged_before = set(ig.measurement_history)
+            ig.measurements(9)
+            assert ig.explore_pings == 1
+            assert ig.measurement_history[-1] not in pinged_before
+
+            # explore→exploit (non-sticky): fresh pairs in this world carry
+            # real gains, so paying exploration lifts the tape back over
+            # the threshold and the auction resumes
+            ig.measurements(12)
+            assert ig.marginal_gain_ewma > MARGINAL_SWITCH_KM
+            assert ig.explore_pings < 4   # not stuck exploring
+        finally:
+            ig.cleanup()
 
     def test_risk_gain_declining_does_not_hurt_reliable_targets(self, uncut_results):
         """Calibrated 838 vs 802 km: at this mini scale the European

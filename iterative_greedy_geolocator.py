@@ -402,6 +402,7 @@ class Iterative_Greedy_Geolocator:
 			self.latency_model = AdditiveLatencyModel()   # fresh per solve
 		# Marginal-return tape + deterministic exploration order ('phased')
 		self.marginal_gain_ewma: Optional[float] = None
+		self.explore_pings = 0
 		self._explore_rng = np.random.default_rng(31415)
 		self.target_regions = {
 			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
@@ -484,6 +485,7 @@ class Iterative_Greedy_Geolocator:
 				if not cand:
 					break
 				explore_pick = cand[int(self._explore_rng.integers(len(cand)))]
+				self.explore_pings += 1
 
 			focus_group_refreshed = False
 			if pings_in_current_batch == 0 or not focus_group:
