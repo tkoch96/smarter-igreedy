@@ -51,17 +51,22 @@ structurally cannot value a measurement whose worth is falsifying the
 model.
 
 Fix directions, in value order:
-1. DONE (2026-07-03, synthetic): info-gain selection
-   (`selection='info_gain'`) — hypothesis-set disagreement / noise, with
-   ridge-aware region size riding along. Validated by TestRidgeEscape
-   (lone VP found as 2nd ping 9/10 seeds, err 477 vs 3068 km; simulate
-   finds it 0/10) and no-harm pins in both ridge-free worlds.
-   REMAINING: the real-mesh acceptance run — rerun the b=1000 hindsight
-   debug driver and the n=100 comparator with
-   `Iterative_Greedy_Geolocator(region_mode=ADDITIVE,
-   selection='info_gain', model_refit_every=25)`; check the 7 km VP
-   (103.69.212.0 → 128.0.113.0) actually gets pinged and the mean drops
-   toward random+NN/oracle territory.
+1. PARTIALLY DONE (2026-07-03). Selection iterations, real-mesh b=1000
+   hindsight numbers (simulate baseline: mean 3087 / median 859):
+   - `info_gain` (mean partition benefit): fixes ridge escape on
+     synthetic but SINKS on the real mesh — uncuttable-ridge promises
+     are huge under a lucky hypothesis and never pay; mean 2815 /
+     median 1423, median target starved to 1-2 pings, sinks of 50-88.
+   - `risk_gain` (p25 benefit × realized/promised track record):
+     mean 2814 (best) / median 1092, allocation structurally fixed
+     (min 2 / median 5 / max 78; high-σ̂ targets 4.3 pings vs 11.4).
+   REMAINING for risk_gain: (a) two leak targets still absorbed 67-78
+   pings — the reliability ratchet can be gamed when spread keeps
+   twitching; (b) median trails simulate (1092 vs 859) because support
+   spread understates residual error, so targets stop being refined at
+   ~5 pings once their AMBIGUITY is resolved — needs a refine-phase
+   fallback (e.g. drop to the simulate utility when benefits < threshold
+   instead of the 1/(dist+1) tie-break).
 2. Report MEDIANS in `Geolocator_Comparator.run()` (store per-target
    errors in plot_data) — greedy already wins medians at b=1000
    (859 vs 907) and the mean-only print hides it.
