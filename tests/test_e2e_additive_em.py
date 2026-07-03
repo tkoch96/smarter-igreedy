@@ -572,13 +572,19 @@ class TestAdditiveBudgetSweep:
         assert _sweep_mean(sweep_results, 'greedy_additive_risk', 80) <= \
             1.02 * _sweep_mean(sweep_results, 'additive_em', 80)
 
-    def test_phased_no_harm_vs_risk(self, sweep_results):
-        """The marginal-return phase switch (exploit → random exploration
-        when the realized-gain tape collapses) must not cost anything in a
-        world with no flat segment to escape (calibrated 1948/1322/706 vs
-        risk's 1948/1325/706 — near-identical; its value is the real-mesh
-        late-budget regime where risk_gain flatlines)."""
-        for b in (10, 40, 80):
+    def test_phased_fixes_risk_mid_budget_premium(self, sweep_results):
+        """THE controlled-environment demonstration of the phase switch
+        (promise-based: explore when the auction's top risk-adjusted bid
+        collapses, which happens at ping ~12 here). Risk-adjustment's
+        mid-budget premium — it declines the pathological targets whose
+        gaussian promises would actually pay — is exactly a dead zone of
+        collapsed bids, and exploration fills it: calibrated means
+        1948 / 920 / 706 vs risk's 1948 / 1325 / 706. At b=40 phased is
+        the best strategy in the figure, beating even the random-order
+        additive_em (1172)."""
+        assert _sweep_mean(sweep_results, 'greedy_additive_phased', 40) <= \
+            0.85 * _sweep_mean(sweep_results, 'greedy_additive_risk', 40)
+        for b in (10, 80):
             assert _sweep_mean(sweep_results, 'greedy_additive_phased', b) <= \
                 1.05 * _sweep_mean(sweep_results, 'greedy_additive_risk', b)
 
@@ -799,39 +805,35 @@ class TestUncuttableRidge:
         assert float(np.median(risk)) < float(np.median(info))
 
     def test_phased_switch_mechanism(self):
-        """Direct pin of BOTH phase transitions. Emergent demonstrations
-        are out of reach at unit scale: the sweep world has no flat
-        segment (explore fires 0-7 of 80 pings, all late), and an
-        engineered stall fails because the rescue VP's partition benefit
-        gets it picked at ping ~2 — before any promises can fail. So the
-        mechanism is pinned directly; its VALUE is a real-mesh claim
-        (risk_gain's measured flat segment from b≈800, where random+NN
-        kept descending)."""
-        sc = make_ridge_scenario(0)
+        """Pin the phase transition on the promise signal: exploit while
+        the auction's top risk-adjusted bid is real, explore once it
+        collapses. Debugged history (trace in the git log): the first cut
+        switched on an EWMA of REALIZED size change, which tie-break
+        wobble on noisy targets kept spuriously high — bids collapse at
+        ping ~12 in the sweep world, the realized tape never crossed the
+        threshold at all. Bids, post-risk-adjustment, are the honest
+        marginal-return estimate; realized size change is not."""
+        sc = make_additive_scenario(0)
+        loc_loc_meas: dict[str, dict[str, list[float]]] = {}
+        for (s, t), rtts in sc['rtts'].items():
+            loc_loc_meas.setdefault(s, {})[t] = list(rtts)
         ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE,
                                          selection='phased')
-        ig.set_data(sc['data'])
+        ig.set_data({'address_to_loc': dict(VP_LOCS),
+                     'loc_loc_meas': loc_loc_meas})
         ig.solve()
         try:
-            ig.measurements(8)
-            # healthy tape early: coverage/resolution gains are large
-            assert ig.explore_pings == 0
-            assert ig.marginal_gain_ewma > MARGINAL_SWITCH_KM
+            # coverage/resolution phase: real bids dominate (boundary is
+            # fuzzy — bids hover near the threshold around ping ~10)
+            ig.measurements(10)
+            assert ig.explore_pings <= 2
 
-            # exploit→explore: a collapsed tape must divert the next ping
-            # to a previously unpinged random pair
-            ig.marginal_gain_ewma = 0.0
-            pinged_before = set(ig.measurement_history)
-            ig.measurements(9)
-            assert ig.explore_pings == 1
-            assert ig.measurement_history[-1] not in pinged_before
-
-            # explore→exploit (non-sticky): fresh pairs in this world carry
-            # real gains, so paying exploration lifts the tape back over
-            # the threshold and the auction resumes
-            ig.measurements(12)
-            assert ig.marginal_gain_ewma > MARGINAL_SWITCH_KM
-            assert ig.explore_pings < 4   # not stuck exploring
+            # bids collapse at ping ~12 (calibrated trace) → exploration
+            # takes over and spends only on unpinged pairs
+            ig.measurements(30)
+            assert ig.explore_pings >= 10
+            assert len(set(ig.measurement_history)) == \
+                len(ig.measurement_history)   # never re-pings a pair
         finally:
             ig.cleanup()
 

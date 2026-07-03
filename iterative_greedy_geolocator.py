@@ -192,12 +192,21 @@ RELIABILITY_FLOOR = 0.05     # never fully write a target off — new VPs appear
 RELIABILITY_MIN_PROMISE_KM = 50.0   # don't score tiny promises
 
 # Phase switch for selection='phased' (marginal-returns rule, Pandora's-box
-# style): exploit while the EWMA of REALIZED believed-size reduction per
-# ping stays above the threshold; below it, spend pings as uniform random
-# draws over unpinged pairs (the exploration action whose yield the
-# exploit tape is implicitly compared against — what random+NN does by
-# accident). Non-sticky: an exploration ping that re-opens large gains
-# lifts the tape and flips the greedy back to exploiting.
+# style): exploit while the auction's TOP BID — the best risk-adjusted
+# promise on the board, which the reliability discount makes an honest
+# marginal-return estimate — exceeds the threshold; below it, spend pings
+# as uniform random draws over unpinged pairs (the exploration action
+# random+NN performs by accident). Non-sticky: an exploration ping whose
+# surprise re-opens hypotheses revives real bids and flips back to
+# exploiting (measured on the sweep trace: explores at pings 57-60 revived
+# 1,800-3,100 km bids at 61-62).
+#
+# The first cut used an EWMA of REALIZED size reduction instead — wrong
+# side of the ledger: tie-break pings churn believed size by ±1,000+ km on
+# noisy targets (wobble, not progress) and the max(0,·) clamp gives that
+# zero-mean wobble a positive mean, so the tape idled at 80-600 km for 40
+# pings after the auction's bids had collapsed to zero at ping ~13.
+# marginal_gain_ewma is kept as telemetry only.
 MARGINAL_EWMA_ALPHA = 0.25
 MARGINAL_SWITCH_KM = 50.0
 
@@ -473,20 +482,6 @@ class Iterative_Greedy_Geolocator:
 		while len(self.measurement_history) < budget:
 			self.iter = len(self.measurement_history)
 
-			explore_pick = None
-			if (self.selection == 'phased'
-			        and self.marginal_gain_ewma is not None
-			        and self.marginal_gain_ewma < MARGINAL_SWITCH_KM):
-				# Exploit returns have collapsed — spend this ping on
-				# uniform exploration of unpinged pairs instead.
-				cand = [(s, d) for d in self.targets
-				        for s in self.available_measurements[d]
-				        if s not in self.measurements_used[d]]
-				if not cand:
-					break
-				explore_pick = cand[int(self._explore_rng.integers(len(cand)))]
-				self.explore_pings += 1
-
 			focus_group_refreshed = False
 			if pings_in_current_batch == 0 or not focus_group:
 				sorted_cache = sorted(
@@ -502,16 +497,25 @@ class Iterative_Greedy_Geolocator:
 			best_global_src: Optional[str] = None
 			best_global_utility = -float('inf')
 
-			if explore_pick is not None:
-				best_global_src, best_global_dst = explore_pick
-				best_global_utility = 0.0
-			else:
-				for dst in focus_group:
-					src, utility = self.best_vp_cache.get(dst, (None, -float('inf')))
-					if src is not None and utility > best_global_utility:
-						best_global_utility = utility
-						best_global_dst = dst
-						best_global_src = src
+			for dst in focus_group:
+				src, utility = self.best_vp_cache.get(dst, (None, -float('inf')))
+				if src is not None and utility > best_global_utility:
+					best_global_utility = utility
+					best_global_dst = dst
+					best_global_src = src
+
+			if (self.selection == 'phased'
+			        and best_global_utility < MARGINAL_SWITCH_KM):
+				# The board's best honest promise is negligible — divert
+				# this ping to uniform exploration of unpinged pairs.
+				cand = [(s, d) for d in self.targets
+				        for s in self.available_measurements[d]
+				        if s not in self.measurements_used[d]]
+				if cand:
+					best_global_src, best_global_dst = \
+						cand[int(self._explore_rng.integers(len(cand)))]
+					best_global_utility = 0.0
+					self.explore_pings += 1
 
 			if best_global_dst is None:
 				if focus_group_refreshed:
