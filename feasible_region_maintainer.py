@@ -119,6 +119,11 @@ class FeasibleRegion:
     get_location, clone, distance_to) is identical in all modes.
     add_measurement accepts an optional sigma_ms argument (gaussian modes
     only) and an optional src id (additive mode only).
+
+    `rtt_model` (probabilistic_helpers.RttModel) swaps the base RTT term
+    (d / KM_PER_MS) for an injected model — e.g. the fiber-atlas floor —
+    in the soft modes' residuals; None keeps today's geodesic behavior
+    exactly.  hard_circle ignores it (its circles are geodesic constructs).
     """
 
     def __init__(
@@ -131,6 +136,7 @@ class FeasibleRegion:
         noise_model: str = GAUSSIAN_NOISE,
         model: Optional[AdditiveLatencyModel] = None,
         hypothesis_size: bool = False,
+        rtt_model=None,
     ) -> None:
         self.target_id = target_id
         self.mode = mode
@@ -149,11 +155,16 @@ class FeasibleRegion:
         # Ignored by hard_circle mode.
         self.noise_model = noise_model
         self.radius_multiplier = radius_multiplier
+        # Injected base RTT model (None = geodesic d/100, unchanged).
+        self.rtt_model = rtt_model
         # Shared cross-target parameter state (additive mode only); the
         # region never mutates it.
         self.model = model
         if mode == ADDITIVE and model is None:
-            self.model = AdditiveLatencyModel()   # standalone/test use
+            self.model = AdditiveLatencyModel(rtt_model=rtt_model)  # standalone/test use
+        if mode == ADDITIVE and rtt_model is None and self.model is not None:
+            # keep the region's residuals consistent with the shared model
+            self.rtt_model = self.model.rtt_model
         # Support set of plausible locations (additive mode; maintained by
         # _update_estimate_additive). `hypothesis_size=True` additionally
         # folds the set's spread into get_region_size() — the ridge-aware
@@ -257,7 +268,8 @@ class FeasibleRegion:
                 result = max(result, self.hypothesis_spread_km())
         else:
             result = (mean_absolute_residual(self.get_location(), self.constraints,
-                                             slope=self.slope)
+                                             slope=self.slope,
+                                             rtt_model=self.rtt_model)
                       * KM_PER_MS / self.slope)
 
         # Trilateration bound: with fewer than 3 VPs the position is
@@ -293,7 +305,8 @@ class FeasibleRegion:
                                     slope=self.slope,
                                     noise_model=self.noise_model,
                                     model=self.model,
-                                    hypothesis_size=self.hypothesis_size)
+                                    hypothesis_size=self.hypothesis_size,
+                                    rtt_model=self.rtt_model)
         new_region.prior_slope = self.prior_slope
         new_region.fitted_sigma_ms = self.fitted_sigma_ms
         new_region.best_guess = self.best_guess.copy()
@@ -438,7 +451,8 @@ class FeasibleRegion:
 
         def loss(point: np.ndarray) -> float:
             return gaussian_nll((point[0], point[1]), self.constraints,
-                                slope=self.slope, noise_model=self.noise_model)
+                                slope=self.slope, noise_model=self.noise_model,
+                                rtt_model=self.rtt_model)
 
         result = minimize(
             loss,
@@ -479,13 +493,16 @@ class FeasibleRegion:
     def _m_step(self) -> tuple[float, float]:
         """Refit (μ, σ) from residuals against the current location estimate."""
         estimate = self.get_location()
-        dists_ms = []   # d / KM_PER_MS  (SOL-equivalent ms)
+        dists_ms = []   # base RTT term (SOL-equivalent ms; μ is slack over it)
         rtts = []
         for vp_loc, _sigma, rtt in self.constraints:
             d = get_distance(estimate, vp_loc)
             if d < 1.0:
                 continue   # co-located VP: ratio is degenerate
-            dists_ms.append(d / KM_PER_MS)
+            if self.rtt_model is None:
+                dists_ms.append(d / KM_PER_MS)
+            else:
+                dists_ms.append(self.rtt_model.base_ms(vp_loc, estimate))
             rtts.append(rtt)
 
         k = len(dists_ms)
@@ -548,7 +565,8 @@ class FeasibleRegion:
             return
         estimate = additive_map_location(
             self._additive_rows(),
-            [self.get_location(), self._nn_anchor()])
+            [self.get_location(), self._nn_anchor()],
+            rtt_model=self.rtt_model)
         self.best_guess = np.array(estimate)
         self._update_hypotheses()
 
@@ -561,8 +579,11 @@ class FeasibleRegion:
         offs, ws = [], []
         t = self.target_id
         for vp_loc, src, rtt in self.constraints:
-            offs.append(rtt - get_distance(x, vp_loc) / KM_PER_MS
-                        - self.model.mu_s.get(src, 5.0))
+            if self.rtt_model is None:
+                base = get_distance(x, vp_loc) / KM_PER_MS
+            else:
+                base = self.rtt_model.base_ms(vp_loc, x)
+            offs.append(rtt - base - self.model.mu_s.get(src, 5.0))
             ws.append(1.0 / self.model.var_sum(src, t))
         w = np.array(ws)
         r = np.array(offs)
@@ -642,7 +663,11 @@ class FeasibleRegion:
         w_sum = 0.0
         wr2_sum = 0.0
         for vp_loc, rtt, mean_off, var_sum in self._additive_rows():
-            r = rtt - get_distance(estimate, vp_loc) / KM_PER_MS - mean_off
+            if self.rtt_model is None:
+                base = get_distance(estimate, vp_loc) / KM_PER_MS
+            else:
+                base = self.rtt_model.base_ms(vp_loc, estimate)
+            r = rtt - base - mean_off
             w = 1.0 / var_sum
             w_sum += w
             wr2_sum += w * r * r

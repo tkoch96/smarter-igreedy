@@ -124,8 +124,12 @@ def additive_utility_evaluator(
 		distance = get_distance(vp_loc, target_region.get_location())
 		return -1000000.0 + current_size + 1.0 / (distance + 1.0)
 
-	dist_km = get_distance(vp_loc, target_region.get_location())
-	expected_rtt, _var = target_region.model.predict(vp, dst, dist_km)
+	loc = target_region.get_location()
+	dist_km = get_distance(vp_loc, loc)
+	if target_region.rtt_model is None:
+		expected_rtt, _var = target_region.model.predict(vp, dst, dist_km)
+	else:
+		expected_rtt, _var = target_region.model.predict_at(vp, dst, vp_loc, loc)
 
 	temp_region = target_region.clone()
 	temp_region.add_measurement(vp_loc, expected_rtt, src=vp)
@@ -220,7 +224,10 @@ def _hypothesis_benefits(target_region: FeasibleRegion, vp: str, dst: str,
 	hyps = target_region.hypotheses
 	if len(hyps) < 2:
 		return None
-	preds = [get_distance(vp_loc, h) / KM_PER_MS for h in hyps]
+	if target_region.rtt_model is None:
+		preds = [get_distance(vp_loc, h) / KM_PER_MS for h in hyps]
+	else:
+		preds = target_region.rtt_model.base_ms_many(vp_loc, hyps)
 	window = 2.0 * math.sqrt(target_region.model.var_sum(vp, dst))
 	pair_d = [[get_distance(p, q) for q in hyps] for p in hyps]
 	spread_now = max(max(row) for row in pair_d)
@@ -304,6 +311,7 @@ class Iterative_Greedy_Geolocator:
 		name: Optional[str] = None,
 		model_refit_every: int = 1,
 		selection: str = 'simulate',
+		rtt_model=None,
 	) -> None:
 		# Distinct names let several differently-configured greedys coexist
 		# in one Geolocator_Comparator run (plot keys / cache filenames).
@@ -323,6 +331,11 @@ class Iterative_Greedy_Geolocator:
 		# measurements every `model_refit_every` actual pings.
 		self.latency_model: Optional[AdditiveLatencyModel] = None
 		self.model_refit_every = model_refit_every
+		# Injected BASE RTT model (probabilistic_helpers.RttModel): swaps the
+		# geodesic d/100 term in the regions' and additive model's residuals
+		# for e.g. the fiber-atlas floor.  Distinct from `rtt_func`, which is
+		# the selection-time RTT *prediction heuristic* (AdaptiveRTTModel).
+		self.rtt_model = rtt_model
 		# ADDITIVE selection flavour: 'simulate' (clone + expected-rtt ping,
 		# size reduction), 'info_gain' (mean per-hypothesis partition
 		# benefit — exploration-aware, cheaper: no per-candidate NM),
@@ -408,7 +421,7 @@ class Iterative_Greedy_Geolocator:
 			return
 
 		if self.region_mode == ADDITIVE:
-			self.latency_model = AdditiveLatencyModel()   # fresh per solve
+			self.latency_model = AdditiveLatencyModel(rtt_model=self.rtt_model)   # fresh per solve
 		# Marginal-return tape + deterministic exploration order ('phased')
 		self.marginal_gain_ewma: Optional[float] = None
 		self.explore_pings = 0
@@ -418,7 +431,8 @@ class Iterative_Greedy_Geolocator:
 			                    mode=self.region_mode, slope=self.region_slope,
 			                    model=self.latency_model,
 			                    hypothesis_size=(self.selection in
-			                                     ('info_gain', 'risk_gain', 'phased')))
+			                                     ('info_gain', 'risk_gain', 'phased')),
+			                    rtt_model=self.rtt_model)
 			for dst in self.targets
 		}
 		self.measurements_used = {dst: set() for dst in self.targets}
@@ -692,7 +706,8 @@ class Iterative_Greedy_Geolocator:
 			# additive_batch_em).  The fitted params also reseed the shared
 			# model, so subsequent selection benefits.
 			estimates, mu_s, var_s, mu_t, var_t = additive_batch_em(
-				self.latency_model.rtts_by_pair, self.vp_locations)
+				self.latency_model.rtts_by_pair, self.vp_locations,
+				rtt_model=self.rtt_model)
 			self.latency_model.mu_s, self.latency_model.var_s = mu_s, var_s
 			self.latency_model.mu_t, self.latency_model.var_t = mu_t, var_t
 			for dst, est in estimates.items():

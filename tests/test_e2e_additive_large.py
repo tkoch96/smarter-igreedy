@@ -31,15 +31,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 import pytest
 
-from feasible_region_maintainer import FeasibleRegion, EM_GAUSSIAN, ADDITIVE
+from feasible_region_maintainer import FeasibleRegion, EM_GAUSSIAN, GAUSSIAN, ADDITIVE
 from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
 from perfect_geolocator import Perfect_Geolocator
-from probabilistic_helpers import KM_PER_MS, additive_batch_em
+from probabilistic_helpers import KM_PER_MS, additive_batch_em, FiberFloorRtt
 from test_e2e_additive_em import (
     _map_location, SRC_MU_RANGE, SRC_SIGMA_RANGE, DST_MU_RANGE,
     DST_SIGMA_RANGE, PATH_MU_RANGE, PATH_SIGMA_RANGE, MISSING_PENALTY_KM,
 )
 from utils import get_distance, LatLon
+
+# internet_gmaps (the fiber atlas) lives inside this repo; its modules
+# assume their own directory on sys.path (see its conftest.py)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'internet_gmaps'))
 
 LARGE_VP_LOCS: dict[str, LatLon] = {
     # Europe-weighted like real meshes, but global
@@ -270,3 +274,182 @@ class TestLargeAdditiveWorld:
             ylim=6500)
         assert os.path.exists(path)
         assert os.path.getsize(path) > 5_000
+
+
+# ---------------------------------------------------------------------------
+# Fiber-floor RttModel: plumbing + a toy world where the floor is the truth
+# ---------------------------------------------------------------------------
+# This synthetic harness's ground truth is rtt = d/100 + offsets, so a fiber
+# strategy here can only prove PLUMBING: injecting FiberFloorRtt with a mock
+# atlas whose floor IS the geodesic must change nothing, bit for bit.  The
+# toy-fiber-world test below builds the complementary world where the truth
+# follows a detouring cable — there the fiber model must win.
+
+class _GeodesicFloorEstimator:
+    """Mock atlas: floor(vp, x) = geodesic / KM_PER_MS.  Module-level so
+    regions holding it survive the greedy's worker pickling."""
+
+    def __init__(self, vp_locs: list[LatLon]) -> None:
+        self.vp_locs = [(float(a), float(b)) for a, b in vp_locs]
+
+    def floor_ms(self, lat: float, lon: float) -> np.ndarray:
+        return np.array([get_distance(vp, (lat, lon)) / KM_PER_MS
+                         for vp in self.vp_locs])
+
+
+def _mock_fiber_model(vp_locs_dict: dict[str, LatLon]) -> FiberFloorRtt:
+    locs = list(vp_locs_dict.values())
+    return FiberFloorRtt(estimator=_GeodesicFloorEstimator(locs),
+                         vp_locs=locs, slope=1.0, offset_ms=0.0)
+
+
+class TestFiberPlumbing:
+    def test_additive_batch_em_unchanged_under_mock_fiber(self):
+        sc = make_large_scenario(0)
+        seen = {(s, t): list(rs)
+                for s, dsts in sc['data']['loc_loc_meas'].items()
+                for t, rs in dsts.items()}
+        base, mu_s_b, _, mu_t_b, _ = additive_batch_em(seen, LARGE_VP_LOCS)
+        mock = _mock_fiber_model(LARGE_VP_LOCS)
+        fib, mu_s_f, _, mu_t_f, _ = additive_batch_em(seen, LARGE_VP_LOCS,
+                                                      rtt_model=mock)
+        assert base.keys() == fib.keys()
+        for t in base:
+            assert base[t] == fib[t], t
+        assert mu_s_b == mu_s_f and mu_t_b == mu_t_f
+
+    def test_gaussian_map_unchanged_under_mock_fiber(self):
+        # slope=1.0: at other slopes (slope*d)/100 vs slope*(d/100) differ
+        # in the last ulp and Nelder-Mead amplifies it — the injection's
+        # bit-exactness contract is defined at the shared base term
+        sc = make_large_scenario(1)
+        llm = sc['data']['loc_loc_meas']
+        mock = _mock_fiber_model(LARGE_VP_LOCS)
+        for t in list(sc['targets'])[:5]:
+            batch = [(LARGE_VP_LOCS[s], llm[s][t][0]) for s in LARGE_VP_LOCS]
+            plain = FeasibleRegion(t, mode=GAUSSIAN, slope=1.0)
+            plain.add_measurements_batch(batch)
+            fiber = FeasibleRegion(t, mode=GAUSSIAN, slope=1.0, rtt_model=mock)
+            fiber.add_measurements_batch(batch)
+            assert plain.get_location() == fiber.get_location(), t
+            assert plain.get_region_size() == fiber.get_region_size(), t
+
+    def test_greedy_curves_unchanged_under_mock_fiber(self):
+        sc = make_large_scenario(2)
+        budgets = (100, 300)
+        curves = {}
+        for name, model in (('plain', None),
+                            ('fiber', _mock_fiber_model(LARGE_VP_LOCS))):
+            ig = Iterative_Greedy_Geolocator(
+                max_workers=1, region_mode=ADDITIVE, model_refit_every=10,
+                selection='risk_gain', rtt_model=model)
+            ig.set_data(sc['data'])
+            ig.solve()
+            try:
+                vals = []
+                for b in budgets:
+                    ig.measurements(b)
+                    vals.append(_avg_err(ig.get_current_estimates(),
+                                         sc['targets']))
+                curves[name] = vals
+            finally:
+                ig.cleanup()
+        assert curves['plain'] == curves['fiber']
+
+
+# Toy fiber world: a C-shaped cable A(0,0) -> B(0,15) -> C(10,15) -> D(10,0).
+# Fiber A->D runs ~40 equator-degrees while the geodesic is ~10 — exactly
+# the detour regime (Colombo/Cape-Town class) where geodesic circles and
+# fiber isochrones disagree.  Ground truth rtt = 1.0*floor + offsets + noise.
+# VPs sit at all four corners: with VPs on one side only, every floor
+# shifts by the same constant along the cable and the per-target offset
+# absorbs position exactly (a linear cable cannot trilaterate itself) —
+# the far-end VP provides the opposing floor gradient that pins position.
+
+TOY_VPS: dict[str, LatLon] = {
+    'vp_a': (0.0, 0.0),
+    'vp_b': (0.0, 15.0),
+    'vp_c': (10.0, 15.0),
+    'vp_d': (10.0, 0.0),
+}
+
+
+def _toy_fiber_graph():
+    from fiber_graph import GraphBuilder
+
+    b = GraphBuilder(snap_tolerance_km=1.0)
+    path = ([(0.0, float(lon)) for lon in range(0, 16)]            # A -> B
+            + [(float(lat), 15.0) for lat in range(1, 11)]         # B -> C
+            + [(10.0, float(lon)) for lon in range(14, -1, -1)])   # C -> D
+    b.add_path(path)
+    return b.build()
+
+
+def make_toy_fiber_scenario(seed: int) -> dict:
+    from floor_query import FloorEstimator
+
+    graph = _toy_fiber_graph()
+    rng = np.random.default_rng(seed + 20_000_000)
+    vp_names = list(TOY_VPS)
+    est = FloorEstimator(graph,
+                         [TOY_VPS[v][0] for v in vp_names],
+                         [TOY_VPS[v][1] for v in vp_names])
+
+    targets = {}
+    # 8 targets along the far C->D leg (deep in detour territory), 4 near B
+    spots = ([(10.0, float(lon)) for lon in (0.0, 2.0, 4.0, 6.0, 8.0, 10.0,
+                                             12.0, 13.0)]
+             + [(0.0, 12.0), (2.0, 15.0), (0.0, 9.0), (5.0, 15.0)])
+    for i, (lat, lon) in enumerate(spots):
+        targets[f't{i:02d}'] = {
+            'loc': (lat + float(rng.normal(0, 0.15)),
+                    lon + float(rng.normal(0, 0.15))),
+            'mu': float(rng.uniform(2.0, 6.0)),
+        }
+    src_mu = {s: float(rng.uniform(2.0, 6.0)) for s in vp_names}
+
+    loc_loc_meas: dict[str, dict[str, list[float]]] = {}
+    for v, s in enumerate(vp_names):
+        loc_loc_meas[s] = {}
+        for t, tp in targets.items():
+            floor = float(est.floor_ms(tp['loc'][0], tp['loc'][1])[v])
+            assert np.isfinite(floor)
+            loc_loc_meas[s][t] = [floor + src_mu[s] + tp['mu']
+                                  + abs(float(rng.normal(0.0, 0.5)))]
+    return {'targets': targets, 'graph': graph, 'estimator': est,
+            'data': {'address_to_loc': dict(TOY_VPS),
+                     'loc_loc_meas': loc_loc_meas}}
+
+
+class TestToyFiberWorld:
+    def test_fiber_model_beats_geodesic_when_truth_is_fiber(self):
+        errs = {'geodesic': [], 'fiber': [], 'nn': []}
+        for seed in range(2):
+            sc = make_toy_fiber_scenario(seed)
+            seen = {(s, t): list(rs)
+                    for s, dsts in sc['data']['loc_loc_meas'].items()
+                    for t, rs in dsts.items()}
+            fiber_model = FiberFloorRtt(
+                estimator=sc['estimator'], vp_locs=list(TOY_VPS.values()),
+                slope=1.0, offset_ms=0.0)
+            geo_est, *_ = additive_batch_em(seen, TOY_VPS)
+            fib_est, *_ = additive_batch_em(seen, TOY_VPS,
+                                            rtt_model=fiber_model)
+            best = {}
+            for (s, t), rs in seen.items():
+                if t not in best or min(rs) < best[t][0]:
+                    best[t] = (min(rs), s)
+            nn_est = {t: TOY_VPS[s] for t, (_, s) in best.items()}
+            errs['geodesic'].append(_avg_err(geo_est, sc['targets']))
+            errs['fiber'].append(_avg_err(fib_est, sc['targets']))
+            errs['nn'].append(_avg_err(nn_est, sc['targets']))
+        geo_mean = float(np.mean(errs['geodesic']))
+        fib_mean = float(np.mean(errs['fiber']))
+        nn_mean = float(np.mean(errs['nn']))
+        print(f"\ntoy fiber world: geodesic={geo_mean:.0f} "
+              f"fiber={fib_mean:.0f} nn={nn_mean:.0f} km")
+        # the whole point of the atlas: when routes follow the cable, the
+        # fiber model dominates both the geodesic model and coverage-NN
+        assert fib_mean < 0.5 * geo_mean
+        assert fib_mean < 0.5 * nn_mean
+        assert fib_mean < 300.0

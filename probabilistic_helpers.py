@@ -89,7 +89,8 @@ def residual_nll(residual_ms: float, sigma_ms: float,
 
 def gaussian_nll(point: LatLon, constraints: list[ProbConstraint],
                  slope: float = 1.0,
-                 noise_model: str = GAUSSIAN_NOISE) -> float:
+                 noise_model: str = GAUSSIAN_NOISE,
+                 rtt_model: 'RttModel' = None) -> float:
     """
     Negative log-posterior for `point` given `constraints`.
 
@@ -105,6 +106,8 @@ def gaussian_nll(point: LatLon, constraints: list[ProbConstraint],
     constraints : list of (vp_loc, sigma_ms, rtt_ms)
     slope       : assumed routing-overhead factor, expected rtt = slope * d/100
     noise_model : GAUSSIAN_NOISE | STUDENT_T_NOISE | ASYMMETRIC_NOISE
+    rtt_model   : optional injected base model replacing the d/100 term
+                  (expected rtt = slope * rtt_model.base_ms(vp, point))
 
     Returns
     -------
@@ -116,14 +119,18 @@ def gaussian_nll(point: LatLon, constraints: list[ProbConstraint],
     lat, lon = point
     total = 0.0
     for (vp_lat, vp_lon), sigma_ms, rtt_ms in constraints:
-        dist_km = get_distance((lat, lon), (vp_lat, vp_lon))
-        expected_rtt = slope * dist_km / KM_PER_MS
+        if rtt_model is None:
+            dist_km = get_distance((lat, lon), (vp_lat, vp_lon))
+            expected_rtt = slope * dist_km / KM_PER_MS
+        else:
+            expected_rtt = slope * rtt_model.base_ms((vp_lat, vp_lon), (lat, lon))
         total += residual_nll(rtt_ms - expected_rtt, sigma_ms, noise_model)
     return total
 
 
 def mean_absolute_residual(point: LatLon, constraints: list[ProbConstraint],
-                           slope: float = 1.0) -> float:
+                           slope: float = 1.0,
+                           rtt_model: 'RttModel' = None) -> float:
     """
     Mean absolute RTT residual at `point` across all constraints.
 
@@ -146,8 +153,11 @@ def mean_absolute_residual(point: LatLon, constraints: list[ProbConstraint],
     lat, lon = point
     residuals = []
     for (vp_lat, vp_lon), _sigma, rtt_ms in constraints:
-        dist_km = get_distance((lat, lon), (vp_lat, vp_lon))
-        expected_rtt = slope * dist_km / KM_PER_MS
+        if rtt_model is None:
+            dist_km = get_distance((lat, lon), (vp_lat, vp_lon))
+            expected_rtt = slope * dist_km / KM_PER_MS
+        else:
+            expected_rtt = slope * rtt_model.base_ms((vp_lat, vp_lon), (lat, lon))
         residuals.append(abs(rtt_ms - expected_rtt))
     return sum(residuals) / len(residuals)
 
@@ -292,6 +302,7 @@ def posterior_mean_grid(
     constraints: list[ProbConstraint],
     lat_resolution: float = 1.0,
     lon_resolution: float = 1.0,
+    rtt_model: 'RttModel' = None,
 ) -> LatLon:
     """
     Posterior mean location via grid integration (Path 2).
@@ -320,8 +331,11 @@ def posterior_mean_grid(
 
     log_p = np.zeros_like(LATS)
     for (vp_lat, vp_lon), sigma_ms, rtt_ms in constraints:
-        dist_km = haversine_grid(vp_lat, vp_lon, LATS, LONS)
-        expected_rtt = dist_km / KM_PER_MS
+        if rtt_model is None:
+            dist_km = haversine_grid(vp_lat, vp_lon, LATS, LONS)
+            expected_rtt = dist_km / KM_PER_MS
+        else:
+            expected_rtt = rtt_model.base_ms_grid((vp_lat, vp_lon), LATS, LONS)
         log_p += -((rtt_ms - expected_rtt) ** 2) / (2.0 * sigma_ms ** 2)
 
     # Numerical stability: subtract max before exp
@@ -332,6 +346,195 @@ def posterior_mean_grid(
     lat_est = float(np.sum(weights * LATS))
     lon_est = float(np.sum(weights * LONS))
     return lat_est, lon_est
+
+
+# ---------------------------------------------------------------------------
+# Injectable base RTT models:  what replaces the d / KM_PER_MS term
+# ---------------------------------------------------------------------------
+# Every estimator in this project converts VP->candidate geometry into an
+# expected baseline RTT.  Historically that conversion was hardwired as
+# geodesic-at-fiber-speed (d / KM_PER_MS, scaled by a mode-level slope or
+# added to per-node offsets).  RttModel makes the conversion injectable so
+# the fiber-atlas floor (internet_gmaps) can replace the geodesic term:
+# the floor is a function of the two COORDINATES, not of their distance —
+# a fiber isochrone is not a circle.
+#
+# Contract: base_ms(vp_loc, loc) returns the SOL-equivalent baseline in ms,
+# i.e. exactly the quantity d / KM_PER_MS used to be.  Mode-level slopes
+# (gaussian / em_gaussian) multiply it; additive offsets add to it.  Every
+# call site keeps a `rtt_model=None` default that preserves the original
+# geodesic expression bit-for-bit, so existing behavior and tests are
+# untouched unless a model is passed.
+
+class RttModel:
+    """Base predictive RTT between two points (the d/KM_PER_MS term)."""
+
+    def base_ms(self, vp_loc: LatLon, loc: LatLon) -> float:
+        raise NotImplementedError
+
+    def base_ms_many(self, vp_loc: LatLon, locs: list[LatLon]) -> list[float]:
+        return [self.base_ms(vp_loc, loc) for loc in locs]
+
+    def base_ms_rows(self, vp_locs: list[LatLon], loc: LatLon) -> list[float]:
+        """base_ms for many VPs at one point (subclasses may batch)."""
+        return [self.base_ms(vp_loc, loc) for vp_loc in vp_locs]
+
+    def base_ms_grid(self, vp_loc: LatLon, lats: np.ndarray,
+                     lons: np.ndarray) -> np.ndarray:
+        out = np.empty_like(lats, dtype=float)
+        it = np.nditer(lats, flags=['multi_index'])
+        for _ in it:
+            idx = it.multi_index
+            out[idx] = self.base_ms(vp_loc, (float(lats[idx]), float(lons[idx])))
+        return out
+
+
+class GeodesicRtt(RttModel):
+    """Today's behavior as an object: slope × geodesic_km / KM_PER_MS."""
+
+    def __init__(self, slope: float = 1.0) -> None:
+        self.slope = slope
+
+    def base_ms(self, vp_loc: LatLon, loc: LatLon) -> float:
+        return self.slope * get_distance(vp_loc, loc) / KM_PER_MS
+
+    def base_ms_grid(self, vp_loc: LatLon, lats: np.ndarray,
+                     lons: np.ndarray) -> np.ndarray:
+        return self.slope * haversine_grid(vp_loc[0], vp_loc[1], lats, lons) / KM_PER_MS
+
+
+# Process-global estimator registry: fiber floor estimators hold tens of MB
+# of per-VP distance fields, which must never ride along when a region (and
+# its model) is pickled to a utility-evaluation worker.  A FiberFloorRtt
+# built with `estimator_factory=` pickles as (factory, token) only; each
+# process builds the estimator once, on first use, and shares it here.
+_FIBER_ESTIMATORS: dict[str, Any] = {}
+
+DEFAULT_FIBER_SLOPE = 1.3   # validated inflation over the raw floor (atlas)
+
+
+class FiberFloorRtt(RttModel):
+    """slope × fiber_floor(vp, loc) + offset_ms, floors from an
+    internet_gmaps FloorEstimator / PolicyFloorEstimator.
+
+    `vp_locs` must be the (lat, lon) list aligned with the estimator's VP
+    rows — base_ms looks its vp_loc argument up in that list.  Floors are
+    memoized per exact query point (keys are exact so a cached neighbor
+    can never stand in for the queried point).  When the estimator
+    supports VP-subset queries (PolicyFloorEstimator.floor_ms_subset),
+    only the VPs actually asked about are computed — with hundreds of
+    VPs, a region's MAP loop touches ~20 of them; base_ms_rows batches
+    one subset lookup per optimizer point.
+
+    inf handling: a PolicyFloorEstimator already falls back to the OPEN
+    floor where the policy allows no route.  If the OPEN floor itself is
+    inf (the point is beyond lastmile_km_max of all mapped infrastructure),
+    base_ms falls back to the geodesic at fiber speed — the only finite
+    admissible bound left (floor ≥ geodesic always); the atlas simply has
+    nothing to say there.
+
+    Pickling: pass `estimator_factory` (a picklable zero-arg callable
+    rebuilding the estimator) and the instance pickles without the
+    estimator or caches; workers rebuild once per process (keyed by
+    `cache_token`).  Without a factory the estimator itself is pickled —
+    fine for small graphs and tests only.
+    """
+
+    def __init__(self, estimator=None, vp_locs: list[LatLon] = (),
+                 slope: float = DEFAULT_FIBER_SLOPE, offset_ms: float = 0.0,
+                 estimator_factory=None, cache_token: str = None) -> None:
+        if estimator is None and estimator_factory is None:
+            raise ValueError("need an estimator or an estimator_factory")
+        self.slope = slope
+        self.offset_ms = offset_ms
+        # () = derive from the estimator (vp_lat/vp_lon or vp_locs attrs)
+        # on first use, so pickles carry no per-VP payload
+        self.vp_locs = [(float(a), float(b)) for a, b in vp_locs]
+        self._factory = estimator_factory
+        self._token = cache_token or (repr(estimator_factory)
+                                      if estimator_factory else None)
+        self._estimator = estimator
+        self._vp_idx: dict = None
+        self._floor_cache: dict[tuple, dict[int, float]] = {}
+
+    _FLOOR_CACHE_MAX = 200_000
+
+    @property
+    def estimator(self):
+        if self._estimator is None:
+            est = _FIBER_ESTIMATORS.get(self._token)
+            if est is None:
+                est = self._factory()
+                _FIBER_ESTIMATORS[self._token] = est
+            self._estimator = est
+        return self._estimator
+
+    @property
+    def vp_idx(self):
+        if self._vp_idx is None:
+            locs = self.vp_locs
+            if not locs:
+                est = self.estimator
+                if hasattr(est, 'vp_lat'):
+                    locs = list(zip(map(float, est.vp_lat),
+                                    map(float, est.vp_lon)))
+                else:
+                    locs = [(float(a), float(b)) for a, b in est.vp_locs]
+            self._vp_idx = {(round(a, 6), round(b, 6)): i
+                            for i, (a, b) in enumerate(locs)}
+        return self._vp_idx
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_floor_cache'] = {}
+        state['_vp_idx'] = None
+        if self._factory is not None:
+            state['_estimator'] = None
+        return state
+
+    def _floors_at(self, loc: LatLon, vs: list[int]) -> dict[int, float]:
+        """Floors for the given VP rows at loc, via the per-point memo.
+        {v: floor_ms}; missing rows are fetched in one subset call when
+        the estimator supports it, else via one full-vector call."""
+        key = (float(loc[0]), float(loc[1]))
+        entry = self._floor_cache.get(key)
+        if entry is None:
+            if len(self._floor_cache) >= self._FLOOR_CACHE_MAX:
+                self._floor_cache.clear()
+            entry = self._floor_cache[key] = {}
+        missing = [v for v in vs if v not in entry]
+        if missing:
+            est = self.estimator
+            if hasattr(est, 'floor_ms_subset'):
+                vals = est.floor_ms_subset(loc[0], loc[1], missing)
+                for v, f in zip(missing, vals):
+                    entry[v] = float(f)
+            else:
+                for v, f in enumerate(np.asarray(est.floor_ms(loc[0], loc[1]))):
+                    entry[v] = float(f)
+        return entry
+
+    def _vp_row(self, vp_loc: LatLon) -> int:
+        return self.vp_idx[(round(vp_loc[0], 6), round(vp_loc[1], 6))]
+
+    def base_ms(self, vp_loc: LatLon, loc: LatLon) -> float:
+        v = self._vp_row(vp_loc)
+        f = self._floors_at(loc, [v])[v]
+        if not math.isfinite(f):
+            f = get_distance(vp_loc, loc) / KM_PER_MS
+        return self.slope * f + self.offset_ms
+
+    def base_ms_rows(self, vp_locs: list[LatLon], loc: LatLon) -> list[float]:
+        """base_ms for many VPs at one point — one subset lookup total."""
+        vs = [self._vp_row(vp) for vp in vp_locs]
+        floors = self._floors_at(loc, sorted(set(vs)))
+        out = []
+        for vp_loc, v in zip(vp_locs, vs):
+            f = floors[v]
+            if not math.isfinite(f):
+                f = get_distance(vp_loc, loc) / KM_PER_MS
+            out.append(self.slope * f + self.offset_ms)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -422,11 +625,13 @@ def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
     return mu_s, var_s, mu_t, var_t
 
 
-def additive_map_location(constraint_rows: list, starts: list[LatLon]) -> LatLon:
+def additive_map_location(constraint_rows: list, starts: list[LatLon],
+                          rtt_model: 'RttModel' = None) -> LatLon:
     """
     MAP location under the additive model.  constraint_rows are
     (vp_loc, rtt_ms, mean_offset_ms, var_sum_ms2) — expected rtt =
-    d/100 + mean_offset, per-measurement weight 1/var_sum.
+    base + mean_offset, per-measurement weight 1/var_sum, where base is
+    d/100 or the injected rtt_model's floor term.
 
     Nelder-Mead is local, so several starts are tried and the best kept:
     always pass the previous estimate AND the NN anchor (lowest-RTT VP) —
@@ -434,12 +639,23 @@ def additive_map_location(constraint_rows: list, starts: list[LatLon]) -> LatLon
     """
     from scipy.optimize import minimize
 
-    def nll(x):
-        total = 0.0
-        for vp_loc, rtt, mean_off, var_sum in constraint_rows:
-            r = rtt - get_distance((x[0], x[1]), vp_loc) / KM_PER_MS - mean_off
-            total += r * r / (2.0 * var_sum)
-        return total
+    if rtt_model is None:
+        def nll(x):
+            total = 0.0
+            for vp_loc, rtt, mean_off, var_sum in constraint_rows:
+                r = rtt - get_distance((x[0], x[1]), vp_loc) / KM_PER_MS - mean_off
+                total += r * r / (2.0 * var_sum)
+            return total
+    else:
+        row_vps = [row[0] for row in constraint_rows]
+
+        def nll(x):
+            bases = rtt_model.base_ms_rows(row_vps, (x[0], x[1]))
+            total = 0.0
+            for (vp_loc, rtt, mean_off, var_sum), base in zip(constraint_rows, bases):
+                r = rtt - base - mean_off
+                total += r * r / (2.0 * var_sum)
+            return total
 
     best, best_val = None, float('inf')
     for start in starts:
@@ -451,7 +667,7 @@ def additive_map_location(constraint_rows: list, starts: list[LatLon]) -> LatLon
 
 
 def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
-                      n_iters: int = 4):
+                      n_iters: int = 4, rtt_model: 'RttModel' = None):
     """
     Fresh batch fit of the additive model: params-first alternation from
     NN-anchored location inits (both paid-for pitfalls baked in — never
@@ -466,6 +682,9 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
 
     rtts_by_pair: {(src, dst): [rtt_ms, ...]}
     vp_locs:      {src: (lat, lon)} — pairs with unknown srcs are ignored.
+    rtt_model:    optional injected base model — residuals and the MAP are
+                  computed against its floor term instead of d/100 (the
+                  per-node offsets then learn slack over the floor).
 
     Returns (estimates, mu_s, var_s, mu_t, var_t).
     """
@@ -482,11 +701,15 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
     nn_est = {t: vp_locs[s] for t, (_, s) in best.items()}
     estimates = dict(nn_est)
 
+    def base(s, t):
+        if rtt_model is None:
+            return get_distance(vp_locs[s], estimates[t]) / KM_PER_MS
+        return rtt_model.base_ms(vp_locs[s], estimates[t])
+
     mu_s = var_s = mu_t = var_t = {}
     for _ in range(n_iters):
         residuals = {
-            (s, t): [r - get_distance(vp_locs[s], estimates[t]) / KM_PER_MS
-                     for r in rs]
+            (s, t): [r - base(s, t) for r in rs]
             for (s, t), rs in pairs.items()
         }
         mu_s, var_s, mu_t, var_t = fit_additive_params(residuals)
@@ -494,7 +717,8 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
             rows = [(vp_locs[s], r, mu_s[s] + mu_t[t], var_s[s] + var_t[t])
                     for (s, t2), rs in pairs.items() if t2 == t
                     for r in rs]
-            estimates[t] = additive_map_location(rows, [estimates[t], nn_est[t]])
+            estimates[t] = additive_map_location(rows, [estimates[t], nn_est[t]],
+                                                 rtt_model=rtt_model)
 
     return estimates, mu_s, var_s, mu_t, var_t
 
@@ -516,10 +740,14 @@ class AdditiveLatencyModel:
       predict(src, dst, dist_km) → (expected_rtt_ms, var_ms2)  with
           expected rtt = d/100 + μ̂_s + μ̂_t and var = σ̂_s² + σ̂_t².
           Unknown nodes fall back to the priors.
+      predict_at(src, dst, src_loc, loc) → same, but the base term comes
+          from the injected rtt_model when one is set (coordinates, not
+          distance — a fiber floor is not a function of d).
       sigma_dst(dst) → σ̂_t, the "stop sinking budget here" signal.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, rtt_model: 'RttModel' = None) -> None:
+        self.rtt_model = rtt_model
         self.rtts_by_pair: dict[tuple[str, str], list[float]] = {}
         self.mu_s: dict[str, float] = {}
         self.var_s: dict[str, float] = {}
@@ -529,11 +757,17 @@ class AdditiveLatencyModel:
     def record(self, src: str, dst: str, rtts: list[float]) -> None:
         self.rtts_by_pair.setdefault((src, dst), []).extend(rtts)
 
+    def base_ms(self, src_loc: LatLon, loc: LatLon) -> float:
+        """The model's baseline RTT term between two points (d/100, or the
+        injected rtt_model's floor)."""
+        if self.rtt_model is None:
+            return get_distance(src_loc, loc) / KM_PER_MS
+        return self.rtt_model.base_ms(src_loc, loc)
+
     def refit(self, vp_locs: dict[str, LatLon],
               estimates: dict[str, LatLon]) -> None:
         residuals = {
-            (s, t): [r - get_distance(vp_locs[s], estimates[t]) / KM_PER_MS
-                     for r in rs]
+            (s, t): [r - self.base_ms(vp_locs[s], estimates[t]) for r in rs]
             for (s, t), rs in self.rtts_by_pair.items()
             if t in estimates and s in vp_locs
         }
@@ -551,6 +785,11 @@ class AdditiveLatencyModel:
 
     def predict(self, src: str, dst: str, dist_km: float) -> tuple[float, float]:
         return (dist_km / KM_PER_MS + self.mean_offset(src, dst),
+                self.var_sum(src, dst))
+
+    def predict_at(self, src: str, dst: str, src_loc: LatLon,
+                   loc: LatLon) -> tuple[float, float]:
+        return (self.base_ms(src_loc, loc) + self.mean_offset(src, dst),
                 self.var_sum(src, dst))
 
     def sigma_dst(self, dst: str) -> float:
