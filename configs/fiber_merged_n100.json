@@ -1,0 +1,8 @@
+{
+  "data": "merged",
+  "n_sources": 100,
+  "n_targets": 100,
+  "fiber": true,
+  "budgets": [200, 500, 800, 1200, 1600, 2000, 2500],
+  "workers": 6
+}

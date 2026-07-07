@@ -236,6 +236,22 @@ DIVERGE (4,161→4,778 and 4,426→5,433); random+NN grinds to 1,620 at
 b=2,000 and wins means from ~b=900 on; smart_perfect (scored through the
 NN converter) sits at ~615.
 
+Fiber-floor result (2026-07-06, assess_fiber_real.py, merged mesh n=100 =
+58 dense + 42 campaign, seed 31415, b=2500): swapping the geodesic d/100
+base term for the internet_gmaps policy floor (v3.2 × 1.3, RttModel
+injection) breaks the greedy plateau — greedy_phased_fiber 1532/748
+(mean/median km) vs geodesic greedy_phased 1933/1246, and the fiber
+additive estimator on RANDOM pings (1695/785) beats the geodesic greedy.
+Dense targets: 871/599 vs 1607/970. Ridge failures collapse (Guadeloupe
+9689→713, Japan 11937→3005); losses concentrate where the atlas floor is
+loose (NZ/MY/SG endpoint trombone) — slack, not structure. Replicates at
+10× scale (2026-07-07, 1000×1000, b=15000): fiber greedy 1675/800 vs
+geodesic greedy 2086/1142, oracle 1523/612; at 200 sources × 1000 targets
+coverage binds (oracle only ~8% better than NN) and fiber ties NN.
+⚠️ fiber runs grow internet_gmaps/data/cache/policy_fields/ at ~250KB ×
+n_vps × ~90 classes (22GB at 1000 VPs) — prune between VP sets. Full
+report: `.claude/FIBER_GEOLOCATOR_RESULTS.md`.
+
 `get_random_subsample(n=100)` **mutates `target_data` in place** — subsequent
 re-runs operate on already-pruned data.
 
@@ -434,13 +450,34 @@ TargetData = dict[str, Any]                    # 'address_to_loc' + 'loc_loc_mea
 ## File map
 
 ```
-assess_geolocators.py              entry point / comparator harness
+assess_geolocators.py              entry point / comparator harness.  Fully
+                                   parametrized — argparse CLI (--help), --config
+                                   JSON (see configs/), GEOLOC_* env vars (legacy);
+                                   precedence CLI > config > env > defaults; no
+                                   settings = the historical default run.  Covers:
+                                   data source legacy|merged, independent
+                                   n_sources/n_targets (lazy-greedy coverage source
+                                   selection for the asymmetric merged mesh),
+                                   per-target VP cap, fiber-floor variants
+                                   (--fiber), budget grids, fig-name/tag, per-target
+                                   error recording + per-region breakdown.  All
+                                   artifacts named by shape <srcs>src_<dsts>dst
+                                   (figures/geolocator_results_<shape>.pdf,
+                                   cache/geolocator_run_<shape>.pkl).  Estimation
+                                   variants are per-instance settings
+                                   (Random_Geolocator converter_mode= / rtt_model=
+                                   / order_seed=), NOT separate harnesses.  README
+                                   "Running experiments" documents the settings
+                                   matrix.
 assess_additive_real.py            real-mesh estimator comparison at matched
                                    measurements (NN / em / em_asym / additive)
 assess_probabilistic.py            real-data Gaussian vs hard-circle sweep (analysis only)
 analyze_latency_distance.py        offline RTT vs distance model fitting (analysis only)
 feasible_region_maintainer.py      FeasibleRegion: hard_circle + gaussian modes
-probabilistic_helpers.py           pure NLL/sigma/grid helpers (no FeasibleRegion dep)
+probabilistic_helpers.py           pure NLL/sigma/grid helpers (no FeasibleRegion dep);
+                                   also RttModel / GeodesicRtt / FiberFloorRtt — the
+                                   injectable base-RTT term (replaces d/100; every call
+                                   site keeps rtt_model=None = old behavior bit-for-bit)
 iterative_greedy_geolocator.py     main algorithm
 perfect_geolocator.py              oracle baseline (has ground truth)
 random_geolocator.py               random baseline (shuffles measurement order only)

@@ -1,0 +1,10 @@
+{
+  "data": "merged",
+  "n_sources": 1000,
+  "n_targets": 1000,
+  "vps_per_target": 25,
+  "fiber": true,
+  "budgets": [1500, 4000, 8000, 15000],
+  "workers": 6,
+  "oracle_candidates": 25
+}

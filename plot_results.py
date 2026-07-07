@@ -48,6 +48,43 @@ def plot_error_over_budget(results_data, output_filename):
 	print(f"\nPlot saved successfully to {output_filename}")
 	# plt.show() # Uncomment if you are running this in a Jupyter Notebook or want a popup
 
+def plot_floor_sweep(results, targets_grid, sources_grid, output_filename):
+	"""'Perfect' floor vs target count, one color per source budget.
+	Solid = NN floor (lowest-RTT measured VP — smart_perfect's full-coverage
+	converged error), dotted = geometric floor (nearest measured VP — the
+	bound for any VP-reporting estimator).  Faint markers = individual
+	sampling seeds; lines join seed means."""
+	colors = {n_src: c for n_src, c in zip(
+		sources_grid, ['tab:red', 'tab:blue', 'tab:green', 'tab:purple', '0.4'])}
+	fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.6))
+	for ax, stat, ttl in ((ax1, 'mean', 'mean error'),
+	                      (ax2, 'med', 'median error')):
+		for n_src in sources_grid:
+			c = colors[n_src]
+			lbl = f"{n_src or 'all'} sources"
+			for kind, ls in (('nn', '-'), ('geo', ':')):
+				key = f'{kind}_{stat}'
+				ys = [np.mean(results[(n_src, n_t)][key]) for n_t in targets_grid]
+				ax.plot(targets_grid, ys, color=c, ls=ls, marker='o', ms=3,
+				        label=f"{lbl} ({'NN' if kind == 'nn' else 'geometric'} floor)")
+				for n_t in targets_grid:
+					ax.plot([n_t] * len(results[(n_src, n_t)][key]),
+					        results[(n_src, n_t)][key],
+					        ls='', marker='.', ms=2.5, color=c, alpha=0.35)
+		ax.set_xlabel('number of targets included')
+		ax.set_ylabel(f'"perfect" floor, {ttl} (km)')
+		ax.set_xscale('log')
+		ax.grid(alpha=0.3, which='both')
+		ax.legend(fontsize=7)
+	fig.suptitle('Full-coverage oracle floor vs target count — each source '
+	             'budget = best-k sources (greedy facility location); '
+	             'targets nested per seed', fontsize=10)
+	fig.tight_layout()
+	plt.savefig(output_filename, dpi=200, bbox_inches='tight')
+	plt.close(fig)
+	print(f"Floor sweep plot saved to {output_filename}")
+
+
 def plot_latency_vs_distance(target_data, output_filename="latency_vs_distance.png"):
 	"""
 	Plots the actual measured minimum RTT against the true geographic distance.
