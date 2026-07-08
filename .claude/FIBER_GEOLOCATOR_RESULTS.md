@@ -1,7 +1,10 @@
-# Fiber-floor geolocation — integration results (2026-07-06)
+# Fiber-floor geolocation — integration results (2026-07-06/07)
 
-Delivery report for HANDOFF_fiber_geolocator.md. All four tasks done; the
-verdict at the bottom is the part that feeds the next atlas iteration.
+What happened when the geolocator's geodesic-at-fiber-speed distance
+model was swapped for the learned fiber-floor atlas (internet_gmaps),
+and what the experiments showed. Open follow-ups live in
+`.claude/TODOS.md`; the atlas-side agenda in
+`.claude/HANDOFF_routing_realism.md`.
 
 ## What was built
 
@@ -95,14 +98,8 @@ verdict at the bottom is the part that feeds the next atlas iteration.
   the MAP a long way ALONG a cable, so slack errors are amplified
   directionally (worst case: a US campaign target thrown 907→7773 km).
   No new-ban candidate emerges from the loss set.
-- **Next lever, in order:** (1) per-region (or per-VP-informed) offsets
-  on top of the floor instead of the global 1.3 — the additive per-VP
-  offsets don't absorb DESTINATION-side trombone for thinly-measured
-  targets; a per-target offset prior keyed by region would. (2) Keep
-  hypothesis-ring GENERATION fiber-aware (rings around the best VP are
-  still geodesic constructs; scoring is already fiber-based) — cheap
-  win for ridge targets. (3) For campaign targets, more/better
-  measurements beat any model change (the oracle gap says so).
+  (The follow-ups this verdict implies are tracked in
+  `.claude/TODOS.md`.)
 
 ## Scaling runs (2026-07-07 overnight; mean/median km at final budget)
 
@@ -156,10 +153,9 @@ campaign targets stay coverage-limited (oracle 1713 there).
 ≈ 3 h, 1000×1000 ≈ 2.7 h wall. The one hazard is the policy-field disk
 cache: 22 GB at 1000 VPs (≈ n_vps × ~90 realized country-classes ×
 250 KB — a 1000-target sample realizes nearly the full signature space
-per VP). It was deleted after the runs. Before scaling further: store
-fields as float32, and/or cap realized classes per VP, and prune the
-cache between runs with different VP sets (keys include VP coordinates,
-so cross-run reuse is nil).
+per VP). It was deleted after the runs. Prune the cache between runs
+with different VP sets — keys include VP coordinates, so cross-run
+reuse is nil (footprint reduction options are tracked in TODOS.md).
 
 ## Floor-matched world: 200 best-placed sources × 100 targets (2026-07-07)
 
@@ -208,6 +204,6 @@ construction (well-placed VPs are NN's best case).
   Nelder-Mead excursions cross country borders, touching many classes
   per VP). Safe to `rm -rf` if space is needed — reruns rebuild lazily;
   keyed by policy NAME, so bump the name on rule changes or you'll read
-  stale physics. Consider float32 or class-capping before scaling up.
+  stale physics.
 - Full n=100 run ≈ 25 min on the laptop (6 workers), fiber greedy
   ≈ 13 min of it.

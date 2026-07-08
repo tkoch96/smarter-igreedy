@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS probe_health (
     prb_id INTEGER PRIMARY KEY, src_strikes INTEGER DEFAULT 0,
     dst_strikes INTEGER DEFAULT 0, ok_results INTEGER DEFAULT 0,
     sol_violations INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS surrogates (
+    prb_id INTEGER PRIMARY KEY, ip TEXT, hop_rtt_ms REAL,
+    local_rtt_ms REAL, ts REAL);
 """
 
 MAX_STRIKES = 3  # consecutive-ish failures before a probe is benched
@@ -37,9 +40,20 @@ class CampaignState:
 
     # -- pairs ------------------------------------------------------------
     def attempted_pairs(self):
-        """Unordered set of pairs already measured or in flight."""
+        """Unordered set of pairs already measured or in flight.
+
+        Exception: a FAILED pair whose dst got a surrogate address AFTER
+        the attempt is retryable — the address that failed is no longer
+        the address we ping, so the failure says nothing about the pair.
+        Failures newer than the surrogate (i.e. against the surrogate
+        itself) stay blocked as usual."""
+        surr_ts = dict(self.db.execute("SELECT prb_id, ts FROM surrogates"))
         out = set()
-        for s, d in self.db.execute("SELECT src, dst FROM pairs"):
+        for s, d, status, ts in self.db.execute(
+            "SELECT src, dst, status, ts FROM pairs"
+        ):
+            if status == "failed" and surr_ts.get(d, 0) > (ts or 0):
+                continue
             out.add((min(s, d), max(s, d)))
         return out
 
@@ -49,8 +63,15 @@ class CampaignState:
             "INSERT OR REPLACE INTO measurements VALUES (?,?,?,?,?,0)",
             (msm_id, dst_prb, dst_ip, len(src_prbs), now),
         )
+        # ON CONFLICT: the only pairs the scheduler re-issues are FAILED
+        # attempts forgiven because the dst since got a surrogate address
+        # (attempted_pairs); their row must follow the new measurement or
+        # result attribution breaks
         self.db.executemany(
-            "INSERT OR IGNORE INTO pairs VALUES (?,?,'pending',NULL,?,?)",
+            "INSERT INTO pairs VALUES (?,?,'pending',NULL,?,?) "
+            "ON CONFLICT(src, dst) DO UPDATE SET "
+            "status='pending', min_rtt=NULL, msm_id=excluded.msm_id, ts=excluded.ts "
+            "WHERE pairs.status='failed'",
             [(s, dst_prb, msm_id, now) for s in src_prbs],
         )
         self.db.commit()
@@ -98,6 +119,19 @@ class CampaignState:
             (msm_id,),
         )
         self.db.commit()
+
+    # -- surrogates ---------------------------------------------------------
+    def record_surrogate(self, prb_id, ip, hop_rtt_ms, local_rtt_ms):
+        self.db.execute(
+            "INSERT OR REPLACE INTO surrogates VALUES (?,?,?,?,?)",
+            (prb_id, ip, hop_rtt_ms, local_rtt_ms, time.time()),
+        )
+        self.db.commit()
+
+    def surrogates(self):
+        """{prb_id: surrogate ip} for probes whose dead listed address has
+        a verified in-network stand-in (see surrogates.py)."""
+        return dict(self.db.execute("SELECT prb_id, ip FROM surrogates"))
 
     # -- probe health -------------------------------------------------------
     def _bump(self, prb_id, column, amount=1):

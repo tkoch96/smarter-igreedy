@@ -9,11 +9,22 @@ fiber-atlas geodesic floor (also results.py). This module only filters to
 probes whose claims are worth testing.
 """
 
+import ipaddress
 import json
 import time
 from pathlib import Path
 
 from . import atlas_api
+
+
+def _is_global_v4(ip):
+    """Explicit bogon screen (RFC1918/CGNAT/loopback/etc.). RIPE's
+    address_v4 has been clean in practice, but traceroute-derived
+    surrogate addresses make this a hard requirement, not an assumption."""
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
 CACHE = Path(__file__).parent / "data" / "probe_inventory.json"
 FIELDS = "id,address_v4,asn_v4,country_code,geometry,status,tags,is_anchor"
@@ -35,6 +46,7 @@ def fetch_inventory(cache_path=CACHE, max_age_h=24.0, verbose=True):
         tags = {t["slug"] for t in p.get("tags", [])}
         if (
             p.get("address_v4")
+            and _is_global_v4(p["address_v4"])
             and p.get("asn_v4")
             and p.get("country_code")
             and p.get("geometry")

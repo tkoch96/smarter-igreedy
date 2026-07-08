@@ -18,6 +18,7 @@ import argparse
 import time
 
 from . import atlas_api
+from .anycast import is_anycast, load_anycast_slash24s
 from .inventory import fetch_inventory
 from .results import pull_open_measurements
 from .scheduler import DiversityScheduler
@@ -45,6 +46,19 @@ def run_daily(
     state = state or CampaignState()
     probes = fetch_inventory()
     by_id = {p["id"]: p for p in probes}
+
+    # dead listed addresses get their verified in-network surrogate
+    # (surrogates.py); anycast-listed probes are sources only (anycast.py)
+    surr = state.surrogates()
+    n_sub = 0
+    for p in probes:
+        if p["id"] in surr:
+            p["ip"] = surr[p["id"]]
+            n_sub += 1
+    anycast_24s = load_anycast_slash24s()
+    no_dst = {p["id"] for p in probes if is_anycast(p["ip"], anycast_24s)}
+    if n_sub or no_dst:
+        print(f"   {n_sub} surrogate dst addresses; {len(no_dst)} anycast probes src-only")
 
     print("== (a)+(b) pulling results of open measurements")
     outcomes = pull_open_measurements(state, by_id)
@@ -76,6 +90,7 @@ def run_daily(
         successful_pairs=successful,
         benched=state.benched_probes(),
         verified_dsts=state.verified_dsts() | anchors,
+        no_dst=no_dst,
         seed=seed if seed is not None else int(time.time()),
     )
     batches = sched.plan_batches(n_pairs)

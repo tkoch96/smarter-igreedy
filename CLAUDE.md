@@ -12,7 +12,9 @@ intuitive approaches are considered cheating, and the model ladder (how each
 estimation idea motivated the next).
 
 Entry point: `assess_geolocators.py` → `Geolocator_Comparator.run()`.
-Current work: `.claude/HANDOFF_next_steps.md`; open items: `.claude/TODOS.md`.
+Latest results: `.claude/FIBER_GEOLOCATOR_RESULTS.md` (fiber-floor
+integration + scaling runs); atlas research agenda:
+`.claude/HANDOFF_routing_realism.md`; open items: `.claude/TODOS.md`.
 
 ---
 
@@ -433,7 +435,11 @@ python3 -m pytest tests/ -v
 - `solve()` must call `_update_best_vp_for_target(dst)` for every target to
   seed `best_vp_cache` — without this, `measurements()` infinite-loops.
 
-**Current status**: iterative greedy does not yet beat random. See `.claude/TODOS.md`.
+**Current status**: greedy_phased beats random+NN on means from n=200
+scale up (see "Real-mesh scaling result" above); with the fiber-floor
+base model it is the best honest strategy at every tested shape
+(`.claude/FIBER_GEOLOCATOR_RESULTS.md`). Random+NN keeps the median
+lead wherever a VP sits close to the median target (its home regime).
 
 ---
 
@@ -525,7 +531,28 @@ tests/plot_region_convergence.py      filmstrip: 1:1 spatial companion to the cu
                                       uncertainty circle, per strategy over budget
                                       (writes tests/region_convergence.pdf)
 
+configs/                           ready-made experiment configs for
+                                   assess_geolocators --config (fiber n=100,
+                                   200x1000, 1000x1000)
+
+internet_gmaps/                    the fiber atlas: infrastructure graph
+                                   (fiber_graph.py + build_graph.py from
+                                   TeleGeography/ITU snapshots), exact floor
+                                   queries (floor_query.py: FloorEstimator +
+                                   PolicyFloorEstimator — policy-aware floors
+                                   for arbitrary points, lazy per-(VP, class)
+                                   fields, disk cache under data/cache/),
+                                   geopolitical transit policy
+                                   (transit_policy.py + TRANSIT_POLICY.md),
+                                   merged mesh loading (mesh_data.py), the
+                                   live RIPE measurement campaign
+                                   (mesh_campaign/), and its own test suite.
+                                   Its modules expect internet_gmaps/ on
+                                   sys.path; see internet_gmaps/README.md.
+
 SIMULATION_ENVIRONMENT.md         ← read this to understand what's allowed during inference
+.claude/FIBER_GEOLOCATOR_RESULTS.md fiber integration + scaling results/verdict
+.claude/HANDOFF_routing_realism.md  atlas research agenda (routing realism)
 .claude/TODOS.md                   ordered fix list
 
 cache/cached_target_data.pkl       full mesh (~909 nodes)

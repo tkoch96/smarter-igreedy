@@ -131,8 +131,10 @@ smoother curves; cost ≈ one estimation pass per point per strategy):
 |---|---|
 | `SIMULATION_ENVIRONMENT.md` | The research problem, the information boundary (what inference may see — read this first), the two-phase selection/evaluation split, and the model ladder |
 | `CLAUDE.md` | Codebase mechanics: every module, mode, invariant, calibrated result and test |
+| `internet_gmaps/README.md` | The fiber atlas sub-package: infrastructure graph, floor queries, transit policy, measurement campaign |
+| `.claude/FIBER_GEOLOCATOR_RESULTS.md` | Fiber-floor integration results: n=100 verdict, scaling runs, floor-matched world |
+| `.claude/HANDOFF_routing_realism.md` | Atlas research agenda: what the shortest-fiber model gets wrong and why |
 | `.claude/TODOS.md` | Open work items, priority-ordered |
-| `.claude/HANDOFF_next_steps.md` | Current handoff: integrate the additive model into greedy selection; run it on real data |
 
 Figures are generated artifacts (gitignored): experiment figures under
 `tests/*.pdf` regenerate with pytest; `figures/` comes from

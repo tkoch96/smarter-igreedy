@@ -54,15 +54,14 @@ target burns 5 pairs, not 100, and screening is a free by-product of the
 mesh itself. Expected steady-state pair failure after week one: low
 single digits (source-side only).
 
-## Deliberate limits / next steps
+## Deliberate limits
 
 - RTTs are single-shot min-of-3; the free daily dumps stay the source for
   well-covered pairs — this campaign buys *coverage*, not repetition.
 - Scheduler treats pairs as unordered (reverse direction ≈ no new info).
-- Tier weights are static; once the fiber-atlas identifies high-value
-  regions (e.g. East Asia slack), add a targeted tier.
+- Tier weights are static (no region-targeted tiers).
 - The coverage projection does not model probation (day-1 country
-  coverage will really take a few days while targets verify).
+  coverage really takes a few days while targets verify).
 
 ## Account limits (learned empirically 2026-07-06, refined 07-07)
 

@@ -1,6 +1,6 @@
 # Fiber Atlas — data availability survey
 
-> Written 2026-07-04. Companion to `../.claude/HANDOFF_fiber_atlas.md`.
+> Written 2026-07-04. Companion to `README.md` (the atlas package).
 > Everything marked **[verified live]** was actually fetched today from this
 > machine, not just found in a paper.
 

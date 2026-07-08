@@ -2,7 +2,7 @@
 
 > Handoff for a fresh agent. Written 2026-07-06 after three
 > falsification rounds (policy v1 -> v3.2) against ~1M measured mesh
-> pairs. Companion to HANDOFF_fiber_geolocator.md (the consumer) and
+> pairs. Companion to FIBER_GEOLOCATOR_RESULTS.md (the consumer) and
 > internet_gmaps/TRANSIT_POLICY.md (rule-by-rule evidence + literature).
 > This one is the research agenda: which routing the shortest-fiber
 > model gets wrong, why, and the ranked list of mechanisms that would
@@ -78,8 +78,8 @@ nothing (IL at +5 ms) are unfalsifiable config debt — don't add them.
 6. **inf-floor growth**: 15-18% of pairs have no allowed route under
    v3.2 (mostly granular-Africa). Is that over-restriction? Check
    violation rates of the pairs whose floors went inf-adjacent, and
-   define the fallback contract (HANDOFF_fiber_geolocator.md uses
-   open-floor fallback).
+   define the fallback contract (the geolocation integration uses
+   open-floor fallback — see FIBER_GEOLOCATOR_RESULTS.md).
 
 ## Proposed mechanisms, ranked
 

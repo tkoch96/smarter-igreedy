@@ -71,13 +71,16 @@ class DiversityScheduler:
         successful_pairs=None,
         benched=frozenset(),
         verified_dsts=frozenset(),
+        no_dst=frozenset(),
         seed=31415,
     ):
         """attempted_pairs are never re-measured; but only successful_pairs
         (default: same as attempted, for simulations) count as COVERAGE —
         a country-pair whose one attempt failed must be retried with other
-        probes, not marked done."""
+        probes, not marked done. no_dst probes (anycast-listed addresses)
+        stay eligible as sources but are never pinged as destinations."""
         self.verified_dsts = set(verified_dsts)
+        self.no_dst = set(no_dst)
         self.rng = random.Random(seed)
         self.probes = [p for p in probes if p["id"] not in benched]
         self.by_id = {p["id"]: p for p in self.probes}
@@ -128,12 +131,19 @@ class DiversityScheduler:
     def _pick_dst(self, group_key, cycles, groups):
         """Prefer a verified (known-pingable) destination within the group:
         verified dsts take full 100-source batches, so they both avoid
-        wasted probation pairs and keep the measurement count down."""
-        members = groups[group_key]
+        wasted probation pairs and keep the measurement count down.
+        Returns None when every member is dst-ineligible (anycast)."""
+        members = [m for m in groups[group_key] if m not in self.no_dst]
+        if not members:
+            return None
         verified = [m for m in members if m in self.verified_dsts]
         if verified:
             return self.rng.choice(verified)
-        return next(cycles[group_key])
+        for _ in range(len(groups[group_key])):
+            m = next(cycles[group_key])
+            if m not in self.no_dst:
+                return m
+        return self.rng.choice(members)
 
     def _dst_cap(self, dst):
         return MAX_PROBES_PER_MEAS if dst in self.verified_dsts else PROBATION_MAX_SRC
@@ -153,6 +163,8 @@ class DiversityScheduler:
             if not wanted:
                 continue
             dst = self._pick_dst(dst_cc, self.cyc_cc, self.grp_cc)
+            if dst is None:
+                continue
             # probation: uncovered pairs beyond the cap stay uncovered in
             # the bookkeeping and get rescheduled another day
             wanted = wanted[: self._dst_cap(dst)]
@@ -172,7 +184,9 @@ class DiversityScheduler:
         pairs = []
         touched = {g for key in self.cov_ccasn for g in key}
         orphans = [g for g in self.ccasns if g not in touched]
-        verified = [d for d in self.verified_dsts if d in self.by_id]
+        verified = [
+            d for d in self.verified_dsts if d in self.by_id and d not in self.no_dst
+        ]
         if not orphans or not verified:
             return pairs
         dsts = self.rng.sample(verified, min(n_dsts, len(verified)))
@@ -199,6 +213,8 @@ class DiversityScheduler:
             if len(pairs) >= budget:
                 break
             dst = self._pick_dst(dst_key, cycles, groups)
+            if dst is None:
+                continue
             cap = self._dst_cap(dst)
             added, tries = 0, 0
             while added < cap and tries < 6 * cap and len(pairs) < budget:
@@ -220,6 +236,8 @@ class DiversityScheduler:
         for dst in dst_ids:
             if len(pairs) >= budget:
                 break
+            if dst in self.no_dst:
+                continue
             cap = self._dst_cap(dst)
             added, tries = 0, 0
             while added < cap and tries < 6 * cap and len(pairs) < budget:

@@ -3,9 +3,11 @@
 import numpy as np
 import pytest
 
+from mesh_campaign.anycast import is_anycast
 from mesh_campaign.results import min_rtt_of, _haversine_km
 from mesh_campaign.scheduler import DiversityScheduler
 from mesh_campaign.state import CampaignState
+from mesh_campaign.surrogates import candidate_surrogate, hops_from_traceroute
 
 
 def synth_probes(n_cc=4, asns_per_cc=3, probes_per_group=2):
@@ -149,6 +151,100 @@ class TestScheduler:
         assert rescue, "orphan group must get a rescue pair"
         # the orphan probe is the SOURCE, aimed at a verified destination
         assert all(s in (0, 1) and d in verified for s, d, _ in rescue)
+
+    def test_no_dst_probes_never_targeted(self):
+        probes = synth_probes(n_cc=6, asns_per_cc=4, probes_per_group=2)
+        no_dst = {p["id"] for p in probes[::3]}
+        sched = DiversityScheduler(probes, no_dst=no_dst, seed=12)
+        plan = sched.plan(10_000)
+        assert all(d not in no_dst for _, d, _ in plan)
+        # ...but they still appear as sources
+        assert any(s in no_dst for s, _, _ in plan)
+
+
+class TestSurrogates:
+    def _traceroute(self, hops):
+        return {
+            "result": [
+                {"hop": i + 1, "result": [{"from": ip, "rtt": rtt}]}
+                for i, (ip, rtt) in enumerate(hops)
+            ]
+        }
+
+    def test_hops_parsed_in_order(self):
+        res = self._traceroute([("192.168.1.1", 0.5), ("10.9.9.9", 1.0), ("8.8.8.8", 1.5)])
+        assert list(hops_from_traceroute(res)) == [
+            ("192.168.1.1", 0.5), ("10.9.9.9", 1.0), ("8.8.8.8", 1.5)]
+
+    def test_candidate_skips_private_and_respects_rtt_cap(self):
+        class Resolver:
+            def asns(self, ip):
+                return [64500] if ip == "193.0.11.7" else []
+
+        # NB: real-global addresses on purpose — RFC5737 documentation
+        # ranges (203.0.113.x etc.) are correctly rejected by the
+        # is_global screen, which an earlier version of this test learned
+        # the hard way
+        probe = {"id": 1, "ip": "193.0.10.9", "asn": 64500}
+        hops = [
+            ("192.168.1.1", 0.4),   # private: skipped
+            ("193.0.10.1", 0.9),    # same /24 as probe: fast path, no ASN lookup
+            ("193.0.11.7", 1.5),
+        ]
+        import mesh_campaign.surrogates as sur
+
+        calls = {}
+
+        def fake_get(path, **kw):
+            calls["path"] = path
+            return [self._traceroute(hops)]
+
+        orig = sur.atlas_api.get
+        sur.atlas_api.get = fake_get
+        try:
+            got = candidate_surrogate(probe, Resolver(), max_rtt_ms=2.0)
+            assert got == {"ip": "193.0.10.1", "hop_rtt_ms": 0.9}
+            # over-cap first in-net hop => None (hops only get farther)
+            far = [("192.168.1.1", 0.4), ("193.0.10.1", 5.0)]
+            sur.atlas_api.get = lambda path, **kw: [self._traceroute(far)]
+            assert candidate_surrogate(probe, Resolver(), max_rtt_ms=2.0) is None
+        finally:
+            sur.atlas_api.get = orig
+
+    def test_anycast_lookup(self):
+        import ipaddress
+
+        nets = {int(ipaddress.ip_address("1.1.1.0")) >> 8}
+        assert is_anycast("1.1.1.53", nets)
+        assert not is_anycast("1.1.2.53", nets)
+        assert not is_anycast("not-an-ip", nets)
+
+    def test_surrogate_state_roundtrip(self, tmp_path):
+        st = CampaignState(tmp_path / "s.sqlite")
+        st.record_surrogate(504, "196.203.250.1", 1.7, 88.0)
+        assert st.surrogates() == {504: "196.203.250.1"}
+
+    def test_surrogate_forgives_prior_failures_only(self, tmp_path):
+        st = CampaignState(tmp_path / "s.sqlite")
+        # pair failed against the dst's dead listed address...
+        st.record_scheduled(111, dst_prb=9, dst_ip="10.0.0.9", src_prbs=[1, 2])
+        st.record_result(1, 9, None)
+        st.record_result(2, 9, 50.0)
+        assert (1, 9) in st.attempted_pairs()
+        # ...then a surrogate lands: the FAILED pair is retryable, the ok
+        # pair and failures against other dsts stay
+        st.record_surrogate(9, "196.0.0.1", 1.0, 90.0)
+        assert (1, 9) not in st.attempted_pairs()
+        assert (2, 9) in st.attempted_pairs()
+        # re-scheduling the forgiven pair rebinds its row to the new msm
+        st.record_scheduled(222, dst_prb=9, dst_ip="196.0.0.1", src_prbs=[1])
+        assert (1, 9) in st.attempted_pairs()  # pending again = blocked
+        assert st.db.execute(
+            "SELECT msm_id, status FROM pairs WHERE src=1 AND dst=9"
+        ).fetchone() == (222, "pending")
+        # a NEW failure against the surrogate itself stays blocked
+        st.record_result(1, 9, None)
+        assert (1, 9) in st.attempted_pairs()
 
 
 class TestState:
