@@ -60,6 +60,20 @@ ADDITIVE    = 'additive'
 # rtt cannot beat SOL).
 HYP_RING_BEARINGS = 16     # ring sample density around the best VP
 HYP_RADIUS_FACTORS = (0.4, 0.7, 1.0)   # inward fractions — fits overshoot OUT
+# Outward rings on the ZERO-OFFSET implied distance (best_rtt × 100, no
+# fitted offset subtracted — the farthest physics allows).  The inward
+# factors above assume fits overshoot outward, but an offset-position
+# ridge fails the OTHER way: the fit launders position error into μ̂_dst,
+# the offset-corrected implied distance shrinks, and the truth sits
+# OUTSIDE every ring — the support can then never contain it and the
+# uncertainty machinery reads a confidently-wrong target as done
+# (2026-07-11 probe audit).  Opt-in (GEOLOC_HYP_OUTER_RINGS=1): in
+# well-specified synthetic worlds the wider supports re-inflate
+# pathological targets' promises (the over-exploration risk_gain was
+# built to damp — four pinned sweep behaviors move), so the knob stays
+# off until the real-mesh A/B judges the trade.
+HYP_OUTER_RADIUS_FACTORS = (0.7, 1.0)
+HYP_OUTER_RINGS = os.environ.get('GEOLOC_HYP_OUTER_RINGS', '0') == '1'
 HYP_SUPPORT_DELTA = 2.0    # keep candidates within this (misfit-scaled) NLL
 HYP_MAX = 8                # support-set size cap
 HYP_MIN_SEP_KM = 200.0     # dedupe near-identical hypotheses
@@ -583,7 +597,8 @@ class FeasibleRegion:
                 base = get_distance(x, vp_loc) / KM_PER_MS
             else:
                 base = self.rtt_model.base_ms(vp_loc, x)
-            offs.append(rtt - base - self.model.mu_s.get(src, 5.0))
+            offs.append(rtt - base - self.model.mu_s.get(
+                src, getattr(self.model, 'prior_mu_ms', 5.0)))
             ws.append(1.0 / self.model.var_sum(src, t))
         w = np.array(ws)
         r = np.array(offs)
@@ -608,6 +623,9 @@ class FeasibleRegion:
 
         pool: list[LatLon] = [map_pt, best_vp_loc]
         radii = {round(implied * f) for f in HYP_RADIUS_FACTORS}
+        if HYP_OUTER_RINGS:
+            raw = best_rtt * KM_PER_MS   # zero-offset (max-distance) bound
+            radii |= {round(raw * f) for f in HYP_OUTER_RADIUS_FACTORS}
         radii.add(round(d_map))
         for r_km in radii:
             if r_km < HYP_MIN_SEP_KM:

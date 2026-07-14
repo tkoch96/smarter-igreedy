@@ -11,6 +11,7 @@ from utils import LatLon, get_distance
 from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, ADDITIVE, DEFAULT_SLOPE, TARGET_OF_INTEREST
 from probabilistic_helpers import (
 	AdditiveLatencyModel, ADDITIVE_PRIOR_VAR_MS2, additive_batch_em, KM_PER_MS,
+	LEARN_ALL,
 )
 
 DEBUG = False
@@ -51,6 +52,25 @@ class AdaptiveRTTModel:
 
 
 BASICALLY_GEOLOCATED = 200  # km, we've essentially geolocated this IP address
+
+# Incremental polish (polish_mode='incremental'): a target's location is
+# re-optimised at a checkpoint only if it was pinged since the last polish
+# or its fitted per-target offset moved by more than this (everything else
+# keeps its previous polished estimate); alternations drop to
+# POLISH_INCR_ITERS because the warm-started fit is already near its
+# fixed point.
+POLISH_OFFSET_EPS_MS = 0.5
+POLISH_INCR_ITERS = 2
+# Opt-in (GEOLOC_POLISH_LIVE_STARTS=1): regions' live per-ping estimates
+# join the polish's location starts, plus a per-target penalized-NLL
+# basin arbitration (see additive_batch_em extra_starts=).  Preserves
+# real-mesh ridge rescues the fresh polish otherwise overwrites
+# (measured: ping-time 2,977 km polished to 13,827) — but in honest
+# synthetic worlds the fresh polish exists precisely to DISCARD ratcheted
+# incremental estimates, and live starts let some ratchets survive (four
+# pinned sweep behaviors move).  Off = historical behavior; judge the
+# trade on the real mesh before flipping.
+POLISH_LIVE_STARTS = os.environ.get('GEOLOC_POLISH_LIVE_STARTS', '0') == '1'
 
 
 def default_expected_rtt_model(vp_loc: LatLon, target_region: FeasibleRegion) -> float:
@@ -300,6 +320,27 @@ def _evaluate_vp_worker(
 	return vp, utility_score
 
 
+def _evaluate_vp_chunk_worker(
+	vps: list[str],
+	dst: str,
+	target_region: FeasibleRegion,
+	vp_locs: list[LatLon],
+	current_size: float,
+	utility_func: Callable,
+	rtt_func: Callable,
+	verbs: list[bool],
+) -> list[tuple[str, float]]:
+	"""One executor task per CHUNK of candidate VPs: the target region
+	(whose pickled constraint state dominates the payload) crosses the
+	process boundary once per chunk instead of once per VP.  Same math
+	as _evaluate_vp_worker, deterministic order within the chunk."""
+	if not target_region.constraints:
+		return [(vp, 1000000.0) for vp in vps]
+	return [(vp, utility_func(vp, dst, target_region, loc, current_size,
+	                          rtt_func, verb))
+	        for vp, loc, verb in zip(vps, vp_locs, verbs)]
+
+
 class Iterative_Greedy_Geolocator:
 	def __init__(
 		self,
@@ -312,6 +353,10 @@ class Iterative_Greedy_Geolocator:
 		model_refit_every: int = 1,
 		selection: str = 'simulate',
 		rtt_model=None,
+		additive_learn: tuple = LEARN_ALL,
+		utility_dispatch: str = 'per_vp',
+		polish_mode: str = 'full',
+		explore_bias: str = 'uniform',
 	) -> None:
 		# Distinct names let several differently-configured greedys coexist
 		# in one Geolocator_Comparator run (plot keys / cache filenames).
@@ -331,6 +376,31 @@ class Iterative_Greedy_Geolocator:
 		# measurements every `model_refit_every` actual pings.
 		self.latency_model: Optional[AdditiveLatencyModel] = None
 		self.model_refit_every = model_refit_every
+		# (mu_src, var_src, mu_dst, var_dst) ablation mask for the additive
+		# model — frozen families stay at their prior constants everywhere
+		# (incremental refits AND the final batch polish).
+		self.additive_learn = additive_learn
+		# How candidate-VP utilities are computed (see
+		# _update_best_vp_for_target): 'per_vp' = one executor job per VP
+		# (the historical path — pickles the region once per candidate;
+		# the DEFAULT, so seed-calibrated tests stay bit-identical);
+		# 'chunk' = one job per worker-sized chunk of candidates; 'inline'
+		# = in this process, no executor; 'auto' = inline for the NM-free
+		# hypothesis utilities (info_gain / risk_gain / phased), chunked
+		# for the simulate family.  Production configs opt into 'auto'
+		# (assess_geolocators) — measured equivalence + speedups in
+		# tests/test_speedups.py and tests/speedups.pdf.
+		if utility_dispatch not in ('auto', 'per_vp', 'chunk', 'inline'):
+			raise ValueError(f"utility_dispatch {utility_dispatch!r} not understood")
+		self.utility_dispatch = utility_dispatch
+		# Checkpoint batch polish flavour: 'full' = fresh NN-anchored batch
+		# fit over everything (the historical path); 'incremental' = fresh
+		# params (cheap) but locations re-optimised only for targets that
+		# are dirty (new pings) or whose fitted offsets moved, warm-started
+		# from the previous polish.
+		if polish_mode not in ('full', 'incremental'):
+			raise ValueError(f"polish_mode {polish_mode!r} not understood")
+		self.polish_mode = polish_mode
 		# Injected BASE RTT model (probabilistic_helpers.RttModel): swaps the
 		# geodesic d/100 term in the regions' and additive model's residuals
 		# for e.g. the fiber-atlas floor.  Distinct from `rtt_func`, which is
@@ -346,6 +416,19 @@ class Iterative_Greedy_Geolocator:
 		if selection not in ('simulate', 'info_gain', 'risk_gain', 'phased'):
 			raise ValueError(f"selection {selection!r} not understood")
 		self.selection = selection
+		# Phased-explore allocation: 'uniform' (historical — every unpinged
+		# pair equally likely) or 'size' (pair probability ∝ its target's
+		# believed region size).  Motivation (2026-07-11 probe audit): at
+		# the plateau, golden pings — single measurements worth 1,000-15,000
+		# km — hide among candidates the auction scores at ~0, but their
+		# targets' believed sizes are 2.5-4x the population median (the
+		# uncertainty signal is honest even when the promise machinery is
+		# blinded by offset-position confounding).  Uniform exploration
+		# finds them at ~1/n_pairs per ping; size-weighting concentrates
+		# the search where the laundered errors live.
+		if explore_bias not in ('uniform', 'size'):
+			raise ValueError(f"explore_bias {explore_bias!r} not understood")
+		self.explore_bias = explore_bias
 
 		if utility_func is not None:
 			self.utility_func: Callable = utility_func
@@ -421,11 +504,17 @@ class Iterative_Greedy_Geolocator:
 			return
 
 		if self.region_mode == ADDITIVE:
-			self.latency_model = AdditiveLatencyModel(rtt_model=self.rtt_model)   # fresh per solve
+			self.latency_model = AdditiveLatencyModel(rtt_model=self.rtt_model,
+			                                          learn=self.additive_learn)   # fresh per solve
 		# Marginal-return tape + deterministic exploration order ('phased')
 		self.marginal_gain_ewma: Optional[float] = None
 		self.explore_pings = 0
 		self._explore_rng = np.random.default_rng(31415)
+		# Incremental-polish bookkeeping (see measurements())
+		self._last_polish_estimates: Optional[dict[str, LatLon]] = None
+		self._last_polish_mu_t: dict[str, float] = {}
+		self._last_polish_mu_s: dict[str, float] = {}
+		self._dirty_since_polish: set[str] = set()
 		self.target_regions = {
 			dst: FeasibleRegion(dst, self.get_prior_guess(dst),
 			                    mode=self.region_mode, slope=self.region_slope,
@@ -464,23 +553,62 @@ class Iterative_Greedy_Geolocator:
 		current_size = target_region.get_region_size()
 		verbs = [np.random.random() > .999 and self.iter > len(self.targets) for s in available_srcs]
 
-		futures = [
-			self.executor.submit(
-				_evaluate_vp_worker,
-				src,
-				dst,
-				target_region,
-				self.vp_locations[src],
-				current_size,
-				self.utility_func,
-				self.rtt_func,
-				v,
-			)
-			for src, v in zip(available_srcs, verbs)
-		]
+		mode = self.utility_dispatch
+		if mode == 'auto':
+			# NM-free hypothesis utilities with few candidates: cheaper in
+			# this process than any executor round-trip.  Everything else
+			# (NM-heavy simulate family, or long candidate lists) goes to
+			# worker chunks — measured crossover in tests/speedups.pdf.
+			cheap = self.utility_func in (info_gain_utility_evaluator,
+			                              risk_adjusted_utility_evaluator)
+			mode = ('inline' if cheap and len(available_srcs) <= 32
+			        else 'chunk')
+		if mode in ('inline', 'chunk') and len(available_srcs) > 1:
+			# Exact-tie breaking must stay stochastic: the seeding phase
+			# scores every candidate of an unpinged target identically, and
+			# the old per-VP path resolved that by as_completed arrival
+			# order.  A fixed candidate order would hand every target the
+			# same first VP (measured: 318 → 681 km on a small synthetic
+			# world).
+			order = np.random.permutation(len(available_srcs))
+			available_srcs = [available_srcs[i] for i in order]
+			verbs = [verbs[i] for i in order]
 
-		for future, v in zip(as_completed(futures), verbs):
-			src, utility = future.result()
+		if mode == 'per_vp':
+			futures = [
+				self.executor.submit(
+					_evaluate_vp_worker,
+					src,
+					dst,
+					target_region,
+					self.vp_locations[src],
+					current_size,
+					self.utility_func,
+					self.rtt_func,
+					v,
+				)
+				for src, v in zip(available_srcs, verbs)
+			]
+			scored = [f.result() for f in as_completed(futures)]
+		elif mode == 'inline':
+			scored = _evaluate_vp_chunk_worker(
+				available_srcs, dst, target_region,
+				[self.vp_locations[s] for s in available_srcs],
+				current_size, self.utility_func, self.rtt_func, verbs)
+		else:  # 'chunk'
+			n_chunks = min(self.max_workers, len(available_srcs))
+			chunks = [available_srcs[i::n_chunks] for i in range(n_chunks)]
+			vchunks = [verbs[i::n_chunks] for i in range(n_chunks)]
+			futures = [
+				self.executor.submit(
+					_evaluate_vp_chunk_worker, chunk, dst, target_region,
+					[self.vp_locations[s] for s in chunk],
+					current_size, self.utility_func, self.rtt_func, vchunk)
+				for chunk, vchunk in zip(chunks, vchunks)
+			]
+			scored = [p for f in as_completed(futures) for p in f.result()]
+
+		for src, utility in scored:
 			if utility > best_utility:
 				best_utility = utility
 				best_src = src
@@ -527,8 +655,13 @@ class Iterative_Greedy_Geolocator:
 				        for s in self.available_measurements[d]
 				        if s not in self.measurements_used[d]]
 				if cand:
-					best_global_src, best_global_dst = \
-						cand[int(self._explore_rng.integers(len(cand)))]
+					if self.explore_bias == 'size':
+						w = np.array([max(self.current_region_sizes.get(d, 1.0), 1.0)
+						              for _, d in cand])
+						i = int(self._explore_rng.choice(len(cand), p=w / w.sum()))
+					else:
+						i = int(self._explore_rng.integers(len(cand)))
+					best_global_src, best_global_dst = cand[i]
 					best_global_utility = 0.0
 					self.explore_pings += 1
 					was_explore = True
@@ -547,6 +680,7 @@ class Iterative_Greedy_Geolocator:
 			expected_utility = best_global_utility
 
 			self.measurements_used[best_global_dst].add(best_global_src)
+			self._dirty_since_polish.add(best_global_dst)
 			actual_rtts: list[float] = loc_loc_meas[best_global_src][best_global_dst]
 
 			min_actual_rtt = min(actual_rtts)
@@ -705,15 +839,62 @@ class Iterative_Greedy_Geolocator:
 			# NN-anchored batch alternation recovers them (see
 			# additive_batch_em).  The fitted params also reseed the shared
 			# model, so subsequent selection benefits.
-			estimates, mu_s, var_s, mu_t, var_t = additive_batch_em(
-				self.latency_model.rtts_by_pair, self.vp_locations,
-				rtt_model=self.rtt_model)
+			#
+			# polish_mode='incremental' (after the first polish): params are
+			# still fit fresh over ALL pairs, but only targets that are
+			# dirty (pinged since the last polish) or whose fitted μ̂_t
+			# moved get their location re-optimised; everything else keeps
+			# its previous polished estimate as the warm start.
+			incremental = (self.polish_mode == 'incremental'
+			               and self._last_polish_estimates is not None)
+			# The regions' live per-ping estimates join the polish's
+			# Nelder-Mead starts: an incremental estimate that escaped an
+			# offset-position ridge (a rescued target) is otherwise not in
+			# the start set, and the polish overwrites the rescue with the
+			# laundered basin's optimum (measured on the 100x300 world:
+			# ping-time 2,977 km polished to 13,827).  Keep-best-NLL makes
+			# the extra start free.
+			live = ({t: r.get_location() for t, r in self.target_regions.items()
+			         if r.constraints} if POLISH_LIVE_STARTS else None)
+			if incremental:
+				# Hot set: targets pinged since the last polish, targets
+				# whose own fitted offset moved, AND targets measured by a
+				# source whose offset moved — a stale μ̂_s shifts every
+				# estimate that leaned on that VP, not just the dirty ones
+				# (measured: dropping the source clause degraded a small
+				# synthetic run 426 → 681 km).
+				moved = {t for t, mu in self.latency_model.mu_t.items()
+				         if abs(mu - self._last_polish_mu_t.get(t, mu))
+				         > POLISH_OFFSET_EPS_MS}
+				moved_src = {s for s, mu in self.latency_model.mu_s.items()
+				             if abs(mu - self._last_polish_mu_s.get(s, mu))
+				             > POLISH_OFFSET_EPS_MS}
+				hot = self._dirty_since_polish | moved
+				for s, t in self.latency_model.rtts_by_pair:
+					if s in moved_src:
+						hot.add(t)
+				estimates, mu_s, var_s, mu_t, var_t = additive_batch_em(
+					self.latency_model.rtts_by_pair, self.vp_locations,
+					n_iters=POLISH_INCR_ITERS,
+					rtt_model=self.rtt_model, learn=self.additive_learn,
+					prev_estimates=self._last_polish_estimates,
+					only_targets=hot,
+					extra_starts=live)
+			else:
+				estimates, mu_s, var_s, mu_t, var_t = additive_batch_em(
+					self.latency_model.rtts_by_pair, self.vp_locations,
+					rtt_model=self.rtt_model, learn=self.additive_learn,
+					extra_starts=live)
 			self.latency_model.mu_s, self.latency_model.var_s = mu_s, var_s
 			self.latency_model.mu_t, self.latency_model.var_t = mu_t, var_t
 			for dst, est in estimates.items():
 				region = self.target_regions.get(dst)
 				if region is not None and region.constraints:
 					region.set_location(est)
+			self._last_polish_estimates = dict(estimates)
+			self._last_polish_mu_t = dict(mu_t)
+			self._last_polish_mu_s = dict(mu_s)
+			self._dirty_since_polish = set()
 
 		meas_dict: MeasData = {}
 		for src, dst in self.measurement_history[:budget]:

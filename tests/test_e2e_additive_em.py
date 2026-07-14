@@ -83,20 +83,42 @@ PATH_SIGMA_RANGE = (12.0, 30.0)
 EM_OUTER_ITERS = 8
 
 
-def make_additive_scenario(seed: int) -> dict:
+def _base_ms(vp_loc: LatLon, loc: LatLon, rtt_model=None) -> float:
+    """The base (distance) RTT term: an injected RttModel, else the
+    historical geodesic d/100 — mirrors probabilistic_helpers'
+    rtt_model=None convention bit-for-bit."""
+    if rtt_model is not None:
+        return float(rtt_model.base_ms(vp_loc, loc))
+    return get_distance(vp_loc, loc) / KM_PER_MS
+
+
+def make_additive_scenario(seed: int, rtt_model=None, vp_locs=None,
+                           target_spots=None) -> dict:
+    """Additive-overhead world: rtt = base + X_src + X_dst.
+
+    The base term is geodesic d/100 by default; pass `rtt_model` (e.g. a
+    FiberFloorRtt over a toy atlas) to generate the truth from another
+    base — the fiber toggle.  `vp_locs`/`target_spots` override the
+    default EU geometry (the toy atlas needs targets on its cable).
+    The scenario carries vp_locs + rtt_model so downstream helpers stay
+    coherent with the world that generated the data."""
     rng = np.random.default_rng(seed + 3_000_000)
+    vp_locs = dict(vp_locs if vp_locs is not None else VP_LOCS)
 
     sources = {
         s: {'mu': float(rng.uniform(*SRC_MU_RANGE)),
             'sigma': float(rng.uniform(*SRC_SIGMA_RANGE))}
-        for s in VP_LOCS
+        for s in vp_locs
     }
+    if target_spots is None:
+        target_spots = [(float(rng.uniform(*TARGET_LAT_RANGE)),
+                         float(rng.uniform(*TARGET_LON_RANGE)))
+                        for _ in range(N_TARGETS)]
     targets = {}
-    for i in range(N_TARGETS):
+    for i, loc in enumerate(target_spots):
         pathological = i < N_PATHOLOGICAL
         targets[f'target_{i}'] = {
-            'loc': (float(rng.uniform(*TARGET_LAT_RANGE)),
-                    float(rng.uniform(*TARGET_LON_RANGE))),
+            'loc': (float(loc[0]), float(loc[1])),
             'mu': float(rng.uniform(*(PATH_MU_RANGE if pathological else DST_MU_RANGE))),
             'sigma': float(rng.uniform(*(PATH_SIGMA_RANGE if pathological else DST_SIGMA_RANGE))),
             'pathological': pathological,
@@ -107,24 +129,27 @@ def make_additive_scenario(seed: int) -> dict:
     rtts: dict[tuple, list[float]] = {}
     for s, sp in sources.items():
         for t, tp in targets.items():
-            sol = get_distance(VP_LOCS[s], tp['loc']) / KM_PER_MS
+            sol = _base_ms(vp_locs[s], tp['loc'], rtt_model)
             rtts[(s, t)] = [
                 sol
                 + max(0.0, float(rng.normal(sp['mu'], sp['sigma'])))
                 + max(0.0, float(rng.normal(tp['mu'], tp['sigma'])))
             ]
-    return {'sources': sources, 'targets': targets, 'rtts': rtts}
+    return {'sources': sources, 'targets': targets, 'rtts': rtts,
+            'vp_locs': vp_locs, 'rtt_model': rtt_model}
 
 
-def _map_location(constraint_rows, starts: list[LatLon]) -> LatLon:
+def _map_location(constraint_rows, starts: list[LatLon],
+                  rtt_model=None) -> LatLon:
     """MAP under the additive model: constraint_rows are
-    (vp_loc, rtt, mean_offset, var_sum) — expected rtt = d/100 + mean_offset.
+    (vp_loc, rtt, mean_offset, var_sum) — expected rtt = base + mean_offset
+    (base = d/100, or `rtt_model` when injected).
     Nelder-Mead is local, so try several starts and keep the best (protects
     against early-EM estimates trapping later iterations)."""
     def nll(x):
         total = 0.0
         for vp_loc, rtt, mean_off, var_sum in constraint_rows:
-            r = rtt - get_distance((x[0], x[1]), vp_loc) / KM_PER_MS - mean_off
+            r = rtt - _base_ms(vp_loc, (x[0], x[1]), rtt_model) - mean_off
             total += r * r / (2.0 * var_sum)
         return total
 
@@ -324,22 +349,28 @@ SWEEP_STRATEGIES = ('random_nn', 'const_gaussian', 'per_target_em',
                     'greedy_additive_risk', 'greedy_additive_phased', 'oracle')
 
 
-def run_greedy_additive_seed(sc: dict, selection: str = 'simulate') -> tuple[list[float], dict]:
-    """Greedy selection + additive estimation over BUDGET_GRID.
+def run_greedy_additive_seed(sc: dict, selection: str = 'simulate',
+                             rtt_model=None,
+                             budget_grid=BUDGET_GRID) -> tuple[list[float], dict]:
+    """Greedy selection + additive estimation over the budget grid.
+    `rtt_model` is the ESTIMATION base (None = geodesic d/100, the
+    historical behavior); the truth base lives in the scenario.
     Returns (error curve, cumulative pathological ping share per budget)."""
+    vp_locs = sc.get('vp_locs', VP_LOCS)
     loc_loc_meas: dict[str, dict[str, list[float]]] = {}
     for (s, t), rtts in sc['rtts'].items():
         loc_loc_meas.setdefault(s, {})[t] = list(rtts)
-    data = {'address_to_loc': dict(VP_LOCS), 'loc_loc_meas': loc_loc_meas}
+    data = {'address_to_loc': dict(vp_locs), 'loc_loc_meas': loc_loc_meas}
     patho = {t for t, tp in sc['targets'].items() if tp['pathological']}
 
     ig = Iterative_Greedy_Geolocator(max_workers=1, region_mode=ADDITIVE,
-                                     selection=selection)
+                                     selection=selection,
+                                     rtt_model=rtt_model)
     ig.set_data(data)
     ig.solve()
     errs, patho_share = [], {}
     try:
-        for b in BUDGET_GRID:
+        for b in budget_grid:
             ig.measurements(b)             # extends history incrementally
             est = ig.get_current_estimates()
             errs.append(float(np.mean([
@@ -363,7 +394,7 @@ def oracle_measurement_order(sc: dict) -> list[tuple[str, str]]:
     address_to_loc, which guides its error-driven greedy choices. An
     oracle must cheat on BOTH halves — selection and estimation — or it
     is not an upper bound and honest strategies can legitimately beat it."""
-    cheat_locs = dict(VP_LOCS)
+    cheat_locs = dict(sc.get('vp_locs', VP_LOCS))
     cheat_locs.update({t: tp['loc'] for t, tp in sc['targets'].items()})
     loc_loc_meas: dict[str, dict[str, list[float]]] = {}
     for (s, t), rs in sc['rtts'].items():
@@ -373,16 +404,26 @@ def oracle_measurement_order(sc: dict) -> list[tuple[str, str]]:
     return pg.measurement_order
 
 
-def run_additive_budget_seed(seed: int) -> dict:
-    sc = make_additive_scenario(seed)
+def run_additive_budget_seed(seed: int, sc: dict = None, rtt_model=None,
+                             budget_grid=BUDGET_GRID,
+                             strategies=SWEEP_STRATEGIES) -> dict:
+    """One seed of the budget sweep.  Defaults reproduce the historical
+    run exactly.  The fiber toggle: pass a scenario built with
+    `make_additive_scenario(..., rtt_model=<fiber>)` (truth base) and
+    `rtt_model=<fiber>` here (estimation base) — or leave `rtt_model`
+    None to measure how the geodesic-base estimators fare on that world."""
+    if sc is None:
+        sc = make_additive_scenario(seed)
+    vp_locs = sc.get('vp_locs', VP_LOCS)
     rng = np.random.default_rng(seed + 4_000_000)
     pings = [(s, t) for s in sc['sources'] for t in sc['targets']]
     rng.shuffle(pings)
 
-    oracle_order = oracle_measurement_order(sc)
+    oracle_order = (oracle_measurement_order(sc)
+                    if 'oracle' in strategies else [])
 
     seen: dict[tuple, list[float]] = {}
-    curves = {name: [] for name in SWEEP_STRATEGIES}
+    curves = {name: [] for name in strategies}
 
 
     def avg_err(estimates: dict) -> float:
@@ -393,7 +434,7 @@ def run_additive_budget_seed(seed: int) -> dict:
         ]))
 
     k = 0
-    for b in BUDGET_GRID:
+    for b in budget_grid:
         while k < b:
             s, t = pings[k]
             seen[(s, t)] = list(sc['rtts'][(s, t)])
@@ -404,18 +445,21 @@ def run_additive_budget_seed(seed: int) -> dict:
         for t in sc['targets']:
             pairs_t = {s2: min(v) for (s2, t2), v in seen.items() if t2 == t}
             if pairs_t:
-                nn_est[t] = VP_LOCS[min(pairs_t, key=pairs_t.get)]
-        curves['random_nn'].append(avg_err(nn_est))
+                nn_est[t] = vp_locs[min(pairs_t, key=pairs_t.get)]
+        if 'random_nn' in curves:
+            curves['random_nn'].append(avg_err(nn_est))
 
         # FeasibleRegion baselines (rebuilt on per-pair min, as production)
         for label, mode in (('const_gaussian', GAUSSIAN),
                             ('per_target_em', EM_GAUSSIAN)):
+            if label not in curves:
+                continue
             est = {}
             for t in sc['targets']:
-                region = FeasibleRegion(t, mode=mode)
+                region = FeasibleRegion(t, mode=mode, rtt_model=rtt_model)
                 for (s2, t2), v in seen.items():
                     if t2 == t:
-                        region.add_measurement(VP_LOCS[s2], min(v))
+                        region.add_measurement(vp_locs[s2], min(v))
                 if region.constraints:
                     est[t] = region.get_location()
             curves[label].append(avg_err(est))
@@ -424,45 +468,58 @@ def run_additive_budget_seed(seed: int) -> dict:
         # budget point (NN-anchored inits, parameters-first). Warm-starting
         # across budget points carries early-budget wrong fixed points
         # forward and degraded full-budget error ~2×.
-        measured = {t2 for (_, t2) in seen}
-        add_est = {t2: nn_est[t2] for t2 in measured}
-        for _ in range(4):
-            residuals = {
-                (s2, t2): [r - get_distance(VP_LOCS[s2], add_est[t2]) / KM_PER_MS
-                           for r in v]
-                for (s2, t2), v in seen.items()
-            }
-            mu_s, var_s, mu_t, var_t = fit_additive_params(residuals)
-            for t2 in measured:
-                rows = [(VP_LOCS[s2], r, mu_s[s2] + mu_t[t2],
-                         var_s[s2] + var_t[t2])
-                        for (s2, tt), v in seen.items() if tt == t2
-                        for r in v]
-                add_est[t2] = _map_location(rows, [add_est[t2], nn_est[t2]])
-        curves['additive_em'].append(avg_err(add_est))
+        if 'additive_em' in curves:
+            measured = {t2 for (_, t2) in seen}
+            add_est = {t2: nn_est[t2] for t2 in measured}
+            for _ in range(4):
+                residuals = {
+                    (s2, t2): [r - _base_ms(vp_locs[s2], add_est[t2], rtt_model)
+                               for r in v]
+                    for (s2, t2), v in seen.items()
+                }
+                mu_s, var_s, mu_t, var_t = fit_additive_params(residuals)
+                for t2 in measured:
+                    rows = [(vp_locs[s2], r, mu_s[s2] + mu_t[t2],
+                             var_s[s2] + var_t[t2])
+                            for (s2, tt), v in seen.items() if tt == t2
+                            for r in v]
+                    add_est[t2] = _map_location(rows, [add_est[t2], nn_est[t2]],
+                                                rtt_model=rtt_model)
+            curves['additive_em'].append(avg_err(add_est))
 
         # oracle: true per-node params on its own (cheating) selection order
-        orc_by_t: dict[str, list[str]] = {}
-        for s2, t2 in oracle_order[:b]:
-            orc_by_t.setdefault(t2, []).append(s2)
-        orc = {}
-        for t2, srcs in orc_by_t.items():
-            tp = sc['targets'][t2]
-            rows = [(VP_LOCS[s2], r,
-                     sc['sources'][s2]['mu'] + tp['mu'],
-                     sc['sources'][s2]['sigma'] ** 2 + tp['sigma'] ** 2)
-                    for s2 in srcs for r in sc['rtts'][(s2, t2)]]
-            nn0 = VP_LOCS[min(srcs, key=lambda s2: min(sc['rtts'][(s2, t2)]))]
-            orc[t2] = _map_location(rows, [nn0, (48.0, 10.0)])
-        curves['oracle'].append(avg_err(orc))
+        if 'oracle' in curves:
+            orc_by_t: dict[str, list[str]] = {}
+            for s2, t2 in oracle_order[:b]:
+                orc_by_t.setdefault(t2, []).append(s2)
+            orc = {}
+            for t2, srcs in orc_by_t.items():
+                tp = sc['targets'][t2]
+                rows = [(vp_locs[s2], r,
+                         sc['sources'][s2]['mu'] + tp['mu'],
+                         sc['sources'][s2]['sigma'] ** 2 + tp['sigma'] ** 2)
+                        for s2 in srcs for r in sc['rtts'][(s2, t2)]]
+                nn0 = vp_locs[min(srcs, key=lambda s2: min(sc['rtts'][(s2, t2)]))]
+                orc[t2] = _map_location(rows, [nn0, (48.0, 10.0)],
+                                        rtt_model=rtt_model)
+            curves['oracle'].append(avg_err(orc))
 
-    curves['greedy_additive'], patho_share = run_greedy_additive_seed(sc)
-    curves['greedy_additive_info'], info_patho_share = \
-        run_greedy_additive_seed(sc, selection='info_gain')
-    curves['greedy_additive_risk'], risk_patho_share = \
-        run_greedy_additive_seed(sc, selection='risk_gain')
-    curves['greedy_additive_phased'], _ = \
-        run_greedy_additive_seed(sc, selection='phased')
+    patho_share = info_patho_share = risk_patho_share = {}
+    if 'greedy_additive' in curves:
+        curves['greedy_additive'], patho_share = run_greedy_additive_seed(
+            sc, rtt_model=rtt_model, budget_grid=budget_grid)
+    if 'greedy_additive_info' in curves:
+        curves['greedy_additive_info'], info_patho_share = \
+            run_greedy_additive_seed(sc, selection='info_gain',
+                                     rtt_model=rtt_model, budget_grid=budget_grid)
+    if 'greedy_additive_risk' in curves:
+        curves['greedy_additive_risk'], risk_patho_share = \
+            run_greedy_additive_seed(sc, selection='risk_gain',
+                                     rtt_model=rtt_model, budget_grid=budget_grid)
+    if 'greedy_additive_phased' in curves:
+        curves['greedy_additive_phased'], _ = \
+            run_greedy_additive_seed(sc, selection='phased',
+                                     rtt_model=rtt_model, budget_grid=budget_grid)
 
     return {'scenario': sc, 'curves': curves,
             'greedy_patho_share': patho_share,
@@ -604,6 +661,102 @@ class TestAdditiveBudgetSweep:
         curves the assertions above checked."""
         from plot_error_additive import make_figure, OUT_PATH
         path = make_figure(sweep_results, OUT_PATH)
+        assert os.path.exists(path)
+        assert os.path.getsize(path) > 5_000
+
+
+# ===========================================================================
+# Fiber toggle — the same additive sweep with the base term swapped
+# ===========================================================================
+#
+# Truth is generated from a toy fiber atlas (the C-shaped detour cable of
+# test_e2e_additive_large — fiber A->D runs ~40 equator-degrees while the
+# geodesic is ~10), with the SAME pathological-destination overhead
+# structure as the geodesic sweep.  Each estimator arm then runs twice on
+# the identical world: once with the historical geodesic d/100 base and
+# once with the fiber base injected (rtt_model=).  When routes follow the
+# cable, the fiber-base additive machinery must dominate its geodesic
+# twin — the synthetic pin of the real-mesh fiber-vs-geodesic result.
+
+FIBER_SWEEP_STRATEGIES = ('random_nn', 'additive_em', 'greedy_additive_phased',
+                          'oracle')
+# 4 toy VPs x 8 targets = 32 pairs
+FIBER_BUDGET_GRID = (4, 8, 12, 16, 20, 24, 28, 32)
+N_FIBER_SWEEP_SEEDS = 3
+
+
+def make_toy_fiber_em_scenario(seed: int):
+    """Additive-overhead scenario whose truth base is the toy C-cable
+    fiber floor.  Returns (scenario, fiber_rtt_model)."""
+    from test_e2e_additive_large import TOY_VPS, _toy_fiber_graph
+    from floor_query import FloorEstimator
+    from probabilistic_helpers import FiberFloorRtt
+
+    vp_names = list(TOY_VPS)
+    est = FloorEstimator(_toy_fiber_graph(),
+                         [TOY_VPS[v][0] for v in vp_names],
+                         [TOY_VPS[v][1] for v in vp_names])
+    fiber = FiberFloorRtt(estimator=est, vp_locs=list(TOY_VPS.values()),
+                          slope=1.0, offset_ms=0.0)
+
+    # N_TARGETS spots on the cable: pathological first (matching
+    # make_additive_scenario's convention), far C->D leg + near-B mix.
+    rng = np.random.default_rng(seed + 21_000_000)
+    base_spots = [(10.0, 2.0), (10.0, 6.0),          # pathological (far leg)
+                  (10.0, 10.0), (10.0, 13.0),
+                  (0.0, 12.0), (2.0, 15.0), (0.0, 9.0), (5.0, 15.0)]
+    spots = [(lat + float(rng.normal(0, 0.15)),
+              lon + float(rng.normal(0, 0.15))) for lat, lon in base_spots]
+    sc = make_additive_scenario(seed, rtt_model=fiber, vp_locs=TOY_VPS,
+                                target_spots=spots)
+    return sc, fiber
+
+
+@pytest.fixture(scope='module')
+def fiber_sweep_results():
+    rows = []
+    for seed in range(N_FIBER_SWEEP_SEEDS):
+        sc, fiber = make_toy_fiber_em_scenario(seed)
+        geo_row = run_additive_budget_seed(
+            seed, sc=sc, rtt_model=None,
+            budget_grid=FIBER_BUDGET_GRID, strategies=FIBER_SWEEP_STRATEGIES)
+        fib_row = run_additive_budget_seed(
+            seed, sc=sc, rtt_model=fiber,
+            budget_grid=FIBER_BUDGET_GRID, strategies=FIBER_SWEEP_STRATEGIES)
+        rows.append({'geo': geo_row, 'fiber': fib_row})
+    return rows
+
+
+def _fiber_mean(rows, arm, strategy, budget):
+    i = FIBER_BUDGET_GRID.index(budget)
+    return float(np.mean([r[arm]['curves'][strategy][i] for r in rows]))
+
+
+class TestFiberToggleSweep:
+    def test_fiber_base_beats_geodesic_base_when_truth_is_fiber(
+            self, fiber_sweep_results):
+        b = FIBER_BUDGET_GRID[-1]
+        geo = _fiber_mean(fiber_sweep_results, 'geo', 'additive_em', b)
+        fib = _fiber_mean(fiber_sweep_results, 'fiber', 'additive_em', b)
+        print(f"\nfiber-truth world, additive_em at b={b}: "
+              f"geodesic-base {geo:.0f} km, fiber-base {fib:.0f} km")
+        assert fib < 0.5 * geo, (
+            f'fiber-base additive_em ({fib:.0f}) should dominate the '
+            f'geodesic-base twin ({geo:.0f}) when the truth is fiber')
+
+    def test_fiber_greedy_beats_geodesic_greedy(self, fiber_sweep_results):
+        b = FIBER_BUDGET_GRID[-1]
+        geo = _fiber_mean(fiber_sweep_results, 'geo',
+                          'greedy_additive_phased', b)
+        fib = _fiber_mean(fiber_sweep_results, 'fiber',
+                          'greedy_additive_phased', b)
+        print(f"\nfiber-truth world, greedy_phased at b={b}: "
+              f"geodesic-base {geo:.0f} km, fiber-base {fib:.0f} km")
+        assert fib < geo
+
+    def test_generate_fiber_figure(self, fiber_sweep_results):
+        from plot_error_additive import make_fiber_figure
+        path = make_fiber_figure(fiber_sweep_results)
         assert os.path.exists(path)
         assert os.path.getsize(path) > 5_000
 

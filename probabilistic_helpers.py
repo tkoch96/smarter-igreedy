@@ -28,6 +28,7 @@ functions; FeasibleRegion passes its configured slope explicitly.
 from __future__ import annotations
 
 import math
+import os
 import numpy as np
 from typing import Any
 
@@ -426,12 +427,13 @@ class FiberFloorRtt(RttModel):
     VPs, a region's MAP loop touches ~20 of them; base_ms_rows batches
     one subset lookup per optimizer point.
 
-    inf handling: a PolicyFloorEstimator already falls back to the OPEN
-    floor where the policy allows no route.  If the OPEN floor itself is
-    inf (the point is beyond lastmile_km_max of all mapped infrastructure),
-    base_ms falls back to the geodesic at fiber speed — the only finite
-    admissible bound left (floor ≥ geodesic always); the atlas simply has
-    nothing to say there.
+    inf handling: a PolicyFloorEstimator raises NoRouteError where the
+    policy allows no route (a policy bug — build the estimator with
+    no_route="open" for the legacy OPEN-floor fallback).  If the OPEN
+    floor itself is inf (the point is beyond lastmile_km_max of all
+    mapped infrastructure), base_ms falls back to the geodesic at fiber
+    speed — the only finite admissible bound left (floor ≥ geodesic
+    always); the atlas simply has nothing to say there.
 
     Pickling: pass `estimator_factory` (a picklable zero-arg callable
     rebuilding the estimator) and the instance pickles without the
@@ -442,11 +444,18 @@ class FiberFloorRtt(RttModel):
 
     def __init__(self, estimator=None, vp_locs: list[LatLon] = (),
                  slope: float = DEFAULT_FIBER_SLOPE, offset_ms: float = 0.0,
-                 estimator_factory=None, cache_token: str = None) -> None:
+                 estimator_factory=None, cache_token: str = None,
+                 prior_mu_ms: float = None) -> None:
         if estimator is None and estimator_factory is None:
             raise ValueError("need an estimator or an estimator_factory")
         self.slope = slope
         self.offset_ms = offset_ms
+        # Additive-model prior mean to use over this base (None = global
+        # default).  Production fiber models pass 0.0: the sloped floor
+        # already covers typical overhead, so the honest baseline is "no
+        # model correction needed" and a large fitted offset must be
+        # EARNED by many measurements, not granted by 3.
+        self.prior_mu_ms = prior_mu_ms
         # () = derive from the estimator (vp_lat/vp_lon or vp_locs attrs)
         # on first use, so pickles carry no per-VP payload
         self.vp_locs = [(float(a), float(b)) for a, b in vp_locs]
@@ -488,6 +497,7 @@ class FiberFloorRtt(RttModel):
         state = self.__dict__.copy()
         state['_floor_cache'] = {}
         state['_vp_idx'] = None
+        state.pop('_node_rows', None)
         if self._factory is not None:
             state['_estimator'] = None
         return state
@@ -516,6 +526,55 @@ class FiberFloorRtt(RttModel):
 
     def _vp_row(self, vp_loc: LatLon) -> int:
         return self.vp_idx[(round(vp_loc[0], 6), round(vp_loc[1], 6))]
+
+    # -- graph-node search support (map-matching to the fiber atlas) -----
+    # The estimator's per-VP fields already hold every VP's floor to every
+    # graph node, so the MAP location step can score ALL nodes exactly
+    # (vectorized) instead of letting Nelder-Mead wander into open ocean,
+    # where off-infrastructure points fall back to smooth geodesic
+    # predictions the data can never falsify.
+
+    @property
+    def supports_node_search(self) -> bool:
+        est = self.estimator
+        return (hasattr(est, 'graph')
+                and (hasattr(est, '_field') or hasattr(est, '_fields')))
+
+    def node_grid(self):
+        g = self.estimator.graph
+        return g.node_lat, g.node_lon
+
+    def _node_floor_row(self, v: int) -> np.ndarray:
+        """Per-VP OPEN floor to every graph node (candidate-generation
+        quality: open ≤ policy floors; final candidates are rescored with
+        the full policy base_ms).  Cached per VP per process."""
+        rows = getattr(self, '_node_rows', None)
+        if rows is None:
+            rows = self._node_rows = {}
+        f = rows.get(v)
+        if f is None:
+            est = self.estimator
+            if hasattr(est, '_field'):        # PolicyFloorEstimator
+                f = np.asarray(est._field(v, est._OPEN_SIG, None),
+                               dtype=np.float32)
+            else:                             # FloorEstimator
+                f = np.asarray(est._fields[v], dtype=np.float32)
+            rows[v] = f
+        return f
+
+    def node_bases(self, vp_locs: list[LatLon]) -> np.ndarray:
+        """(len(vp_locs), n_nodes) matrix of base_ms at every node."""
+        rows = np.vstack([self._node_floor_row(self._vp_row(vp))
+                          for vp in vp_locs])
+        return self.slope * rows + self.offset_ms
+
+    def on_infrastructure(self, loc: LatLon) -> bool:
+        """Within last-mile reach of any mapped fiber node — the model's
+        domain.  Beyond it every prediction is the geodesic fallback."""
+        nlat, nlon = self.node_grid()
+        km = haversine_grid(loc[0], loc[1], nlat, nlon)
+        return bool(km.min() <= getattr(self.estimator,
+                                        'lastmile_km_max', 300.0))
 
     def base_ms(self, vp_loc: LatLon, loc: LatLon) -> float:
         v = self._vp_row(vp_loc)
@@ -550,13 +609,61 @@ class FiberFloorRtt(RttModel):
 # symmetric priors anchor the split; consumers should rely on predictions
 # and CENTERED offsets, which are gauge-invariant.
 
-ADDITIVE_PRIOR_MU_MS = 5.0        # prior per-node overhead mean
+# Prior per-node overhead mean.  5 ms dates from the bare-geodesic era,
+# where offsets legitimately absorbed real path overhead; with a good
+# base model (fiber ×1.3) the honest prior is ~0 — "the atlas needs no
+# correction until measurements prove otherwise" (GEOLOC_PRIOR_MU_MS=0
+# for such runs; pair with a stronger GEOLOC_PRIOR_STRENGTH so a few
+# residuals can't claim a large model fix).
+ADDITIVE_PRIOR_MU_MS = float(os.environ.get('GEOLOC_PRIOR_MU_MS', '5.0'))
+
+
+def _prior_mu_for(rtt_model) -> float:
+    """Per-base-model prior mean: an RttModel may carry its own
+    `prior_mu_ms` (production fiber models set 0.0 — "the atlas needs no
+    correction until measurements prove otherwise"); None defers to the
+    global constant (bare geodesic keeps 5 ms — offsets there legitimately
+    absorb real overhead)."""
+    pm = getattr(rtt_model, 'prior_mu_ms', None)
+    return ADDITIVE_PRIOR_MU_MS if pm is None else float(pm)
 ADDITIVE_PRIOR_VAR_MS2 = 25.0     # prior per-node noise variance (5ms)²
-ADDITIVE_PRIOR_STRENGTH = 2.0     # pseudo-observations anchoring each node
+# Pseudo-observations anchoring each node's (μ, σ²) at the prior — the
+# L2/ridge strength of the additive fit.  At 2.0 a node with ~15 pairs
+# outvotes its prior 7:1, which lets a mislocated target launder its
+# position error into a huge fitted offset (measured: err>5000 km
+# targets carry median μ̂_dst 27 ms vs 0.5 ms for well-located ones) and
+# stop bidding for pings.  GEOLOC_PRIOR_STRENGTH overrides for A/B runs
+# (read at import; inherited by spawned workers).
+ADDITIVE_PRIOR_STRENGTH = float(os.environ.get('GEOLOC_PRIOR_STRENGTH', '2.0'))
 ADDITIVE_VAR_FLOOR_MS2 = 0.04     # (0.2ms)² — don't let variances collapse
 
+# Floor for the fitted per-node mean offsets (ms).  0.0 is the historical
+# hard lower-bound assumption: the base term is a physical floor, so
+# overhead can only be nonnegative.  A SMALL NEGATIVE value gives the fit
+# a soft landing when the base model can OVER-predict — e.g. a sloped
+# fiber floor whose ×1.3 slack exceeds the real detour on some paths:
+# modest over-prediction is then absorbed by the offset instead of being
+# forced into the location estimate (measured failure mode: 47% of long
+# dense constraints "impossible" → wholesale MAP displacement).
+# Run-level A/B knob: GEOLOC_MU_FLOOR_MS (read at import; inherited by
+# spawned worker processes).
+ADDITIVE_MU_FLOOR_MS = float(os.environ.get('GEOLOC_MU_FLOOR_MS', '0.0'))
 
-def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
+# Graph-node search (map-matching to the fiber atlas) in the additive MAP
+# location step — DEFAULT ON for base models that expose per-node floors
+# (real atlas estimators; test mocks don't, keeping plumbing pins
+# bit-exact).  GEOLOC_NODE_SEARCH=0 restores free Nelder-Mead only.
+NODE_SEARCH_DEFAULT = os.environ.get('GEOLOC_NODE_SEARCH', '1') == '1'
+NODE_SEARCH_TOP_K = 3
+
+
+LEARN_ALL = (True, True, True, True)  # (mu_src, var_src, mu_dst, var_dst)
+
+
+def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8,
+                        learn: tuple = LEARN_ALL,
+                        mu_floor_ms: float = None,
+                        prior_mu_ms: float = None):
     """
     Fit the two-way additive overhead model from SOL residuals.
 
@@ -569,11 +676,24 @@ def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
     Means via alternating shrunk averages (two-way ANOVA style); variances
     via moment matching on the de-meaned residuals, split alternately
     between the source and destination of each pair.
+
+    `learn` = (mu_src, var_src, mu_dst, var_dst) ablation mask: a frozen
+    family stays at its prior constant (exactly the value unknown nodes
+    fall back to), so the other families' fits absorb what they can.
+
+    `mu_floor_ms` clamps the fitted means (None → ADDITIVE_MU_FLOOR_MS,
+    default 0.0 = the historical nonnegative-overhead assumption; see the
+    constant's comment for when a small negative floor is warranted).
     """
+    if mu_floor_ms is None:
+        mu_floor_ms = ADDITIVE_MU_FLOOR_MS
+    if prior_mu_ms is None:
+        prior_mu_ms = ADDITIVE_PRIOR_MU_MS
+    learn_mu_s, learn_var_s, learn_mu_t, learn_var_t = learn
     srcs = sorted({s for s, _ in residuals_by_pair})
     dsts = sorted({t for _, t in residuals_by_pair})
-    mu_s = {s: ADDITIVE_PRIOR_MU_MS for s in srcs}
-    mu_t = {t: ADDITIVE_PRIOR_MU_MS for t in dsts}
+    mu_s = {s: prior_mu_ms for s in srcs}
+    mu_t = {t: prior_mu_ms for t in dsts}
 
     by_src = {s: [(t, rs) for (s2, t), rs in residuals_by_pair.items() if s2 == s]
               for s in srcs}
@@ -581,22 +701,26 @@ def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
               for t in dsts}
 
     for _ in range(n_iters):
-        for t in dsts:
-            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_MU_MS
-            den = ADDITIVE_PRIOR_STRENGTH
-            for s, rs in by_dst[t]:
-                for r in rs:
-                    num += r - mu_s[s]
-                    den += 1.0
-            mu_t[t] = max(0.0, num / den)
-        for s in srcs:
-            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_MU_MS
-            den = ADDITIVE_PRIOR_STRENGTH
-            for t, rs in by_src[s]:
-                for r in rs:
-                    num += r - mu_t[t]
-                    den += 1.0
-            mu_s[s] = max(0.0, num / den)
+        if learn_mu_t:
+            for t in dsts:
+                num = ADDITIVE_PRIOR_STRENGTH * prior_mu_ms
+                den = ADDITIVE_PRIOR_STRENGTH
+                for s, rs in by_dst[t]:
+                    for r in rs:
+                        num += r - mu_s[s]
+                        den += 1.0
+                mu_t[t] = max(mu_floor_ms, num / den)
+        if learn_mu_s:
+            for s in srcs:
+                num = ADDITIVE_PRIOR_STRENGTH * prior_mu_ms
+                den = ADDITIVE_PRIOR_STRENGTH
+                for t, rs in by_src[s]:
+                    for r in rs:
+                        num += r - mu_t[t]
+                        den += 1.0
+                mu_s[s] = max(mu_floor_ms, num / den)
+        if not (learn_mu_s or learn_mu_t):
+            break
 
     # Per-pair excess variance of the de-meaned residuals
     pair_var = {}
@@ -607,20 +731,24 @@ def fit_additive_params(residuals_by_pair: dict, n_iters: int = 8):
     var_s = {s: ADDITIVE_PRIOR_VAR_MS2 for s in srcs}
     var_t = {t: ADDITIVE_PRIOR_VAR_MS2 for t in dsts}
     for _ in range(n_iters):
-        for t in dsts:
-            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_VAR_MS2
-            den = ADDITIVE_PRIOR_STRENGTH
-            for s, _ in by_dst[t]:
-                num += max(0.0, pair_var[(s, t)] - var_s[s])
-                den += 1.0
-            var_t[t] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
-        for s in srcs:
-            num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_VAR_MS2
-            den = ADDITIVE_PRIOR_STRENGTH
-            for t, _ in by_src[s]:
-                num += max(0.0, pair_var[(s, t)] - var_t[t])
-                den += 1.0
-            var_s[s] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
+        if learn_var_t:
+            for t in dsts:
+                num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_VAR_MS2
+                den = ADDITIVE_PRIOR_STRENGTH
+                for s, _ in by_dst[t]:
+                    num += max(0.0, pair_var[(s, t)] - var_s[s])
+                    den += 1.0
+                var_t[t] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
+        if learn_var_s:
+            for s in srcs:
+                num = ADDITIVE_PRIOR_STRENGTH * ADDITIVE_PRIOR_VAR_MS2
+                den = ADDITIVE_PRIOR_STRENGTH
+                for t, _ in by_src[s]:
+                    num += max(0.0, pair_var[(s, t)] - var_t[t])
+                    den += 1.0
+                var_s[s] = max(ADDITIVE_VAR_FLOOR_MS2, num / den)
+        if not (learn_var_s or learn_var_t):
+            break
 
     return mu_s, var_s, mu_t, var_t
 
@@ -636,6 +764,15 @@ def additive_map_location(constraint_rows: list, starts: list[LatLon],
     Nelder-Mead is local, so several starts are tried and the best kept:
     always pass the previous estimate AND the NN anchor (lowest-RTT VP) —
     an early wrong fixed point must not trap later refits.
+
+    Fiber-atlas models additionally get GRAPH-NODE SEARCH (default; kill
+    switch GEOLOC_NODE_SEARCH=0): the same objective is evaluated at
+    every graph node in one vectorized pass (map-matching — the answer
+    must live near mapped fiber), the best node seeds an extra NM start,
+    the top nodes compete as candidates under the full policy base, and
+    an off-infrastructure winner (where base_ms is the unfalsifiable
+    geodesic fallback — how estimates used to end up mid-Pacific) is
+    rejected in favor of the best on-infrastructure candidate.
     """
     from scipy.optimize import minimize
 
@@ -657,17 +794,63 @@ def additive_map_location(constraint_rows: list, starts: list[LatLon],
                 total += r * r / (2.0 * var_sum)
             return total
 
+    node_candidates: list[LatLon] = []
+    use_nodes = (rtt_model is not None
+                 and NODE_SEARCH_DEFAULT
+                 and getattr(rtt_model, 'supports_node_search', False)
+                 and constraint_rows)
+    if use_nodes:
+        # Vectorized global scan of the SAME objective over every graph
+        # node (open floors — candidate generation; candidates are then
+        # rescored by nll(), i.e. the full policy base).
+        B = rtt_model.node_bases([row[0] for row in constraint_rows])
+        rtts = np.array([row[1] for row in constraint_rows])[:, None]
+        offs = np.array([row[2] for row in constraint_rows])[:, None]
+        vars_ = np.array([row[3] for row in constraint_rows])[:, None]
+        R = rtts - B - offs
+        cost = np.where(np.isfinite(R), R * R / (2.0 * vars_), np.inf).sum(axis=0)
+        nlat, nlon = rtt_model.node_grid()
+        k = min(NODE_SEARCH_TOP_K, len(cost))
+        for i in np.argpartition(cost, k - 1)[:k]:
+            if np.isfinite(cost[i]):
+                node_candidates.append((float(nlat[i]), float(nlon[i])))
+
     best, best_val = None, float('inf')
-    for start in starts:
+    best_oninfra, best_oninfra_val = None, float('inf')
+    for start in list(starts) + node_candidates[:1]:
         res = minimize(nll, np.array(start), method='Nelder-Mead',
                        tol=1e-4, options={'maxiter': 500})
-        if res.fun < best_val:
-            best, best_val = res.x, res.fun
+        pt, val = res.x, float(res.fun)
+        if val < best_val:
+            best, best_val = pt, val
+        if use_nodes and val < best_oninfra_val:
+            p = _normalize_latlon(float(pt[0]), float(pt[1]))
+            if rtt_model.on_infrastructure(p):
+                best_oninfra, best_oninfra_val = pt, val
+    # raw node candidates compete directly, rescored under the policy base
+    for p in node_candidates:
+        val = float(nll(np.array(p)))
+        if val < best_val:
+            best, best_val = np.array(p), val
+        if val < best_oninfra_val:      # nodes are on-infra by construction
+            best_oninfra, best_oninfra_val = np.array(p), val
+
+    if use_nodes and best_oninfra is not None:
+        chosen = _normalize_latlon(float(best[0]), float(best[1]))
+        if not rtt_model.on_infrastructure(chosen):
+            # the free-search winner lives in the geodesic-fallback zone
+            # (unfalsifiable terrain) — take the best answer the model can
+            # actually speak for
+            best = best_oninfra
     return _normalize_latlon(float(best[0]), float(best[1]))
 
 
 def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
-                      n_iters: int = 4, rtt_model: 'RttModel' = None):
+                      n_iters: int = 4, rtt_model: 'RttModel' = None,
+                      learn: tuple = LEARN_ALL,
+                      prev_estimates: dict = None,
+                      only_targets: set = None,
+                      extra_starts: dict = None):
     """
     Fresh batch fit of the additive model: params-first alternation from
     NN-anchored location inits (both paid-for pitfalls baked in — never
@@ -685,6 +868,30 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
     rtt_model:    optional injected base model — residuals and the MAP are
                   computed against its floor term instead of d/100 (the
                   per-node offsets then learn slack over the floor).
+    learn:        (mu_src, var_src, mu_dst, var_dst) ablation mask, threaded
+                  to fit_additive_params — frozen families stay at priors
+                  throughout the alternation, so the location steps never
+                  see learned values for them.
+    prev_estimates: optional {dst: (lat, lon)} from a previous polish —
+                  used as location inits (an EXTRA Nelder-Mead start; the
+                  NN anchor stays, and params are still fit fresh, per the
+                  never-warm-start-params rule).  Multi-start keeps the
+                  best NLL, so a stale previous estimate cannot make the
+                  fit worse than the fresh path's own starts.
+    only_targets: optional subset of targets whose LOCATION is
+                  re-optimised (the incremental-polish hot set: dirty or
+                  offset-moved targets).  Params are still fit over ALL
+                  pairs; other targets keep prev_estimates (or the NN
+                  anchor when absent).
+    extra_starts: optional {dst: (lat, lon)} of ADDITIONAL Nelder-Mead
+                  starts (e.g. the regions' live per-ping estimates).
+                  Without it, a target whose incremental estimate escaped
+                  an offset-position ridge gets polished only from the NN
+                  anchor / previous-polish starts — both possibly in the
+                  laundered basin — and the polish OVERWRITES the escape
+                  (measured: ping-time error 2,977 km → polished 13,827).
+                  Multi-start keeps the best NLL, so extra starts can
+                  only help.
 
     Returns (estimates, mu_s, var_s, mu_t, var_t).
     """
@@ -692,6 +899,7 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
              if s in vp_locs and rs}
     if not pairs:
         return {}, {}, {}, {}, {}
+    prior_mu = _prior_mu_for(rtt_model)
 
     best: dict[str, tuple[float, str]] = {}
     for (s, t), rs in pairs.items():
@@ -700,6 +908,12 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
             best[t] = (r, s)
     nn_est = {t: vp_locs[s] for t, (_, s) in best.items()}
     estimates = dict(nn_est)
+    if prev_estimates:
+        for t in estimates:
+            if t in prev_estimates:
+                estimates[t] = tuple(prev_estimates[t])
+    reopt = (set(estimates) if only_targets is None
+             else set(only_targets) & set(estimates))
 
     def base(s, t):
         if rtt_model is None:
@@ -712,13 +926,59 @@ def additive_batch_em(rtts_by_pair: dict, vp_locs: dict,
             (s, t): [r - base(s, t) for r in rs]
             for (s, t), rs in pairs.items()
         }
-        mu_s, var_s, mu_t, var_t = fit_additive_params(residuals)
+        mu_s, var_s, mu_t, var_t = fit_additive_params(residuals, learn=learn,
+                                                       prior_mu_ms=prior_mu)
         for t in estimates:
+            if t not in reopt:
+                continue
             rows = [(vp_locs[s], r, mu_s[s] + mu_t[t], var_s[s] + var_t[t])
                     for (s, t2), rs in pairs.items() if t2 == t
                     for r in rs]
-            estimates[t] = additive_map_location(rows, [estimates[t], nn_est[t]],
+            starts = [estimates[t], nn_est[t]]
+            if extra_starts and t in extra_starts:
+                starts.append(tuple(extra_starts[t]))
+            estimates[t] = additive_map_location(rows, starts,
                                                  rtt_model=rtt_model)
+
+    if extra_starts:
+        # Basin arbitration.  The alternation is params-first: offsets are
+        # fitted against the INITIAL estimates, so a position hypothesis
+        # from another basin (a region's live estimate that escaped an
+        # offset-position ridge) can never win the location step — the
+        # judging parameters belong to the incumbent basin.  Give each
+        # hypothesis its own self-consistent offset (closed-form μ_t refit
+        # with everything else fixed) and charge the prior's
+        # pseudo-observation cost, so a laundered 27 ms offset finally
+        # pays for its size; keep the better penalized NLL per target.
+        def penalized_nll(t, loc):
+            rows = [(s, r) for (s, t2), rs in pairs.items() if t2 == t
+                    for r in rs]
+            if not rows:
+                return float('inf'), prior_mu
+            num = ADDITIVE_PRIOR_STRENGTH * prior_mu
+            den = ADDITIVE_PRIOR_STRENGTH
+            res = []
+            for s, r in rows:
+                b = (get_distance(vp_locs[s], loc) / KM_PER_MS
+                     if rtt_model is None else rtt_model.base_ms(vp_locs[s], loc))
+                res.append((s, r - b))
+                num += r - b - mu_s[s]
+                den += 1.0
+            mu = max(ADDITIVE_MU_FLOOR_MS, num / den)
+            nll = sum((e - mu_s[s] - mu) ** 2 / (2.0 * (var_s[s] + var_t[t]))
+                      for s, e in res)
+            nll += (ADDITIVE_PRIOR_STRENGTH * (mu - prior_mu) ** 2
+                    / (2.0 * var_t[t]))
+            return nll, mu
+        for t in reopt:
+            if t not in extra_starts:
+                continue
+            live = tuple(extra_starts[t])
+            nll_pol, _ = penalized_nll(t, estimates[t])
+            nll_live, mu_live = penalized_nll(t, live)
+            if nll_live < nll_pol:
+                estimates[t] = live
+                mu_t[t] = mu_live
 
     return estimates, mu_s, var_s, mu_t, var_t
 
@@ -746,8 +1006,14 @@ class AdditiveLatencyModel:
       sigma_dst(dst) → σ̂_t, the "stop sinking budget here" signal.
     """
 
-    def __init__(self, rtt_model: 'RttModel' = None) -> None:
+    def __init__(self, rtt_model: 'RttModel' = None,
+                 learn: tuple = LEARN_ALL) -> None:
         self.rtt_model = rtt_model
+        # Per-base-model prior mean (production fiber = 0: trust the atlas)
+        self.prior_mu_ms = _prior_mu_for(rtt_model)
+        # (mu_src, var_src, mu_dst, var_dst) ablation mask — frozen
+        # families stay at their prior constants across refits.
+        self.learn = learn
         self.rtts_by_pair: dict[tuple[str, str], list[float]] = {}
         self.mu_s: dict[str, float] = {}
         self.var_s: dict[str, float] = {}
@@ -773,11 +1039,12 @@ class AdditiveLatencyModel:
         }
         if residuals:
             self.mu_s, self.var_s, self.mu_t, self.var_t = \
-                fit_additive_params(residuals)
+                fit_additive_params(residuals, learn=self.learn,
+                                    prior_mu_ms=self.prior_mu_ms)
 
     def mean_offset(self, src: str, dst: str) -> float:
-        return (self.mu_s.get(src, ADDITIVE_PRIOR_MU_MS)
-                + self.mu_t.get(dst, ADDITIVE_PRIOR_MU_MS))
+        return (self.mu_s.get(src, self.prior_mu_ms)
+                + self.mu_t.get(dst, self.prior_mu_ms))
 
     def var_sum(self, src: str, dst: str) -> float:
         return (self.var_s.get(src, ADDITIVE_PRIOR_VAR_MS2)
