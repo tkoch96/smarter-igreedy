@@ -113,6 +113,33 @@ def plot_knob_grid(curves, marginals, output_filename):
 	plt.close()
 	print(f"Knob-grid figure saved to {output_filename}", flush=True)
 
+# Self-describing legend labels: every figure should say what a strategy
+# IS (selection + estimation + base model), never rely on conversation
+# context like "new" / "old".  Unknown names fall back to themselves.
+STRATEGY_LABELS = {
+	'random':
+		'random ping order + nearest-neighbor estimate (floor)',
+	'smart_perfect':
+		'oracle: error-guided selection using ground truth (ceiling)',
+	'greedy_phased':
+		'additive greedy (rtt = d/100 + X_src + X_dst), phased explore',
+	'greedy_phased_geo':
+		'additive greedy, 1.3×geodesic base',
+	'greedy_phased_fiber':
+		'additive greedy, 1.3×fiber-floor base, graph-node MAP',
+	'greedy_fiber':
+		'gaussian-region greedy, fiber-floor base',
+	'random_additive':
+		'random ping order + additive-model estimate',
+	'random_additive_fiber':
+		'random ping order + additive estimate, fiber-floor base',
+}
+
+
+def strategy_label(name):
+	return STRATEGY_LABELS.get(name, name)
+
+
 def plot_error_over_budget(results_data, output_filename):
 	"""
 	Plots the average geolocation error against the measurement budget.
@@ -137,11 +164,11 @@ def plot_error_over_budget(results_data, output_filename):
 		errors = data['errors']
 		
 		plt.plot(
-			budgets, 
-			errors, 
-			label=name.capitalize(), 
-			marker=markers[i % len(markers)], 
-			linewidth=2, 
+			budgets,
+			errors,
+			label=strategy_label(name),
+			marker=markers[i % len(markers)],
+			linewidth=2,
 			markersize=6,
 			alpha=0.8
 		)
