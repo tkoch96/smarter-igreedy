@@ -18,9 +18,12 @@ import requests
 BASE = "https://atlas.ripe.net/api/v2"
 KEY_FILE = Path.home() / ".ripe_atlas_key"
 
-# RIPE Atlas platform limits (see atlas.ripe.net/docs/udm; mirrors the
-# constants in the old atlas_pinger.py)
-MAX_PROBES_PER_MEAS = 100
+# RIPE Atlas platform limits (docs re-checked 2026-07-09: 1000 probes per
+# measurement, 100 concurrent, 100k results/day, <=50 results/s per
+# measurement). The old 100-probe cap came from atlas_pinger.py and made
+# the concurrency slots the bottleneck: ~90 slots x ~10 min one-off
+# lifetime = ~15 measurements/min no matter how many pairs each carries.
+MAX_PROBES_PER_MEAS = 1000
 MAX_ACTIVE_MEAS = 90  # platform cap 100; leave headroom
 PING_PACKETS = 3  # credits per ping result = packets
 
@@ -68,6 +71,9 @@ def create_ping(target_ip, probe_ids, description, packets=PING_PACKETS):
                 "description": description,
                 "packets": packets,
                 "resolve_on_probe": False,
+                # platform rejects >50 results/s per measurement; spread
+                # the probes so large batches stay under it
+                "spread": max(1, -(-len(probe_ids) // 50)),
             }
         ],
         "probes": [

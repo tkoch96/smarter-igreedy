@@ -252,7 +252,7 @@ class TestState:
         st = CampaignState(tmp_path / "s.sqlite")
         st.record_scheduled(111, dst_prb=5, dst_ip="10.0.0.5", src_prbs=[1, 2, 3])
         assert st.attempted_pairs() == {(1, 5), (2, 5), (3, 5)}
-        assert st.open_measurements() == [(111, 5, "10.0.0.5")]
+        assert st.open_measurements() == [(111, 5, "10.0.0.5", "coverage")]
         st.record_result(1, 5, 12.5)
         st.record_result(2, 5, None)
         st.close_measurement(111)  # pair (3,5) still pending -> failed
@@ -274,6 +274,68 @@ class TestState:
             st.strike_src(10)
         st.credit_ok(10)
         assert 10 not in st.benched_probes()
+
+
+class TestRemeasure:
+    def test_history_keeps_last_n(self, tmp_path):
+        from mesh_campaign.state import HISTORY_KEEP
+
+        st = CampaignState(tmp_path / "s.sqlite")
+        st.record_scheduled(111, dst_prb=5, dst_ip="10.0.0.5", src_prbs=[1])
+        for i in range(HISTORY_KEEP + 2):
+            st.record_result(1, 5, 10.0 + i, rtt2=10.1 + i, msm_id=111)
+        n = st.db.execute(
+            "SELECT COUNT(*) FROM pair_history WHERE src=1 AND dst=5"
+        ).fetchone()[0]
+        assert n == HISTORY_KEEP
+
+    def test_candidates_trigger_rules(self, tmp_path):
+        st = CampaignState(tmp_path / "s.sqlite")
+        st.record_scheduled(111, dst_prb=5, dst_ip="10.0.0.5", src_prbs=[1, 2, 3, 4])
+        st.record_result(1, 5, 10.0, rtt2=11.0, msm_id=111)  # corroborated
+        st.record_result(2, 5, 10.0, rtt2=17.0, msm_id=111)  # gappy
+        st.record_result(3, 5, 10.0, rtt2=None, msm_id=111)  # single packet
+        st.record_result(4, 5, None)  # failed: never a candidate
+        cands = st.remeasure_candidates(max_per_week=99)
+        assert [(s, d) for s, d, _ in cands] == [(3, 5), (2, 5)]  # worst first
+
+    def test_candidates_weekly_cap(self, tmp_path):
+        from mesh_campaign.state import REMEASURE_MAX_PER_WEEK
+
+        st = CampaignState(tmp_path / "s.sqlite")
+        st.record_scheduled(111, dst_prb=5, dst_ip="10.0.0.5", src_prbs=[1])
+        for _ in range(REMEASURE_MAX_PER_WEEK):
+            st.record_result(1, 5, 10.0, rtt2=17.0, msm_id=111)
+        assert st.remeasure_candidates() == []  # chronically noisy: accepted as-is
+
+    def test_failed_remeasure_never_demotes_ok_pair(self, tmp_path):
+        st = CampaignState(tmp_path / "s.sqlite")
+        st.record_scheduled(111, dst_prb=5, dst_ip="10.0.0.5", src_prbs=[1])
+        st.record_result(1, 5, 10.0, rtt2=17.0, msm_id=111)
+        st.record_result(1, 5, None, protect_ok=True)
+        assert st.results("ok") == [(1, 5, 10.0)]
+
+    def test_min2_rtt_of(self):
+        from mesh_campaign.results import min2_rtt_of
+
+        res = {"result": [{"rtt": 9.0}, {"rtt": 5.0}, {"rtt": 5.2}]}
+        assert min2_rtt_of(res) == (5.0, 5.2)
+        assert min2_rtt_of({"result": [{"rtt": 5.0}]}) == (5.0, None)
+        assert min2_rtt_of({"result": [{"x": 1}]}) == (None, None)
+
+    def test_export_uses_windowed_min(self, tmp_path):
+        from mesh_campaign.export import campaign_target_data
+
+        probes = [dict(p, id=pid) for p, pid in zip(synth_probes(), [100, 101, 102, 103])]
+        st = CampaignState(tmp_path / "s.sqlite")
+        st.record_scheduled(1, dst_prb=101, dst_ip="10.0.0.101", src_prbs=[100])
+        st.record_result(100, 101, 20.0, rtt2=20.1, msm_id=1)
+        # re-measure lands higher: pairs.min_rtt is the latest, but the
+        # exported value is the min over the history window
+        st.record_result(100, 101, 25.0, rtt2=25.1, msm_id=2)
+        ip = {p["id"]: p["ip"] for p in probes}
+        td = campaign_target_data(state=st, probes=probes)
+        assert td["loc_loc_meas"] == {ip[100]: {ip[101]: 20.0}}
 
 
 class TestExportAndMerge:

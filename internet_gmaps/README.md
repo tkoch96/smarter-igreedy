@@ -29,7 +29,7 @@ external callers `sys.path.append(<repo>/internet_gmaps)`).
 - `transit_policy.py` + `TRANSIT_POLICY.md` — geopolitical transit
   restrictions (whose fiber may carry through-traffic): country/region
   rules with endpoint exemptions, cable- and terrestrial-distrust RTT
-  factors, `DEFAULT_POLICY` (v3.2), and the per-rule evidence. Also the
+  factors, `DEFAULT_POLICY` (v3.7), and the per-rule evidence. Also the
   parallel policy-floor matrix/paths machinery used by validation.
 - `floor_query.py` — the query layer:
   - `FloorEstimator` — OPEN floors: exact per-VP distance fields +
@@ -40,10 +40,14 @@ external callers `sys.path.append(<repo>/internet_gmaps)`).
     lazy one-Dijkstra-per-(VP, country-class) fields, LRU-bounded
     (`max_cached_fields=`) with optional disk cache (`cache_dir=`,
     keyed by policy NAME — bump the name on rule changes), VP-subset
-    queries (`floor_ms_subset`), and OPEN-floor fallback exactly where
-    the policy allows no route (never bare geodesic). Country
-    attribution is injectable (`node_cc`/`vp_cc`/`point_cc_fn`),
-    defaulting to offline reverse_geocoder.
+    queries (`floor_ms_subset`). Where the policy leaves no allowed
+    route while the open graph has one, `floor_ms` raises
+    `NoRouteError` (a KeyError) — an unroutable pair is a policy bug,
+    never a silent number; `no_route="open"` restores the legacy
+    OPEN-floor fallback (never bare geodesic). Points off the graph
+    entirely stay inf under both modes. Country attribution is
+    injectable (`node_cc`/`vp_cc`/`point_cc_fn`), defaulting to
+    offline reverse_geocoder.
     ⚠️ the disk cache grows at ~250 KB × n_vps × realized classes
     (measured 22 GB at 1000 VPs); it is safe to delete — fields
     rebuild lazily.
@@ -54,8 +58,14 @@ external callers `sys.path.append(<repo>/internet_gmaps)`).
   scheduling, results, export). Measurement state lives in
   `mesh_campaign/data/` (not in git). No cron is installed; runs are
   manual via `python -m mesh_campaign.daily`.
-- `tests/` — unit tests (brute-force floor references, policy rules,
-  PolicyFloorEstimator exactness/fallback/cache) plus the mesh- and
+- `analysis/` — standalone diagnostic/figure scripts (stranded-pair
+  diagnosis, noise audits, regional cable attribution, floor
+  cross-checks, penalty-vs-deletion). Each file's docstring says when
+  to use it and how to run it; see also
+  `../.claude/HANDOFF_atlas_policy_v38.md` for the iteration playbook.
+- `tests/` — unit tests (brute-force floor references, policy rules
+  incl. terrestrial-only bans, PolicyFloorEstimator
+  exactness/NoRouteError/cache) plus the mesh- and
   graph-dependent validation suites (skip without the mesh cache /
   built graph / reverse_geocoder). Run
   `~/Documents/venv312/bin/python -m pytest tests/` from this dir.

@@ -17,7 +17,13 @@ raw floor was ~0.1% violated; if the policy pushes raw floors above real
 measurements, the restriction is wrong for those pairs (real traffic DOES
 transit there) — that rate is printed per formerly-transited country.
 
-Skips like the other mesh tests. Runtime ~2-4 min (one Dijkstra per
+Also pins the routability contract: test_no_policy_stranded_pairs
+asserts no pair with an open route loses it under the current policy
+(the NoRouteError guarantee — every probe stays routable).
+
+Skips like the other mesh tests. Runtime: seconds when the stage
+matrices are disk-cached (data/cache/floors_*.npy), ~5 min per
+uncached policy stage at ~3.2k metro locations (one Dijkstra per
 (VP, target-country-class); see transit_policy.policy_floor_matrix).
 """
 
@@ -48,6 +54,12 @@ from transit_policy import (
     OPEN_POLICY,
     V1_POLICY,
     V2_POLICY,
+    V32_POLICY,
+    V33_POLICY,
+    V34_POLICY,
+    V35_POLICY,
+    V36_POLICY,
+    V37_POLICY,
     policy_floor_matrix_parallel,
 )
 
@@ -60,7 +72,8 @@ pytestmark = pytest.mark.skipif(
 class PolicyEval:
     """Floors for every model stage, on the same sampled pairs:
     planned-cables-included open graph -> RFS-only open graph -> v1 policy
-    (falsified rules) -> v2 policy (current DEFAULT_POLICY)."""
+    (falsified rules) -> v2 -> v3.2 (node-level Africa ban, frozen) ->
+    current DEFAULT_POLICY."""
 
     MAX_LOCS = None  # full scale: floors are parallel across VPs + disk-cached
 
@@ -118,7 +131,67 @@ class PolicyEval:
                 ),
             )
         )
-        # stage 4: current policy
+        # stage 4: v3.2 (frozen history — node-level Africa ban)
+        self.v32_floor = pair(
+            self._cached_matrix(
+                V32_POLICY.name,
+                lambda: policy_floor_matrix_parallel(
+                    self.ev.graph, self.ana.node_cc, self.ev.lat, self.ev.lon,
+                    self.ana.loc_cc, V32_POLICY,
+                ),
+            )
+        )
+        # stage 5: v3.3 (frozen history — Africa terrestrial-only)
+        self.v33_floor = pair(
+            self._cached_matrix(
+                V33_POLICY.name,
+                lambda: policy_floor_matrix_parallel(
+                    self.ev.graph, self.ana.node_cc, self.ev.lat, self.ev.lon,
+                    self.ana.loc_cc, V33_POLICY,
+                ),
+            )
+        )
+        # stage 6: v3.4 (frozen history — falsified relay-exemption round)
+        self.v34_floor = pair(
+            self._cached_matrix(
+                V34_POLICY.name,
+                lambda: policy_floor_matrix_parallel(
+                    self.ev.graph, self.ana.node_cc, self.ev.lat, self.ev.lon,
+                    self.ana.loc_cc, V34_POLICY,
+                ),
+            )
+        )
+        # stage 7: v3.5 (frozen history — terrestrial-only generalization)
+        self.v35_floor = pair(
+            self._cached_matrix(
+                V35_POLICY.name,
+                lambda: policy_floor_matrix_parallel(
+                    self.ev.graph, self.ana.node_cc, self.ev.lat, self.ev.lon,
+                    self.ana.loc_cc, V35_POLICY,
+                ),
+            )
+        )
+        # stage 8: v3.6 (frozen history — falsified island-exemption scope)
+        self.v36_floor = pair(
+            self._cached_matrix(
+                V36_POLICY.name,
+                lambda: policy_floor_matrix_parallel(
+                    self.ev.graph, self.ana.node_cc, self.ev.lat, self.ev.lon,
+                    self.ana.loc_cc, V36_POLICY,
+                ),
+            )
+        )
+        # stage 9: v3.7 (frozen history)
+        self.v37_floor = pair(
+            self._cached_matrix(
+                V37_POLICY.name,
+                lambda: policy_floor_matrix_parallel(
+                    self.ev.graph, self.ana.node_cc, self.ev.lat, self.ev.lon,
+                    self.ana.loc_cc, V37_POLICY,
+                ),
+            )
+        )
+        # stage 10: current policy
         self.policy_mat = self._cached_matrix(
             self.policy.name,
             lambda: policy_floor_matrix_parallel(
@@ -134,6 +207,12 @@ class PolicyEval:
         self.res_open = self.meas - FIBER_SLOPE * self.open_floor
         self.res_v1 = self.meas - FIBER_SLOPE * self.v1_floor
         self.res_v2 = self.meas - FIBER_SLOPE * self.v2_floor
+        self.res_v32 = self.meas - FIBER_SLOPE * self.v32_floor
+        self.res_v33 = self.meas - FIBER_SLOPE * self.v33_floor
+        self.res_v34 = self.meas - FIBER_SLOPE * self.v34_floor
+        self.res_v35 = self.meas - FIBER_SLOPE * self.v35_floor
+        self.res_v36 = self.meas - FIBER_SLOPE * self.v36_floor
+        self.res_v37 = self.meas - FIBER_SLOPE * self.v37_floor
         self.res_policy = self.meas - FIBER_SLOPE * self.policy_floor
         self.res_base = (self.ev.meas - self.ev.geod_baseline)[s]
         # per pair: which of its open-path transit countries the policy bans
@@ -141,7 +220,53 @@ class PolicyEval:
             self.policy.banned_set(t, {sc, dc})
             for t, sc, dc in zip(self.ana.transit, self.ana.src_cc, self.ana.dst_cc)
         ]
+        # pseudo-region rules (node_cc_remaps, e.g. "XI"): open-path transit
+        # sets carry real ccs, so detect box crossings geometrically from
+        # the recovered path edges
+        if self.policy.node_cc_remaps:
+            g = self.ev.graph
+            for cc, (lat0, lat1, lon0, lon1) in self.policy.node_cc_remaps:
+                node_in = (
+                    (g.node_lat >= lat0) & (g.node_lat <= lat1)
+                    & (g.node_lon >= lon0) & (g.node_lon <= lon1)
+                )
+                edge_in = node_in[g.edge_src] | node_in[g.edge_dst]
+                for k, (edges, sc, dc) in enumerate(
+                    zip(self.ana.path_edges, self.ana.src_cc, self.ana.dst_cc)
+                ):
+                    if edges and edge_in[list(edges)].any():
+                        b = self.policy.banned_set({cc}, {sc, dc})
+                        if b:
+                            self.banned_on_path[k] = self.banned_on_path[k] | b
         self.formerly = np.array([len(b) > 0 for b in self.banned_on_path])
+        # factor-touched: open path rides an edge any distrust factor
+        # scales (cable name, terrestrial cc/group, corridor box) — floors
+        # legitimately change there without any country being banned
+        g = self.ev.graph
+        scaled_edge = np.zeros(g.n_edges, dtype=bool)
+        if g.edge_feature is not None:
+            names = list(g.feature_names)
+            for fname, _f in self.policy.cable_factors:
+                if fname in names:
+                    scaled_edge |= g.edge_feature == names.index(fname)
+            if "ITU" in names:
+                itu = g.edge_feature == names.index("ITU")
+                scc = self.ana.node_cc[g.edge_src]
+                dcc = self.ana.node_cc[g.edge_dst]
+                for cc, _f in self.policy.terrestrial_factors:
+                    if isinstance(cc, str):
+                        scaled_edge |= itu & (scc == cc) & (dcc == cc)
+                    else:
+                        grp = sorted(cc)
+                        scaled_edge |= itu & (np.isin(scc, grp) | np.isin(dcc, grp))
+        for _n, (lat0, lat1, lon0, lon1), _f in self.policy.corridor_factors:
+            nin = ((g.node_lat >= lat0) & (g.node_lat <= lat1)
+                   & (g.node_lon >= lon0) & (g.node_lon <= lon1))
+            scaled_edge |= nin[g.edge_src] | nin[g.edge_dst]
+        self.factor_touched = np.array([
+            bool(edges) and bool(scaled_edge[list(edges)].any())
+            for edges in self.ana.path_edges
+        ])
 
 
 @pytest.fixture(scope="module")
@@ -154,10 +279,23 @@ class TestPolicyValidation:
         finite = np.isfinite(pe.open_floor)
         assert np.all(pe.policy_floor[finite] >= pe.open_floor[finite] - 1e-6)
 
+    def test_no_policy_stranded_pairs(self, pe):
+        # every pair the OPEN graph can route must stay routable under the
+        # current policy — "every probe is routable". A pair with an open
+        # route but no policy route is a policy bug (the query layer
+        # raises NoRouteError for exactly these); v3.2's node-level Africa
+        # ban stranded ~14% of sampled pairs this way.
+        stranded = np.isfinite(pe.open_floor) & ~np.isfinite(pe.policy_floor)
+        assert stranded.sum() == 0, (
+            f"{stranded.sum():,} pairs have an open route but no route "
+            f"under {pe.policy.name}"
+        )
+
     def test_untouched_pairs_unchanged(self, pe):
-        # pairs whose open-model path transited no restricted country must
-        # keep (almost exactly) the same floor
-        untouched = ~pe.formerly & np.isfinite(pe.policy_floor)
+        # pairs whose open-model path transited no restricted country AND
+        # rode no factor-scaled edge must keep (almost exactly) the same
+        # floor — bans and distrust factors are the only levers
+        untouched = ~pe.formerly & ~pe.factor_touched & np.isfinite(pe.policy_floor)
         same = np.abs(pe.policy_floor[untouched] - pe.open_floor[untouched]) < 0.01
         assert np.mean(same) > 0.95
 
@@ -171,6 +309,12 @@ class TestPolicyValidation:
             ("1.3·fiber, open (RFS-only graph)", pe.res_open, "tab:green", "-"),
             ("1.3·fiber, v1 policy (falsified)", pe.res_v1, "tab:orange", "-"),
             ("1.3·fiber, v2 policy", pe.res_v2, "tab:brown", "-"),
+            ("1.3·fiber, v3.2 policy", pe.res_v32, "tab:pink", "-"),
+            ("1.3·fiber, v3.3 policy", pe.res_v33, "tab:cyan", "-"),
+            ("1.3·fiber, v3.4 policy (falsified)", pe.res_v34, "tab:olive", "-"),
+            ("1.3·fiber, v3.5 policy", pe.res_v35, "tab:gray", "-"),
+            ("1.3·fiber, v3.6 policy (falsified)", pe.res_v36, "tab:blue", "-"),
+            ("1.3·fiber, v3.7 policy", pe.res_v37, "tab:purple", "-"),
             (f"1.3·fiber, {pe.policy.name} (current)", pe.res_policy, "tab:red", "-"),
         ]
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5))
@@ -217,7 +361,13 @@ class TestPolicyValidation:
             ("open", pe.res_open[f], pe.open_floor[f]),
             ("v1", pe.res_v1[f], pe.v1_floor[f]),
             ("v2", pe.res_v2[f], pe.v2_floor[f]),
-            ("v3", pe.res_policy[f], pe.policy_floor[f]),
+            ("v3.2", pe.res_v32[f], pe.v32_floor[f]),
+            ("v3.3", pe.res_v33[f], pe.v33_floor[f]),
+            ("v3.4", pe.res_v34[f], pe.v34_floor[f]),
+            ("v3.5", pe.res_v35[f], pe.v35_floor[f]),
+            ("v3.6", pe.res_v36[f], pe.v36_floor[f]),
+            ("v3.7", pe.res_v37[f], pe.v37_floor[f]),
+            ("v3.8", pe.res_policy[f], pe.policy_floor[f]),
         ):
             fin = np.isfinite(r)
             print(

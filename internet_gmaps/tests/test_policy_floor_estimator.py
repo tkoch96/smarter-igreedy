@@ -18,10 +18,11 @@ import pytest
 
 import geo
 from fiber_graph import GraphBuilder
-from floor_query import FloorEstimator, PolicyFloorEstimator
+from floor_query import FloorEstimator, NoRouteError, PolicyFloorEstimator
 from test_transit_policy import masked_brute_floor
 from transit_policy import (
     OPEN_POLICY,
+    CountryRule,
     TransitPolicy,
     allowed_node_mask,
     no_transit,
@@ -79,7 +80,7 @@ class TestOpenEquivalence:
 
     def test_floor_many_matches_floor(self):
         g, node_cc = chain_through_xx()
-        pfe = make_pfe(g, node_cc, BLOCK_XX)
+        pfe = make_pfe(g, node_cc, BLOCK_XX, no_route="open")
         lats = np.array([0.0, 1.0, -2.0])
         lons = np.array([0.2, 7.7, 4.4])
         many = pfe.floor_many_ms(lats, lons)
@@ -153,10 +154,79 @@ class TestMatrixEquality:
                 assert got[v] == pytest.approx(want, rel=1e-9), (v, t, t_cc)
 
 
+class TestNoRouteError:
+    def test_strangled_route_raises_keyerror(self):
+        # AA -> BB must cross XX; the policy bans XX, the OPEN graph
+        # routes it: floor_ms must refuse loudly, not substitute a value
+        g, node_cc = chain_through_xx()
+        pfe = make_pfe(g, node_cc, BLOCK_XX, direct_km_max=0.0)
+        with pytest.raises(NoRouteError, match="stranded"):
+            pfe.floor_ms(0.0, 7.7)
+        with pytest.raises(KeyError):  # NoRouteError IS a KeyError
+            pfe.floor_ms(0.0, 7.7)
+        # the raw validation API still exposes inf for the same query
+        pf = pfe.policy_floor_ms(0.0, 7.7)
+        assert np.isinf(pf[0]) and np.isfinite(pf[1]) and np.isfinite(pf[2])
+
+    def test_subset_raises_only_when_a_blocked_vp_is_queried(self):
+        g, node_cc = chain_through_xx()
+        pfe = make_pfe(g, node_cc, BLOCK_XX, direct_km_max=0.0)
+        got = pfe.floor_ms_subset(0.0, 7.7, [1, 2])  # exempt VPs: fine
+        assert np.all(np.isfinite(got))
+        with pytest.raises(NoRouteError):
+            pfe.floor_ms_subset(0.0, 7.7, [0])
+
+    def test_open_inf_does_not_raise(self):
+        # off-grid target: even the open graph has no route — that is a
+        # graph-coverage gap, not a policy bug, so no raise: stays inf
+        b = GraphBuilder(snap_tolerance_km=1.0)
+        b.add_path([(0.0, 0.0), (0.0, 1.0)])
+        g = b.build()
+        pfe = PolicyFloorEstimator(
+            g, [0.0], [0.2], node_cc=np.array(["AA", "AA"]), vp_cc=np.array(["AA"]),
+            policy=BLOCK_XX, point_cc_fn=band_cc,
+            direct_km_max=100.0, lastmile_km_max=100.0,
+        )
+        assert np.isinf(pfe.floor_ms(0.0, 90.0)[0])
+
+    def test_invalid_no_route_mode_rejected(self):
+        g, node_cc = chain_through_xx()
+        with pytest.raises(ValueError):
+            make_pfe(g, node_cc, BLOCK_XX, no_route="fallback")
+
+
+class TestTerrestrialOnlyRules:
+    def test_estimator_matches_matrix_with_terrestrial_ban(self):
+        # ITU chain through XX + TG detour whose mid vertex is also XX:
+        # a terrestrial-only ban must leave the submarine route usable,
+        # identically in the matrix and the estimator
+        b = GraphBuilder(snap_tolerance_km=1.0)
+        b.add_path([(0.0, float(lon)) for lon in range(0, 9)], feature="ITU")
+        b.add_path([(0.0, 0.0), (6.0, 2.0), (6.0, 6.0), (0.0, 8.0)], feature="TG:around")
+        g = b.build()
+        node_cc = np.where((g.node_lon > 2.5) & (g.node_lon < 6.5), "XX", "AA")
+        lat, lon = np.zeros(2), np.array([-0.3, 8.3])
+        loc_cc = np.array(["AA", "BB"])
+        pol = TransitPolicy(
+            "t-terr",
+            (CountryRule("t-terr-xx", lambda cc: cc == "XX", terrestrial_only=True),),
+        )
+        kw = dict(lastmile_km_max=100.0, direct_km_max=0.0)
+        mat = policy_floor_matrix(g, node_cc, lat, lon, loc_cc, pol, **kw)
+        pfe = PolicyFloorEstimator(
+            g, lat, lon, node_cc=node_cc, vp_cc=loc_cc, policy=pol,
+            point_cc_fn=band_cc, **kw,
+        )
+        for t in range(2):
+            got = pfe.policy_floor_ms(lat[t], lon[t], cc=loc_cc[t])
+            np.testing.assert_allclose(got, mat[t, :], rtol=1e-12)
+        assert np.all(np.isfinite(mat))  # submarine keeps every pair routable
+
+
 class TestInfFallback:
     def test_blocked_route_falls_back_to_open_floor(self):
         g, node_cc = chain_through_xx()
-        pfe = make_pfe(g, node_cc, BLOCK_XX, direct_km_max=0.0)
+        pfe = make_pfe(g, node_cc, BLOCK_XX, direct_km_max=0.0, no_route="open")
         open_est = FloorEstimator(g, MESH_LAT, MESH_LON, direct_km_max=0.0)
         # target in BB territory: AA VP must cross XX -> policy inf
         lat, lon = 0.0, 7.7
@@ -170,22 +240,9 @@ class TestInfFallback:
         assert fl[0] == want_open[0] and np.isfinite(fl[0])
         np.testing.assert_array_equal(fl[1:], pf[1:])
 
-    def test_open_unreachable_stays_inf(self):
-        # even the open graph offers no route: floor_ms must stay inf
-        # (the model refuses to invent a route; the caller picks a fallback)
-        b = GraphBuilder(snap_tolerance_km=1.0)
-        b.add_path([(0.0, 0.0), (0.0, 1.0)])
-        g = b.build()
-        pfe = PolicyFloorEstimator(
-            g, [0.0], [0.2], node_cc=np.array(["AA", "AA"]), vp_cc=np.array(["AA"]),
-            policy=BLOCK_XX, point_cc_fn=band_cc,
-            direct_km_max=100.0, lastmile_km_max=100.0,
-        )
-        assert np.isinf(pfe.floor_ms(0.0, 90.0)[0])
-
     def test_fallback_never_below_open_floor(self):
         g, node_cc = chain_through_xx()
-        pfe = make_pfe(g, node_cc, BLOCK_XX)
+        pfe = make_pfe(g, node_cc, BLOCK_XX, no_route="open")
         open_est = FloorEstimator(g, MESH_LAT, MESH_LON)
         rng = np.random.default_rng(7)
         for _ in range(20):
@@ -219,7 +276,7 @@ class TestDiskCache:
 class TestVpSubsets:
     def test_subset_matches_full_query(self):
         g, node_cc = chain_through_xx()
-        pfe = make_pfe(g, node_cc, BLOCK_XX)
+        pfe = make_pfe(g, node_cc, BLOCK_XX, no_route="open")
         for lat, lon in ((0.0, 0.2), (0.0, 4.4), (1.0, 7.7)):
             full = pfe.floor_ms(lat, lon)
             for subset in ([0], [2, 0], [1, 2]):
@@ -230,7 +287,7 @@ class TestVpSubsets:
         # AA->BB blocked (inf -> open floor) while XX->BB stays finite:
         # a mixed subset must fall back only on the blocked rows
         g, node_cc = chain_through_xx()
-        pfe = make_pfe(g, node_cc, BLOCK_XX, direct_km_max=0.0)
+        pfe = make_pfe(g, node_cc, BLOCK_XX, direct_km_max=0.0, no_route="open")
         got = pfe.floor_ms_subset(0.0, 7.7, [0, 1])
         open_ = FloorEstimator(g, MESH_LAT, MESH_LON, direct_km_max=0.0)
         assert got[0] == open_.floor_ms(0.0, 7.7)[0]
@@ -238,9 +295,9 @@ class TestVpSubsets:
 
     def test_lru_eviction_keeps_results_exact(self, tmp_path):
         g, node_cc = chain_through_xx()
-        ref = make_pfe(g, node_cc, BLOCK_XX)
+        ref = make_pfe(g, node_cc, BLOCK_XX, no_route="open")
         pfe = make_pfe(g, node_cc, BLOCK_XX, cache_dir=tmp_path,
-                       max_cached_fields=2)
+                       max_cached_fields=2, no_route="open")
         for lon in (0.2, 4.4, 7.7, 0.2, 7.7):   # forces evictions + reloads
             np.testing.assert_array_equal(pfe.floor_ms(0.0, lon),
                                           ref.floor_ms(0.0, lon))

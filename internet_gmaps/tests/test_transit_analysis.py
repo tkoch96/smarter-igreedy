@@ -286,10 +286,20 @@ class TestCableResidualCorrelation:
         ax1.legend(fontsize=8)
 
         med = np.full(g.n_edges, np.nan)
+        cnt = np.zeros(g.n_edges)
         for e, v in edge_res.items():
+            cnt[e] = len(v)
             if len(v) >= 50:
                 med[e] = np.median(v)
-        segs, vals, bg = [], [], []
+        cnt_max = max(cnt.max(), 51.0)
+
+        def lw_of(n):
+            # width encodes VOLUME: log-scaled path-use count, 0.4-3.4 px
+            return 0.4 + 3.0 * (np.log10(n) - np.log10(50)) / (
+                np.log10(cnt_max) - np.log10(50)
+            )
+
+        segs, vals, widths, bg = [], [], [], []
         for e in range(g.n_edges):
             s, d = g.edge_src[e], g.edge_dst[e]
             if abs(g.node_lon[s] - g.node_lon[d]) >= 180:
@@ -298,23 +308,174 @@ class TestCableResidualCorrelation:
             if np.isfinite(med[e]):
                 segs.append(seg)
                 vals.append(med[e])
+                widths.append(lw_of(cnt[e]))
             else:
                 bg.append(seg)
         ax2.add_collection(LineCollection(bg, colors="0.88", linewidths=0.25, rasterized=True))
-        lc = LineCollection(segs, cmap="RdYlGn_r", norm=plt.Normalize(0, 120), linewidths=1.2)
+        lc = LineCollection(
+            segs, cmap="RdYlGn_r", norm=plt.Normalize(0, 120), linewidths=widths
+        )
         lc.set_array(np.array(vals))
         ax2.add_collection(lc)
+        ax2.scatter(
+            ana.ev.lon, ana.ev.lat, s=1.2, c="k", alpha=0.35, lw=0,
+            zorder=3, rasterized=True,
+        )
         fig.colorbar(lc, ax=ax2, label="median residual of paths using edge (ms)")
         ax2.set_xlim(-180, 180)
         ax2.set_ylim(-60, 80)
         ax2.set_title(
-            "Edges colored by median residual of the modeled paths using them\n"
-            "(grey: unused or support < 50)",
+            "Color: median residual of paths using edge; WIDTH: path-use volume (log)\n"
+            "(grey: unused or support < 50; black dots: probe locations)",
             fontsize=10,
         )
         fig.tight_layout()
         FIG_DIR.mkdir(exist_ok=True)
         fig.savefig(FIG_DIR / "cable_residual_offenders.pdf", bbox_inches="tight", dpi=150)
+        plt.close(fig)
+
+        # companion figure: pure VOLUME view (how much the model uses each
+        # edge), plus the most-used features with their residuals
+        from matplotlib.colors import LogNorm
+
+        fig, (bx1, bx2) = plt.subplots(
+            1, 2, figsize=(16.5, 5.5), gridspec_kw={"width_ratios": [1.1, 1.6]}
+        )
+        top_used = sorted(label_res, key=lambda lab: -len(label_res[lab]))[:15]
+        y = np.arange(len(top_used))[::-1]
+        bx1.barh(y, [len(label_res[lab]) for lab in top_used], color="tab:blue", alpha=0.85)
+        bx1.set_yticks(y)
+        bx1.set_yticklabels(
+            [lab if len(lab) <= 26 else lab[:25] + "…" for lab in top_used], fontsize=7
+        )
+        for yi, lab in zip(y, top_used):
+            bx1.annotate(
+                f" med {np.median(label_res[lab]):.0f} ms",
+                xy=(len(label_res[lab]), yi), va="center", fontsize=7, color="0.25",
+            )
+        bx1.set_xscale("log")
+        bx1.set_xlabel("path-uses (log)")
+        bx1.set_title("Most-used cables / link groups\n(annotation: median residual)", fontsize=10)
+
+        u_segs, u_vals, u_bg = [], [], []
+        for e in range(g.n_edges):
+            s, d = g.edge_src[e], g.edge_dst[e]
+            if abs(g.node_lon[s] - g.node_lon[d]) >= 180:
+                continue
+            seg = [(g.node_lon[s], g.node_lat[s]), (g.node_lon[d], g.node_lat[d])]
+            if cnt[e] >= 10:
+                u_segs.append(seg)
+                u_vals.append(cnt[e])
+            else:
+                u_bg.append(seg)
+        bx2.add_collection(LineCollection(u_bg, colors="0.9", linewidths=0.25, rasterized=True))
+        ulc = LineCollection(
+            u_segs, cmap="Blues", norm=LogNorm(10, cnt_max),
+            linewidths=[lw_of(max(n, 50)) for n in u_vals],
+        )
+        ulc.set_array(np.array(u_vals))
+        bx2.add_collection(ulc)
+        bx2.scatter(
+            ana.ev.lon, ana.ev.lat, s=1.2, c="k", alpha=0.35, lw=0,
+            zorder=3, rasterized=True,
+        )
+        fig.colorbar(ulc, ax=bx2, label="modeled paths using edge (log)")
+        bx2.set_xlim(-180, 180)
+        bx2.set_ylim(-60, 80)
+        bx2.set_title(
+            "Edge USAGE under the current policy — color and width: path-use volume\n"
+            "(grey: < 10 uses; black dots: probe locations)",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        fig.savefig(FIG_DIR / "cable_usage_map.pdf", bbox_inches="tight", dpi=150)
+        plt.close(fig)
+
+        # figure 3: FIX-IMPACT — which cable moves the residual CDF most if
+        # fixed. Each path's POSITIVE residual is apportioned across its
+        # edges by RTT-length share, so per-feature masses sum to the total
+        # error mass exactly once (a feature's mass = the most CDF mass a
+        # fix there could reclaim; endpoint slack is smeared onto the path).
+        mass = np.zeros(g.n_edges)
+        for r, edges in zip(ana.residual, ana.path_edges):
+            if not np.isfinite(r) or r <= 0 or not edges:
+                continue
+            e_arr = np.asarray(edges)
+            w = g.edge_rtt_ms[e_arr]
+            tot = w.sum()
+            if tot > 0:
+                np.add.at(mass, e_arr, r * (w / tot))
+        total_mass = float(mass.sum())
+
+        label_mass = defaultdict(float)
+        for e in np.flatnonzero(mass > 0):
+            label_mass[edge_label(e)] += mass[e]
+        top_fix = sorted(label_mass, key=lambda lab: -label_mass[lab])[:15]
+
+        print("\n=== fix-impact: share of total residual mass "
+              f"({total_mass / 1e3:,.0f} s over {len(ana.residual):,} paths) ===")
+        for lab in top_fix:
+            print(f"  {lab:<28s} {label_mass[lab] / total_mass:6.2%}  "
+                  f"(median {np.median(label_res[lab]):5.1f} ms, "
+                  f"n={len(label_res[lab]):,})")
+
+        fig, (cx1, cx2) = plt.subplots(
+            1, 2, figsize=(16.5, 5.5), gridspec_kw={"width_ratios": [1.1, 1.6]}
+        )
+        y = np.arange(len(top_fix))[::-1]
+        cx1.barh(y, [100 * label_mass[lab] / total_mass for lab in top_fix],
+                 color="tab:red", alpha=0.85)
+        cx1.set_yticks(y)
+        cx1.set_yticklabels(
+            [lab if len(lab) <= 26 else lab[:25] + "…" for lab in top_fix], fontsize=7
+        )
+        for yi, lab in zip(y, top_fix):
+            cx1.annotate(
+                f" med {np.median(label_res[lab]):.0f} ms × n={len(label_res[lab]):,}",
+                xy=(100 * label_mass[lab] / total_mass, yi),
+                va="center", fontsize=7, color="0.25",
+            )
+        cx1.set_xlabel("share of total residual mass (%)")
+        cx1.set_title("Fix priority — reclaimable share of the error CDF\n"
+                      "(volume × residual, fair-share attribution)", fontsize=10)
+
+        from matplotlib.colors import LogNorm as _LogNorm
+
+        m_segs, m_vals, m_bg = [], [], []
+        m_floor = total_mass * 1e-5
+        for e in range(g.n_edges):
+            s, d = g.edge_src[e], g.edge_dst[e]
+            if abs(g.node_lon[s] - g.node_lon[d]) >= 180:
+                continue
+            seg = [(g.node_lon[s], g.node_lat[s]), (g.node_lon[d], g.node_lat[d])]
+            if mass[e] > m_floor:
+                m_segs.append(seg)
+                m_vals.append(mass[e])
+            else:
+                m_bg.append(seg)
+        cx2.add_collection(LineCollection(m_bg, colors="0.9", linewidths=0.25, rasterized=True))
+        m_vals = np.array(m_vals)
+        mlc = LineCollection(
+            m_segs, cmap="viridis", norm=_LogNorm(m_floor, m_vals.max()),
+            linewidths=0.5 + 2.8 * (np.log(m_vals) - np.log(m_floor))
+            / (np.log(m_vals.max()) - np.log(m_floor)),
+        )
+        mlc.set_array(m_vals)
+        cx2.add_collection(mlc)
+        cx2.scatter(
+            ana.ev.lon, ana.ev.lat, s=1.2, c="k", alpha=0.35, lw=0,
+            zorder=3, rasterized=True,
+        )
+        fig.colorbar(mlc, ax=cx2, label="residual mass on edge (ms, log)")
+        cx2.set_xlim(-180, 180)
+        cx2.set_ylim(-60, 80)
+        cx2.set_title(
+            "Where the error CDF's mass lives — color/width: fair-share residual mass\n"
+            "(fixing bright-yellow/thick reclaims the most; black dots: probe locations)",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        fig.savefig(FIG_DIR / "cable_fix_impact.pdf", bbox_inches="tight", dpi=150)
         plt.close(fig)
 
         assert len(stats) >= 10
@@ -357,13 +518,17 @@ class TestTransitGridMap:
             vmax=120,
             alpha=0.75,
         )
+        ax.scatter(
+            ana.ev.lon, ana.ev.lat, s=1.2, c="k", alpha=0.35, lw=0,
+            zorder=3, rasterized=True,
+        )
         fig.colorbar(pm, ax=ax, label="median residual of paths crossing cell (ms)")
         ax.set_xlim(-180, 180)
         ax.set_ylim(-60, 80)
         ax.set_title(
             f"Where modeled paths accumulate unexplained latency — {GRID_DEG:.0f}° cells, "
             f"support ≥ {MIN_CELL_SUPPORT} pairs\n(median measured − 1.3·fiber floor over all "
-            "pairs whose modeled shortest path crosses the cell)"
+            "pairs whose modeled shortest path crosses the cell; black dots: probe locations)"
         )
         FIG_DIR.mkdir(exist_ok=True)
         fig.savefig(FIG_DIR / "transit_residual_map.pdf", bbox_inches="tight", dpi=150)

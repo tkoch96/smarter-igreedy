@@ -37,6 +37,19 @@ def min_rtt_of(result):
     return min(rtts) if rtts else None
 
 
+def min2_rtt_of(result):
+    """(lowest, second-lowest) packet RTT of one ping result. The second
+    value is None when fewer than two packets answered — an uncorroborated
+    min that the re-measure trigger treats as worst-case."""
+    rtts = sorted(
+        r["rtt"]
+        for r in result.get("result", [])
+        if isinstance(r, dict) and isinstance(r.get("rtt"), (int, float))
+    )
+    mn = min_rtt_of(result)
+    return mn, (rtts[1] if len(rtts) >= 2 else None)
+
+
 def resweep_closed_measurements(state, by_id, verbose=True):
     """Second-chance pull: re-fetch results for CLOSED measurements that
     still have failed pairs. Probes that were disconnected at measurement
@@ -68,10 +81,10 @@ def resweep_closed_measurements(state, by_id, verbose=True):
             src = res["prb_id"]
             if src not in failed_srcs:
                 continue
-            rtt = min_rtt_of(res)
+            rtt, rtt2 = min2_rtt_of(res)
             if rtt is None:
                 continue
-            state.record_result(src, dst_prb, rtt)
+            state.record_result(src, dst_prb, rtt, rtt2=rtt2, msm_id=msm_id)
             state.credit_ok(src)
             state.credit_ok(dst_prb)
             recovered += 1
@@ -85,13 +98,17 @@ def pull_open_measurements(state, by_id, grace_s=RESULTS_GRACE_S, verbose=True):
     update pair outcomes and probe health. Returns list of
     (src, dst, min_rtt or None)."""
     outcomes = []
-    for msm_id, dst_prb, dst_ip in state.open_measurements(older_than_s=grace_s):
+    for msm_id, dst_prb, dst_ip, kind in state.open_measurements(older_than_s=grace_s):
+        remeasure = kind == "remeasure"
         try:
             results = atlas_api.measurement_results(msm_id)
         except Exception as e:  # transient API failure: retry next run
             if verbose:
                 print(f"  msm {msm_id}: fetch failed ({e}); will retry")
             continue
+        # re-measures carry no pending pairs rows (record_scheduled), so
+        # expected is empty for them: silent sources are not failures — the
+        # pair keeps its existing ok RTT and only answered pings add history
         expected = {
             src for src, dst, *_ in state.db.execute(
                 "SELECT src, dst FROM pairs WHERE msm_id=?", (msm_id,)
@@ -100,9 +117,11 @@ def pull_open_measurements(state, by_id, grace_s=RESULTS_GRACE_S, verbose=True):
         answered = set()
         for res in results:
             src = res["prb_id"]
-            rtt = min_rtt_of(res)
+            rtt, rtt2 = min2_rtt_of(res)
             answered.add(src)
-            state.record_result(src, dst_prb, rtt)
+            state.record_result(
+                src, dst_prb, rtt, rtt2=rtt2, msm_id=msm_id, protect_ok=remeasure
+            )
             outcomes.append((src, dst_prb, rtt))
             if rtt is None:
                 continue
@@ -123,5 +142,9 @@ def pull_open_measurements(state, by_id, grace_s=RESULTS_GRACE_S, verbose=True):
         state.close_measurement(msm_id)
         if verbose:
             n_ok = sum(1 for s, d, r in outcomes if d == dst_prb and r is not None)
-            print(f"  msm {msm_id} -> dst {dst_prb}: {n_ok}/{len(expected)} pairs ok")
+            tag = " [remeasure]" if remeasure else ""
+            print(
+                f"  msm {msm_id} -> dst {dst_prb}: "
+                f"{n_ok}/{len(expected) or len(results)} pairs ok{tag}"
+            )
     return outcomes

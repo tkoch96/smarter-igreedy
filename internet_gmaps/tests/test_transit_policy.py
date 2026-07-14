@@ -66,6 +66,131 @@ class TestRules:
         assert africa_containment(exempt_suez=False).banned("EG", frozenset({"DE", "SG"}))
         assert "ZA" in AFRICA_CCS and "EG" in AFRICA_CCS
 
+    def test_small_island_transit(self):
+        from transit_policy import SMALL_ISLAND_NATIONS, small_island_transit
+
+        rule = small_island_transit()
+        # ZA<->IN may not ride SAFE through Mauritius
+        assert rule.banned("MU", frozenset({"ZA", "IN"}))
+        # any small-island endpoint unlocks the CLASS: MU<->DE may hop RE
+        assert not rule.banned("MU", frozenset({"MU", "DE"}))
+        assert not rule.banned("RE", frozenset({"MU", "DE"}))
+        # major island hubs are not members; Pacific relays are exempt
+        for cc in ("HK", "SG", "TW", "NZ", "IE", "FJ", "GU"):
+            assert not rule.banned(cc, frozenset({"US", "DE"})), cc
+        assert "IS" in SMALL_ISLAND_NATIONS  # island access chains: IS->FO->GB
+        assert not rule.banned("FO", frozenset({"IS", "GB"}))
+        # v3.7: BIG-island endpoints unlock too — DO/HT ride the Antilles
+        assert not rule.banned("PR", frozenset({"DO", "US"}))
+        assert rule.banned("PR", frozenset({"BR", "US"}))  # mainland pairs don't
+        assert "BL" in SMALL_ISLAND_NATIONS  # v3.6 gap: stranded 137 pairs
+
+    def test_group_terrestrial_factor_covers_cross_border(self):
+        from transit_policy import OPEN_POLICY, policy_floor_matrix_parallel
+
+        # one ITU chain whose middle crosses TM->UZ, one all-AA control
+        b = GraphBuilder(snap_tolerance_km=1.0)
+        b.add_path([(0.0, float(lon)) for lon in range(0, 9)], feature="ITU")
+        b.add_path([(5.0, float(lon)) for lon in range(0, 9)], feature="ITU")
+        g = b.build()
+        node_cc = np.array(
+            ["TM" if lat < 2.5 and lon < 4 else ("UZ" if lat < 2.5 else "AA")
+             for lat, lon in zip(g.node_lat, g.node_lon)]
+        )
+        lat = np.array([0.0, 0.0, 5.0, 5.0])
+        lon = np.array([-0.3, 8.3, -0.3, 8.3])
+        loc_cc = np.array(["XA", "XB", "XA", "XB"])
+        kw = dict(n_workers=2, lastmile_km_max=100.0, direct_km_max=0.0)
+        policy = TransitPolicy(
+            "t-group", (), terrestrial_factors=((("TM", "UZ"), 2.0),)
+        )
+        open_ = policy_floor_matrix_parallel(g, node_cc, lat, lon, loc_cc, OPEN_POLICY, **kw)
+        scaled = policy_floor_matrix_parallel(g, node_cc, lat, lon, loc_cc, policy, **kw)
+        assert scaled[1, 0] > 1.5 * open_[1, 0]  # TM/UZ chain doubled incl. border edge
+        assert scaled[3, 2] == pytest.approx(open_[3, 2], rel=1e-9)  # AA chain untouched
+
+    def test_corridor_factor_scales_edges_in_box(self):
+        from transit_policy import OPEN_POLICY, policy_floor_matrix_parallel
+
+        # two featureless chains; only one passes through the corridor box
+        b = GraphBuilder(snap_tolerance_km=1.0)
+        b.add_path([(0.0, float(lon)) for lon in range(0, 9)])
+        b.add_path([(30.0, float(lon)) for lon in range(0, 9)])
+        g = b.build()
+        node_cc = np.array(["AA"] * g.n_nodes)
+        lat = np.array([0.0, 0.0, 30.0, 30.0])
+        lon = np.array([-0.3, 8.3, -0.3, 8.3])
+        loc_cc = np.array(["XA", "XB", "XA", "XB"])
+        kw = dict(n_workers=2, lastmile_km_max=200.0, direct_km_max=0.0)
+        policy = TransitPolicy(
+            "t-corr", (), corridor_factors=(("box", (-2.0, 2.0, 2.0, 6.0), 2.0),)
+        )
+        open_ = policy_floor_matrix_parallel(g, node_cc, lat, lon, loc_cc, OPEN_POLICY, **kw)
+        scaled = policy_floor_matrix_parallel(g, node_cc, lat, lon, loc_cc, policy, **kw)
+        assert scaled[1, 0] > 1.2 * open_[1, 0]  # equatorial chain crosses the box
+        assert scaled[3, 2] == pytest.approx(open_[3, 2], rel=1e-9)  # lat-30 chain untouched
+
+    def test_indian_ocean_containment(self):
+        from transit_policy import (
+            INDIAN_OCEAN_BOX,
+            indian_ocean_containment,
+        )
+
+        rule = indian_ocean_containment()
+        # mainland<->mainland may not cross the open Indian Ocean
+        assert rule.banned("XI", frozenset({"ZA", "AU"}))
+        assert rule.banned("XI", frozenset({"OM", "AU"}))
+        # island endpoints keep their chains
+        assert not rule.banned("XI", frozenset({"MU", "DE"}))
+        assert not rule.banned("XI", frozenset({"MG", "US"}))
+        # remap: box nodes become XI, others untouched; policies without
+        # remaps are a no-op
+        pol = DEFAULT_POLICY
+        cc = pol.remap_node_cc(
+            np.array(["AA", "AA", "AA"]),
+            np.array([-20.0, -20.0, 30.0]),
+            np.array([70.0, 120.0, 70.0]),
+        )
+        np.testing.assert_array_equal(cc, ["XI", "AA", "AA"])
+        lat0, lat1, lon0, lon1 = INDIAN_OCEAN_BOX
+        assert lat1 <= 5.0  # the Suez->India->Malacca mainline stays out
+
+    def test_soviet_bloc_region_exemption(self):
+        # v3.4: a bloc endpoint unlocks bloc fiber (KZ exits via RU) but a
+        # non-bloc pair still can't cross it, and EU-integrated ex-bloc
+        # endpoints don't unlock (EE is outside the exempting region)
+        rule = soviet_bloc(region_exempt=True)
+        assert rule.banned("RU", frozenset({"DE", "JP"}))
+        assert not rule.banned("RU", frozenset({"KZ", "DE"}))
+        assert not rule.banned("UZ", frozenset({"KZ", "DE"}))  # region-wide
+        assert rule.banned("RU", frozenset({"EE", "JP"}))
+
+    def test_relay_island_exemptions(self):
+        # v3.4: Caribbean + Atlantic/Indian relay islands exempt from the
+        # small-country ban (the Pacific lesson, two more oceans)
+        from transit_policy import CABLE_RELAY_ISLANDS
+
+        rule = small_country(5.0, exempt=CABLE_RELAY_ISLANDS)
+        for cc in ("AG", "DM", "SX", "TT", "CV", "ST", "SC", "MU", "MV", "FJ"):
+            assert not rule.member(cc), cc
+        assert rule.member("BT")  # non-relay small states stay restricted
+
+    def test_africa_terrestrial_only_split(self):
+        # v3.3: the granular Africa rule bans terrestrial edges only —
+        # banned_split routes it to the terrestrial set, node set empty
+        rule = africa_containment(country_granular=True, terrestrial_only=True)
+        assert rule.terrestrial_only
+        assert rule.banned("NG", frozenset({"US", "BR"}))
+        pol = TransitPolicy("t", (rule,))
+        node_b, terr_b = pol.banned_split({"NG", "US"}, {"US", "BR"})
+        assert node_b == frozenset() and terr_b == {"NG"}
+        # a country hit by a node rule too lands in node_banned
+        pol2 = TransitPolicy("t2", (rule, no_transit("NG")))
+        node_b, terr_b = pol2.banned_split({"NG"}, {"US", "BR"})
+        assert node_b == {"NG"} and terr_b == frozenset()
+        # attribution view stays the union
+        assert pol.banned_set({"NG"}, {"US", "BR"}) == {"NG"}
+
     def test_default_policy_composition(self):
         # restricted() = banned with no exempting endpoint (worst case).
         # v3: TW added; Africa is country-granular (ZA/KE/NG via that rule).
@@ -80,13 +205,17 @@ class TestRules:
         # country rule: only the exact country unlocks itself
         assert "MU" in DEFAULT_POLICY.banned_set({"MU"}, {"FJ", "US"})
         assert "MU" not in DEFAULT_POLICY.banned_set({"MU"}, {"MU", "US"})
-        # v3 granular Africa: an African endpoint no longer unlocks OTHER
-        # African countries — only its own
-        assert "KE" in DEFAULT_POLICY.banned_set({"KE"}, {"NG", "US"})
-        assert "KE" not in DEFAULT_POLICY.banned_set({"KE"}, {"KE", "US"})
-        # the non-granular region rule keeps continent-level exemption
-        from transit_policy import V2_POLICY
+        # v3.2/v3.3 granular Africa (frozen): an African endpoint unlocks
+        # only its own country
+        from transit_policy import V2_POLICY, V33_POLICY
 
+        assert "KE" in V33_POLICY.banned_set({"KE"}, {"NG", "US"})
+        assert "KE" not in V33_POLICY.banned_set({"KE"}, {"KE", "US"})
+        # v3.5 (current): back to region granularity, terrestrial-only —
+        # a landlocked African endpoint may cross neighbors overland
+        assert "KE" not in DEFAULT_POLICY.banned_set({"KE"}, {"UG", "US"})
+        assert "KE" in DEFAULT_POLICY.banned_set({"KE"}, {"DE", "US"})
+        # the v2 node-level region rule keeps continent-level exemption
         assert "KE" not in V2_POLICY.banned_set({"KE"}, {"NG", "US"})
         assert "ZA" in V2_POLICY.banned_set({"ZA"}, {"NG", "US"})
 
@@ -234,6 +363,50 @@ class TestPolicyFloorMatrix:
         scaled = policy_floor_matrix_parallel(g, node_cc, lat, lon, loc_cc, policy, **kw)
         assert scaled[1, 0] > 1.5 * open_[1, 0]  # ITU-internal link doubled
         assert scaled[3, 2] == pytest.approx(open_[3, 2], rel=1e-9)  # cable untouched
+
+    def test_terrestrial_only_ban_keeps_submarine_route(self):
+        from transit_policy import policy_floor_matrix_parallel
+
+        # two routes AA -> BB: a short ITU overland chain through XX and a
+        # longer TG submarine detour whose mid vertex ALSO geocodes to XX
+        # (ocean vertices attribute to the nearest coastal state) — the
+        # Africa v3.3 scenario
+        b = GraphBuilder(snap_tolerance_km=1.0)
+        b.add_path([(0.0, float(lon)) for lon in range(0, 9)], feature="ITU")
+        b.add_path([(0.0, 0.0), (6.0, 2.0), (6.0, 6.0), (0.0, 8.0)], feature="TG:around")
+        g = b.build()
+        node_cc = np.where((g.node_lon > 2.5) & (g.node_lon < 6.5), "XX", "AA")
+        lat, lon = np.zeros(2), np.array([-0.3, 8.3])
+        loc_cc = np.array(["AA", "BB"])
+        kw = dict(lastmile_km_max=100.0, direct_km_max=0.0)
+
+        from transit_policy import CountryRule
+
+        open_ = policy_floor_matrix(g, node_cc, lat, lon, loc_cc, OPEN_POLICY, **kw)
+        terr_pol = TransitPolicy(
+            "t-terr",
+            (CountryRule("t-terr-xx", lambda cc: cc == "XX", terrestrial_only=True),),
+        )
+        terr = policy_floor_matrix(g, node_cc, lat, lon, loc_cc, terr_pol, **kw)
+        node_pol = TransitPolicy("t-node", (no_transit("XX"),))
+        node = policy_floor_matrix(g, node_cc, lat, lon, loc_cc, node_pol, **kw)
+
+        # node ban severs both routes (submarine mid vertex is XX): inf.
+        assert np.isinf(node[1, 0])
+        # terrestrial ban: overland blocked, submarine detour survives —
+        # finite, exactly the floor of the graph with only the TG path
+        b2 = GraphBuilder(snap_tolerance_km=1.0)
+        b2.add_path([(0.0, 0.0), (6.0, 2.0), (6.0, 6.0), (0.0, 8.0)], feature="TG:around")
+        est2 = FloorEstimator(b2.build(), lat, lon, **kw)
+        want = est2.floor_ms(lat[1], lon[1])[0]
+        assert np.isfinite(terr[1, 0])
+        assert terr[1, 0] == pytest.approx(want, rel=1e-9)
+        assert terr[1, 0] > open_[1, 0]  # detour is longer than overland
+        # parallel path agrees with serial under terrestrial bans
+        par = policy_floor_matrix_parallel(
+            g, node_cc, lat, lon, loc_cc, terr_pol, n_workers=2, **kw
+        )
+        np.testing.assert_allclose(par, terr, rtol=1e-12)
 
     def test_parallel_matches_serial(self):
         from transit_policy import policy_floor_matrix_parallel

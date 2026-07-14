@@ -63,6 +63,22 @@ single digits (source-side only).
 - The coverage projection does not model probation (day-1 country
   coverage really takes a few days while targets verify).
 
+## Re-measure feature (added 2026-07-10)
+
+A pair's min RTT is only trusted if a second packet corroborates it within
+REMEASURE_GAP_MS (5 ms). Every result now records its two lowest packets
+in `pair_history` (last HISTORY_KEEP=10 observations per pair; the
+exported RTT is the min over that window, so a stale one-packet low ages
+out after a path change). daily.py re-pings uncorroborated ok pairs at
+10 packets (credits aren't binding; results are) under `--remeasure-pairs`
+(default 15k/day), densest-dst batches first, capped at 300 measurements.
+Pairs observed REMEASURE_MAX_PER_WEEK=3 times in 7 days are accepted
+as-is (chronic noise). A failed re-measure never demotes an ok pair.
+Exhaustive backfill 2026-07-10 over all 373,131 campaign pairs: 4.20%
+gap-triggered, 0.98% single-packet; noise scales with RTT (0.34% under
+10 ms, 5.96% over 150 ms), and is diffuse across probes, not
+concentrated (only 41 probes >50% trigger rate).
+
 ## Account limits (learned empirically 2026-07-06, refined 07-07)
 
 The binding constraint is **100,000 results per ROLLING 24h window** (1

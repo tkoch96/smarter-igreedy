@@ -19,7 +19,9 @@ Skipped unless both inputs exist:
   ../cache/cached_target_data.pkl   (the mesh; see parent CLAUDE.md)
   data/graph_*.npz                  (run build_graph.py first)
 
-Runtime ~1 minute (~900 VP fields over a ~31k-node graph, ~825k pairs).
+Runtime ~1 minute: probes are clustered to 0.25° metros (MeshEval), so
+the per-VP fields scale with metro count (~3.2k at the 2026-07-09 mesh,
+10.7k probes / ~388k directed pairs), not raw probe count.
 """
 
 import pickle
@@ -334,6 +336,10 @@ class TestCaseStudyMaps:
             if abs(g.node_lon[s] - g.node_lon[d]) < 180
         ]
         ax.add_collection(LineCollection(segs, colors="0.8", linewidths=0.3, rasterized=True))
+        ax.scatter(
+            ev.lon, ev.lat, s=1.0, c="k", alpha=0.25, lw=0, zorder=2,
+            rasterized=True,
+        )
         for seg in split_antimeridian(geodesic_points(src, dst)):
             ax.plot(seg[:, 0], seg[:, 1], "--", color="tab:orange", lw=1.6)
         rtt, path = floor_path_ms(ev.graph, src, dst)
@@ -405,7 +411,7 @@ class TestCaseStudyMaps:
             )
         fig.suptitle(
             "Fiber-floor case studies — orange dashed: great circle; blue: fiber path; "
-            "grey: fiber graph",
+            "grey: fiber graph; black dots: probe locations",
             fontsize=11,
         )
         FIG_DIR.mkdir(exist_ok=True)

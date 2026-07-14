@@ -125,6 +125,15 @@ class FloorEstimator:
         return np.vstack([self.floor_ms(lat, lon) for lat, lon in zip(lats, lons)])
 
 
+class NoRouteError(KeyError):
+    """The transit policy leaves no allowed route from some VP to the
+    queried point even though the OPEN graph has one. An unroutable pair
+    is a policy bug, not a queryable state — every probe must be routable
+    — so floor_ms raises this (KeyError subclass) instead of silently
+    substituting a value. Construct the estimator with no_route="open"
+    for the legacy OPEN-floor fallback."""
+
+
 class PolicyFloorEstimator:
     """Policy-aware floors for arbitrary query points — the geolocation
     counterpart of transit_policy.policy_floor_matrix (which only handles
@@ -139,13 +148,18 @@ class PolicyFloorEstimator:
     bump the policy name on any rule change or you'll read stale physics.
 
     inf semantics: a policy floor of inf means "no allowed route", which
-    is not a usable likelihood. floor_ms() falls back to the OPEN floor
-    for exactly those (vp, point) entries — never to bare geodesic, which
-    would reintroduce the geodesic ridge precisely where the policy is
-    most opinionated. policy_floor_ms() exposes the raw (inf-preserving)
-    floors for validation. Both include the policy-free direct option
-    within direct_km_max, matching policy_floor_matrix. The OPEN floors
-    are themselves lazy per-VP fields (banned set = ∅, unscaled edges) —
+    is a policy bug — every probe must be routable. floor_ms() raises
+    NoRouteError (a KeyError) for exactly those (vp, point) entries by
+    default; no_route="open" restores the legacy OPEN-floor fallback
+    (never bare geodesic, which would reintroduce the geodesic ridge
+    precisely where the policy is most opinionated). Points that are inf
+    even on the OPEN graph (beyond lastmile_km_max of all mapped
+    infrastructure) stay inf under both modes — that is a graph-coverage
+    statement, not a policy one, and the caller picks the last-resort
+    bound. policy_floor_ms() exposes the raw (inf-preserving) floors for
+    validation. Both include the policy-free direct option within
+    direct_km_max, matching policy_floor_matrix. The OPEN floors are
+    themselves lazy per-VP fields (banned set = ∅, unscaled edges) —
     nothing is precomputed for VPs that are never queried.
 
     Scale: `vp_indices=` restricts any query to a subset of VPs — a
@@ -175,9 +189,22 @@ class PolicyFloorEstimator:
         lastmile_km_max=DEFAULT_LASTMILE_KM_MAX,
         cache_dir=None,
         max_cached_fields=None,
+        no_route="raise",
+        field_dtype=np.float64,
     ):
         # deferred import: transit_policy imports this module for the knobs
-        from transit_policy import DEFAULT_POLICY, scaled_base_data
+        from transit_policy import DEFAULT_POLICY, itu_entry_mask, scaled_base_data
+
+        if no_route not in ("raise", "open"):
+            raise ValueError(f"no_route must be 'raise' or 'open', got {no_route!r}")
+        self.no_route = no_route
+        # float32 halves field RAM/disk (~250 KB -> 125 KB per field; the
+        # LRU and the disk cache both double their reach) at ~0.5 µs RTT
+        # precision — plenty for geolocation, but NOT for the bit-exactness
+        # the validation suites pin, so float64 stays the default.  The
+        # disk-cache key includes the dtype, so compact and exact caches
+        # never serve each other.
+        self.field_dtype = np.dtype(field_dtype)
 
         self.graph = graph
         self.vp_lat = np.atleast_1d(np.asarray(vp_lat, dtype=float))
@@ -195,6 +222,11 @@ class PolicyFloorEstimator:
             if node_cc is not None
             else np.asarray(self._point_cc_fn(graph.node_lat, graph.node_lon))
         )
+        # geographic pseudo-countries (e.g. "XI" open Indian Ocean) apply
+        # before any rule or cache digest sees the attribution
+        self.node_cc = self.policy.remap_node_cc(
+            self.node_cc, graph.node_lat, graph.node_lon
+        )
         self.vp_cc = (
             np.asarray(vp_cc)
             if vp_cc is not None
@@ -209,6 +241,9 @@ class PolicyFloorEstimator:
         self._base_row, self._base_col = base.row, base.col
         self._open_data = base.data
         self._base_data = scaled_base_data(self.policy, graph, base, self.node_cc)
+        self._entry_itu = itu_entry_mask(graph, base.row, base.col)
+        self._cc_row = self.node_cc[self._base_row]
+        self._cc_col = self.node_cc[self._base_col]
         from collections import OrderedDict
 
         self._fields = OrderedDict()   # (v, sig) -> (n_nodes,) field, LRU
@@ -233,17 +268,19 @@ class PolicyFloorEstimator:
         if self.cache_dir is None:
             return None
         name = "open" if sig == self._OPEN_SIG else self.policy.name
-        key = "|".join(
-            [
-                name,
-                f"{self.vp_lat[v]:.6f},{self.vp_lon[v]:.6f}",
-                str(self.vp_cc[v]),
-                repr(sig),
-                f"{self.graph.n_nodes}n{self.graph.n_edges}e",
-                f"lm{self.lastmile_km_max}",
-                self._node_cc_digest,
-            ]
-        )
+        parts = [
+            name,
+            f"{self.vp_lat[v]:.6f},{self.vp_lon[v]:.6f}",
+            str(self.vp_cc[v]),
+            repr(sig),
+            f"{self.graph.n_nodes}n{self.graph.n_edges}e",
+            f"lm{self.lastmile_km_max}",
+            self._node_cc_digest,
+        ]
+        if self.field_dtype != np.float64:
+            # historical float64 cache filenames stay valid unchanged
+            parts.append(self.field_dtype.name)
+        key = "|".join(parts)
         h = hashlib.md5(key.encode()).hexdigest()[:16]
         return self.cache_dir / f"pfield_{h}.npy"
 
@@ -256,16 +293,23 @@ class PolicyFloorEstimator:
         n = self.graph.n_nodes
         if cc is None:
             ok = np.ones(n, dtype=bool)
+            banned_t = frozenset()
             data = self._open_data
         else:
-            banned = np.array(
-                sorted(self.policy.banned_set(self._uniq_node_ccs,
-                                              {self.vp_cc[v], cc})),
-                dtype=self.node_cc.dtype,
+            banned_n, banned_t = self.policy.banned_split(
+                self._uniq_node_ccs, {self.vp_cc[v], cc}
             )
-            ok = ~np.isin(self.node_cc, banned)
+            ok = ~np.isin(
+                self.node_cc, np.array(sorted(banned_n), dtype=self.node_cc.dtype)
+            )
             data = self._base_data
         emask = ok[self._base_row] & ok[self._base_col]
+        if banned_t:
+            banned_t = sorted(banned_t)
+            emask &= ~(
+                self._entry_itu
+                & (np.isin(self._cc_row, banned_t) | np.isin(self._cc_col, banned_t))
+            )
         km = geo.haversine_km(
             self.vp_lat[v], self.vp_lon[v], self.graph.node_lat, self.graph.node_lon
         )
@@ -292,7 +336,7 @@ class PolicyFloorEstimator:
         if path is not None and path.exists():
             f = np.load(path)
         else:
-            f = self._compute_field(v, cc)
+            f = self._compute_field(v, cc).astype(self.field_dtype, copy=False)
             if path is not None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.parent / f"{path.stem}.{os.getpid()}.tmp.npy"
@@ -337,16 +381,31 @@ class PolicyFloorEstimator:
                              self.direct_km_max, self.lastmile_km_max)
 
     def floor_ms(self, lat, lon, cc=None, vp_indices=None):
-        """Policy floors with the OPEN-floor fallback where the policy
-        floor is inf.  Still inf where even the open graph offers no route
-        (endpoint beyond lastmile_km_max of everything)."""
+        """Policy floors. Where the policy leaves no allowed route the
+        behavior follows the constructor's `no_route`: "raise" (default)
+        raises NoRouteError — an unroutable pair is a policy bug, never a
+        silent number — while "open" substitutes the OPEN floor for
+        exactly those (vp, point) entries. Entries that are inf even on
+        the open graph (endpoint beyond lastmile_km_max of everything)
+        stay inf under both modes."""
         vps = self._resolve_vps(vp_indices)
         pf = self.policy_floor_ms(lat, lon, cc, vps)
         blocked = ~np.isfinite(pf)
         if not np.any(blocked):
             return pf
+        of = self.open_floor_ms(lat, lon, vps[blocked])
+        if self.no_route == "raise":
+            strangled = np.isfinite(of)
+            if np.any(strangled):
+                raise NoRouteError(
+                    f"policy '{self.policy.name}' allows no route to "
+                    f"({float(lat):.3f}, {float(lon):.3f}) "
+                    f"[cc={cc or self.point_cc(lat, lon)}] from VP rows "
+                    f"{vps[blocked][strangled].tolist()} while the OPEN "
+                    f"graph routes them — the policy stranded this pair"
+                )
         out = pf.copy()
-        out[blocked] = self.open_floor_ms(lat, lon, vps[blocked])
+        out[blocked] = of  # under "raise" only open-inf entries remain
         return out
 
     def floor_ms_subset(self, lat, lon, vp_indices, cc=None):

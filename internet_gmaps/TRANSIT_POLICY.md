@@ -151,3 +151,126 @@ Next-iteration agenda from the v3.1 offender table: ITU Iraq links
 ITU Nepal links (62.8 — Himalayan India<->China crossing); APG (107.6);
 watch inf-pair growth (18k pairs, 15%) from granular Africa — the
 geolocation integration needs an explicit inf-fallback convention.
+
+## v3.2 (2026-07-06, evening round)
+
+NEW mechanism `terrestrial_factors` — RTT multipliers on ITU links
+INTERNAL to a country (the Iraq lesson: ITU IQ at 92.7 ms while IQ
+'transit' pairs riding Gulf coastal cables are fine; a node ban would
+have severed those submarine chains). v3.2 = v3.1 + distrust-itu[IQ x2].
+
+## v3.3 (2026-07-09, expanded mesh 835k pairs)
+
+The granular Africa ban goes **terrestrial-only** (new `CountryRule
+terrestrial_only=True`): only ITU overland edges in African countries are
+banned for pairs without the matching African endpoint; nodes stay, so
+the east/west coastal submarine systems keep routing — sea cables around
+Africa ARE how traffic transits the continent, and the node-level ban
+was severing them because ocean vertices reverse-geocode to the nearest
+coastal state. Evidence: the v3.2 falsifier table itself (MR/EH/CV at
+15-16%, MA/DZ/TN at 7-9% raw violations with negative medians — floors
+pushed ABOVE real measurements on west-coast routes), plus ~14% of
+sampled pairs stranded outright (no allowed route).
+
+Paired contract change in the query layer: `PolicyFloorEstimator.
+floor_ms` now RAISES `NoRouteError` (a KeyError) when the policy strands
+a pair the open graph can route, instead of silently substituting the
+OPEN floor (`no_route="open"` restores the old fallback). Points off the
+graph entirely (open floor inf) still return inf — that is graph
+coverage, not policy. `test_policy_validation.py::
+test_no_policy_stranded_pairs` pins stranded == 0 under the current
+policy; the "inf-fallback convention" agenda item above is thereby
+closed.
+
+## v3.4 (2026-07-09, FALSIFIED same day — kept for the progression)
+
+From the v3.3 stranded-pair diagnosis (12,180 sampled pairs open-routable
+but policy-unroutable): soviet-bloc gains region-level endpoint exemption
+(the per-country exemption left every landlocked bloc state — KZ 3.7k
+stranded pairs, KG/TJ/MN — with no exit, while reality exits via Moscow),
+and the Pacific relay-island exemption was extended by enumeration to the
+Caribbean (Antilles chain; DO at 11M population was stranded by its
+neighbors) and Atlantic/Indian oceans (CV/ST/GQ, MU/RE/SC/KM/MV).
+Falsifier verdict: enumeration is whack-a-mole. The west-Africa trunk
+also crosses the waters of small NON-island states (GM/GW/GA/NA/EH/MR —
+Mauritania at 4.9M sits just under the 5M threshold), so formerly-
+stranded west-African pairs got detour floors ABOVE their measurements
+(GM 72%, GW 78%, NG 80% raw violations) and 2,256 landlocked-African
+pairs stayed stranded.
+
+## v3.5 (2026-07-09, current)
+
+The v3.3 terrestrial-only insight generalized — every intuition in the
+policy was about OVERLAND fiber:
+
+- `small-country-terrestrial[<5M]`: the small-state ban applies to ITU
+  edges only. Node semantics kept severing submarine trunks wherever
+  ocean vertices geocode to a small coastal state (Pacific v1 88-99%,
+  Antilles 28-39%, west Africa 50-80% — three oceans, same artifact).
+- `no-africa-transit-terrestrial-except-suez`: back to REGION
+  granularity. Landlocked Africa (UG/ZW/ZM/MW/BF/TD/SS/RW/CD/LS) must
+  cross neighbors overland to reach the coast — geography, not fiction;
+  the coastal-chain fiction the granular rule targeted is submarine and
+  the terrestrial-only mechanism already governs it. Non-African pairs
+  still cannot cross Africa overland.
+- soviet-bloc-minus-EU-region kept from v3.4 (validated: KZ 69.9 ->
+  27.7 ms median at 0.7% violations, MN 126.7 -> 23.7 at 0.9%).
+
+Result (120k sampled pairs, 835k-pair mesh): **0 policy-stranded pairs**
+(the 108 remaining inf are open-graph coverage gaps), raw-floor
+violations 3.9% -> **1.2%** — the most admissible floor of the series —
+at the cost of explanatory tightness (median residual 10.1 -> 16.7 ms vs
+open 19.2). For the geolocator the trade is correct: a floor's hard
+requirement is admissibility (never above reality); tightness is
+secondary. The falsified v3.1-agenda items now read: every formerly-
+transiting country sits at positive median residual with <9% violations
+(worst: RU 8.6%). test_no_policy_stranded_pairs pins stranded == 0;
+NoRouteError (floor_query) makes any future regression loud.
+
+Open question carried forward: the v3.2/v3.3 tightness (median ~10 ms)
+came partly from bans the falsifiers now reject. Recovering it without
+violating admissibility needs finer mechanisms — the interconnection-
+evidence rule (HANDOFF_routing_realism.md) is the ranked candidate.
+
+## v3.6 (2026-07-09, FALSIFIED same day — kept for the progression)
+
+Three rules against the routes the v3.5 relaxations exposed:
+(1) `no-small-island-transit` — small-population island nations never
+carry non-island traffic (node-level: kills ZA<->IN riding SAFE through
+Mauritius); (2) RJCN/KJCN distrust x2 (land at Nakhodka, carriers
+interconnect in Tokyo/HK — the Taiwan lesson at cable level) + NEW group
+form of terrestrial_factors covering cross-border overland corridors
+(AZ-KG-TJ-TM-UZ x2: 96-115 ms residuals even for bloc-endpoint pairs);
+(3) NEW corridor_factors mechanism — geographic distrust box over
+Yemen waters / Bab-el-Mandeb x1.5 (future trench siblings inherit the
+war-zone risk automatically) + PEACE by name x2 (it absorbed the
+displaced model traffic under v3.5: 165 ms, n=5,023).
+Falsifier verdict: rules (2)/(3) validated (tightness recovered 16.8 ->
+13.1 ms median, violations 2.1%, no EU<->Asia blast radius from the
+corridor factor). Rule (1) scoped its exemption wrong: only SMALL-island
+endpoints could unlock the class, stranding Hispaniola — DO (11M) and HT
+are big islands served by the small-island Antilles chain — 1,085
+sampled pairs, plus BL/MF missing from the class (137 more).
+
+## v3.7 (2026-07-09, current)
+
+v3.6 with the island rule's exemption widened to ANY island-nation
+endpoint (`ISLAND_NATIONS` = small + big islands + Pacific relays;
+RegionRule gains `exempt_region` ⊇ region) and BL/MF added to the class.
+Island traffic rides island chains; mainland<->mainland still cannot
+touch small islands.
+
+Result (120k sampled pairs): **0 policy-stranded pairs** (108 inf are
+open-graph coverage gaps), median residual 13.5 ms (vs open 19.2, v3.5
+16.7), raw violations 2.0%, overshoot 20.2%. The three v3.6 mechanisms
+survive their falsifiers under v3.7: MN 22.3 ms med / 1.3% viol, BY
+18.8 / 2.2%, CN 22.3 / 2.4%, Maghreb positive medians.
+
+Known remaining over-restriction (the next refinement, deliberately not
+patched by enumeration): waters-attribution on the island ban — TT 15.5%
+/ SH 11.3% / CV 6.8% raw violations with negative medians are cables
+PASSING those islands' waters (ocean vertices geocode to the nearest
+island), not island infrastructure. Candidate mechanism: scope node bans
+to near-shore nodes (distance to the geocoded settlement <= ~75 km),
+which would also sharpen every other node rule's caveat about mid-ocean
+vertices.

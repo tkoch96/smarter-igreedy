@@ -2,7 +2,8 @@
 
 > Handoff for a fresh agent. Written 2026-07-06 after three
 > falsification rounds (policy v1 -> v3.2) against ~1M measured mesh
-> pairs. Companion to FIBER_GEOLOCATOR_RESULTS.md (the consumer) and
+> pairs. Updated 2026-07-09: v3.3 shipped (terrestrial-only Africa
+> ban — coastal submarine transit re-enabled); agenda item 6 resolved. Companion to FIBER_GEOLOCATOR_RESULTS.md (the consumer) and
 > internet_gmaps/TRANSIT_POLICY.md (rule-by-rule evidence + literature).
 > This one is the research agenda: which routing the shortest-fiber
 > model gets wrong, why, and the ranked list of mechanisms that would
@@ -75,11 +76,14 @@ nothing (IL at +5 ms) are unfalsifiable config debt — don't add them.
    but currently unfalsifiable (+5 ms, n=714). Trigger: mesh grows
    Middle East pairs, or Blue-Raman/TEAS RFS (which would make Israeli
    transit REAL — the rule may be obsolete before it's justified).
-6. **inf-floor growth**: 15-18% of pairs have no allowed route under
-   v3.2 (mostly granular-Africa). Is that over-restriction? Check
-   violation rates of the pairs whose floors went inf-adjacent, and
-   define the fallback contract (the geolocation integration uses
-   open-floor fallback — see FIBER_GEOLOCATOR_RESULTS.md).
+6. **inf-floor growth** — RESOLVED 2026-07-09 by v3.3: it WAS
+   over-restriction. The node-level granular-Africa ban was severing the
+   east/west coastal submarine systems (ocean vertices geocode to the
+   nearest coastal state); v3.3 makes the Africa ban terrestrial-only
+   (ITU edges), sea cables route again, and the query layer now raises
+   NoRouteError instead of silently falling back where a policy strands
+   an open-routable pair (test_no_policy_stranded_pairs pins zero).
+   See TRANSIT_POLICY.md v3.3.
 
 ## Proposed mechanisms, ranked
 

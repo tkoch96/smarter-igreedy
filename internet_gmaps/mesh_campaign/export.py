@@ -34,10 +34,20 @@ def campaign_target_data(state=None, probes=None, exclude_sol_suspect=True):
     suspect = sol_suspect_probes(state) if exclude_sol_suspect else set()
 
     addr_to_loc, meas = {}, defaultdict(dict)
+    # canonical RTT = min over the pair's HISTORY_KEEP most recent
+    # observations, so a re-measured path change ages out instead of a
+    # stale one-packet low pinning the floor forever; pairs without
+    # history (pre-remeasure-feature) keep their stored min
+    windowed = dict(
+        (((s, d), mn) for s, d, mn in state.db.execute(
+            "SELECT src, dst, MIN(min_rtt) FROM pair_history GROUP BY src, dst"
+        ))
+    )
     q = state.db.execute(
         "SELECT src, dst, min_rtt FROM pairs WHERE status='ok' AND msm_id > 0"
     )
     for src, dst, rtt in q:
+        rtt = windowed.get((src, dst), rtt)
         ps, pd = by_id.get(src), by_id.get(dst)
         if ps is None or pd is None or src in suspect or dst in suspect:
             continue

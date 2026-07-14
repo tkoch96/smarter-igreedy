@@ -25,6 +25,14 @@ from .scheduler import DiversityScheduler
 from .state import CampaignState
 
 DESCRIPTION_FMT = "fiber-atlas-mesh|{date}|dst:{dst}"
+REMEASURE_FMT = "fiber-atlas-mesh-remeasure|{date}|dst:{dst}"
+
+# Re-measures use min-of-10 instead of min-of-3: credits are not the
+# binding constraint (results are), and these are exactly the pairs whose
+# floor needs corroborating. Batch count is capped so the long tail of
+# single-pair dsts can't eat the concurrency slots (~15 msm/min submit).
+REMEASURE_PACKETS = 10
+REMEASURE_MAX_MEAS = 300
 
 # Account cap discovered empirically 2026-07-06, refined 07-07: max 100k
 # RESULTS per ROLLING 24H WINDOW (1 result = 1 src-dst pair, regardless of
@@ -35,6 +43,14 @@ DAILY_RESULTS_LIMIT = 100_000
 STOP_ERRORS = ("credit", "quota", "results limit", "daily results")
 
 
+def _create_ping_retry(dst_ip, src_prbs, description, packets=atlas_api.PING_PACKETS):
+    ok, resp = atlas_api.create_ping(dst_ip, src_prbs, description, packets=packets)
+    if not ok and "concurrent" in str(resp):
+        atlas_api.wait_for_capacity()
+        ok, resp = atlas_api.create_ping(dst_ip, src_prbs, description, packets=packets)
+    return ok, resp
+
+
 def run_daily(
     budget_credits=300_000,
     max_pairs=None,
@@ -42,6 +58,7 @@ def run_daily(
     dry_run=False,
     seed=None,
     state=None,
+    remeasure_pairs=15_000,
 ):
     state = state or CampaignState()
     probes = fetch_inventory()
@@ -80,6 +97,59 @@ def run_daily(
     if n_pairs == 0:
         print("   rolling 24h results limit reached; nothing to schedule")
         return [], []
+
+    date = time.strftime("%Y-%m-%d")
+    if remeasure_pairs:
+        print("== (c') re-measuring uncorroborated pairs (min-of-10)")
+        cands = state.remeasure_candidates()
+        budget = min(remeasure_pairs, n_pairs)
+        benched = state.benched_probes()
+        by_dst = {}
+        for s, d, _gap in cands:
+            if s in benched or d in benched or s not in by_id or d not in by_id:
+                continue
+            if d in no_dst:
+                continue
+            by_dst.setdefault(d, []).append(s)
+        print(f"   {len(cands)} candidate pairs across {len(by_dst)} dsts; "
+              f"pair budget {budget}")
+        n_re = n_meas = 0
+        limit_hit = False
+        # densest dst batches first: measurement count, not pairs, is the
+        # submit-loop bottleneck; the single-pair tail drains over days
+        for dst, srcs in sorted(by_dst.items(), key=lambda kv: -len(kv[1])):
+            if n_re >= budget or n_meas >= REMEASURE_MAX_MEAS or limit_hit:
+                break
+            for i in range(0, len(srcs), atlas_api.MAX_PROBES_PER_MEAS):
+                chunk = srcs[i:i + atlas_api.MAX_PROBES_PER_MEAS][: budget - n_re]
+                if not chunk or n_meas >= REMEASURE_MAX_MEAS:
+                    break
+                if dry_run:
+                    n_re += len(chunk)
+                    n_meas += 1
+                    continue
+                if n_meas % 10 == 9:
+                    atlas_api.wait_for_capacity()
+                ok, resp = _create_ping_retry(
+                    by_id[dst]["ip"], chunk,
+                    REMEASURE_FMT.format(date=date, dst=dst),
+                    packets=REMEASURE_PACKETS,
+                )
+                if ok:
+                    state.record_scheduled(
+                        resp, dst, by_id[dst]["ip"], chunk, kind="remeasure"
+                    )
+                    n_re += len(chunk)
+                    n_meas += 1
+                else:
+                    print(f"   remeasure create failed for dst {dst}: {resp}")
+                    if any(k in str(resp).lower() for k in STOP_ERRORS):
+                        print("   stopping: account limit reached")
+                        limit_hit = True
+                        break
+        print(f"   launched {n_meas} re-measurements covering {n_re} pairs")
+        n_pairs = 0 if limit_hit else n_pairs - n_re
+
     successful = {
         (min(s, d), max(s, d)) for s, d, _ in state.results("ok")
     }
@@ -115,19 +185,13 @@ def run_daily(
     if dry_run:
         return batches, []
 
-    date = time.strftime("%Y-%m-%d")
     msm_ids = []
     for i, b in enumerate(batches):
         if i % 10 == 9:
             atlas_api.wait_for_capacity()
-        ok, resp = atlas_api.create_ping(
+        ok, resp = _create_ping_retry(
             b.dst_ip, b.src_prbs, DESCRIPTION_FMT.format(date=date, dst=b.dst_prb)
         )
-        if not ok and "concurrent" in str(resp):
-            atlas_api.wait_for_capacity()
-            ok, resp = atlas_api.create_ping(
-                b.dst_ip, b.src_prbs, DESCRIPTION_FMT.format(date=date, dst=b.dst_prb)
-            )
         if ok:
             state.record_scheduled(resp, b.dst_prb, b.dst_ip, b.src_prbs)
             msm_ids.append(resp)
@@ -148,9 +212,12 @@ def main():
     ap.add_argument("--max-measurements", type=int, default=1200)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--remeasure-pairs", type=int, default=15_000,
+                    help="pair budget for re-measuring uncorroborated RTTs (0 disables)")
     args = ap.parse_args()
     run_daily(
-        args.budget_credits, args.max_pairs, args.max_measurements, args.dry_run, args.seed
+        args.budget_credits, args.max_pairs, args.max_measurements, args.dry_run,
+        args.seed, remeasure_pairs=args.remeasure_pairs,
     )
 
 
