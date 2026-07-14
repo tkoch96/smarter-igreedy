@@ -2,6 +2,117 @@ import matplotlib.pyplot as plt
 import numpy as np
 from utils import get_distance
 
+
+def plot_knob_grid_overview(arm_rows, knob_names, marginals, anchors,
+                            output_filename):
+	"""THE grid-search view: every arm ranked by final-budget mean error
+	(top), the knob on/off indicator matrix aligned below it (scan what
+	the good arms have in common), and each knob's paired marginal
+	effect (right).
+
+	arm_rows:   [(label, on_flags list[bool], mean_km, median_km)],
+	            pre-sorted best→worst
+	knob_names: row labels for the indicator matrix (len = len(on_flags))
+	marginals:  {knob: (d_mean_km, d_median_km, on_wins, n_pairs)}
+	anchors:    {label: (mean_km, median_km)} — horizontal reference lines
+	"""
+	n, K = len(arm_rows), len(knob_names)
+	fig = plt.figure(figsize=(max(13, 0.22 * n + 7), 7))
+	gs = fig.add_gridspec(2, 2, width_ratios=[3.2, 1.15],
+	                      height_ratios=[2.4, 1], hspace=0.09, wspace=0.22)
+	ax = fig.add_subplot(gs[0, 0])
+	axm = fig.add_subplot(gs[1, 0], sharex=ax)
+	axb = fig.add_subplot(gs[:, 1])
+
+	x = np.arange(n)
+	ax.plot(x, [r[2] for r in arm_rows], 'o', ms=4.5, color='tab:blue',
+	        label='mean')
+	ax.plot(x, [r[3] for r in arm_rows], 'o', ms=4.5, color='tab:orange',
+	        label='median')
+	anchor_colors = ['k', 'gray', 'tab:green', 'tab:purple']
+	for i, (label, (am, amed)) in enumerate(anchors.items()):
+		c = anchor_colors[i % len(anchor_colors)]
+		ax.axhline(am, color=c, linestyle='--', linewidth=1.2,
+		           label=f'{label} mean')
+		ax.axhline(amed, color=c, linestyle=':', linewidth=1.2,
+		           label=f'{label} median')
+	vals = ([r[2] for r in arm_rows] + [r[3] for r in arm_rows]
+	        + [v for pair in anchors.values() for v in pair])
+	if max(vals) / max(min(vals), 1e-9) > 6:
+		ax.set_yscale('log')
+	ax.set_ylabel('error at final budget (km)')
+	ax.grid(True, linestyle='--', alpha=0.5)
+	ax.legend(fontsize=8, ncol=2)
+	plt.setp(ax.get_xticklabels(), visible=False)
+
+	mat = np.array([[1.0 if r[1][k] else 0.0 for r in arm_rows]
+	                for k in range(K)])
+	axm.imshow(mat, aspect='auto', cmap='Greys', vmin=0, vmax=1.4,
+	           interpolation='nearest', extent=(-0.5, n - 0.5, K - 0.5, -0.5))
+	axm.set_yticks(range(K))
+	axm.set_yticklabels(knob_names, fontsize=9)
+	axm.set_xticks(np.arange(-0.5, n, 1), minor=True)
+	axm.set_yticks(np.arange(-0.5, K, 1), minor=True)
+	axm.grid(which='minor', color='w', linewidth=0.5)
+	axm.tick_params(which='minor', length=0)
+	axm.set_xlabel('arms, ranked best → worst by mean error (dark = knob ON)')
+
+	_marginal_bars(axb, marginals)
+
+	plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+	plt.clf()
+	plt.close()
+	print(f"Knob-grid overview saved to {output_filename}", flush=True)
+
+
+def _marginal_bars(ax, marginals):
+	knobs = list(marginals)
+	ypos = np.arange(len(knobs))
+	ax.barh(ypos + 0.19, [marginals[k][0] for k in knobs], height=0.36,
+	        label='mean effect')
+	ax.barh(ypos - 0.19, [marginals[k][1] for k in knobs], height=0.36,
+	        label='median effect')
+	ax.set_yticks(ypos)
+	ax.set_yticklabels([f"{k}  ({marginals[k][2]}/{marginals[k][3]} ON-wins)"
+	                    for k in knobs], fontsize=9)
+	ax.invert_yaxis()
+	ax.axvline(0, color='k', linewidth=0.8)
+	ax.set_xlabel('paired ON−OFF effect (km)\nnegative = knob helps')
+	ax.set_title('Knob marginal effects')
+	ax.legend(fontsize=8)
+	ax.grid(True, axis='x', linestyle='--', alpha=0.5)
+
+
+def plot_knob_grid(curves, marginals, output_filename):
+	"""Knob-grid figure: mean + median error-vs-budget for a selected
+	subset of arms (left, middle) and each knob's paired marginal effect
+	at the final budget (right).
+
+	curves:    {label: {'budgets': [...], 'mean': [...], 'median': [...],
+	                    'style': optional matplotlib kwargs}}
+	marginals: {knob: (d_mean_km, d_median_km, on_wins, n_pairs)}
+	"""
+	fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+	for label, c in curves.items():
+		style = dict(linewidth=2, alpha=0.85)
+		style.update(c.get('style', {}))
+		axes[0].plot(c['budgets'], c['mean'], label=label, **style)
+		axes[1].plot(c['budgets'], c['median'], label=label, **style)
+	for ax, ttl in ((axes[0], 'Mean error'), (axes[1], 'Median error')):
+		ax.set_title(f'{ttl} vs budget')
+		ax.set_xlabel('# measurements')
+		ax.set_ylabel('error (km)')
+		ax.grid(True, linestyle='--', alpha=0.5)
+	axes[0].legend(fontsize=8)
+
+	_marginal_bars(axes[2], marginals)
+
+	plt.tight_layout()
+	plt.savefig(output_filename, dpi=300)
+	plt.clf()
+	plt.close()
+	print(f"Knob-grid figure saved to {output_filename}", flush=True)
+
 def plot_error_over_budget(results_data, output_filename):
 	"""
 	Plots the average geolocation error against the measurement budget.
