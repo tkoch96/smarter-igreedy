@@ -110,10 +110,24 @@ smoother curves; cost ≈ one estimation pass per point per strategy):
 - `figures/geolocator_results_<shape>.pdf` — average error vs number of
   pings, the objective (override with `--fig-name`)
 - `cache/geolocator_run_<shape>.pkl` — full per-target errors per budget
-  + sampling metadata (feeds post-hoc slicing and `--replot`)
+  + sampling metadata (feeds post-hoc slicing and `--replot`).  Greedy
+  strategies also carry `utility_tracking` (per-ping decision telemetry:
+  expected vs realized utility, explore/exploit flag, model residuals,
+  estimate/size before-after) and `model_params` (final fitted additive
+  μ/σ² per node + the learn mask) — the "why did gains slow down"
+  record, also saved per arm in `--knob-grid` runs
 - `--replot cache/geolocator_run_*.pkl` regenerates the figure + region
   breakdown from a recorded run without recomputing anything
 - per-region mean-error table at the final budget (`--no-breakdown` to skip)
+- `--knob-grid` — instead of a comparison run, the 2^6 additive-greedy
+  ablation: {mu_src, var_src, mu_dst, var_dst} learned vs frozen-at-prior
+  × base model {1.3×geodesic, fiber floor} × {risk_gain, phased}.
+  Arms run `--grid-concurrency` at a time (default 3, each with
+  `--workers` inner workers), each writes
+  `cache/knob_grid_<shape>/<arm>.pkl` and is skipped when present
+  (resumable); ends with a combined
+  `cache/geolocator_knob_grid_<shape>.pkl`, a sorted table, and paired
+  per-knob marginal effects.
 - `--floor-sweep-targets 25,100,1000,...` (with `--floor-sweep-sources`,
   default `200,1000,0`=all) computes the full-coverage "perfect" floor —
   NN over the lowest-RTT measured VP, what `smart_perfect` converges to —
@@ -124,6 +138,25 @@ smoother curves; cost ≈ one estimation pass per point per strategy):
 - `cache/cached_results_<strategy>_<mode>_<shape>.pkl` — cached baseline
   curves (`random`, `smart_perfect` only); the shape keys the cache, so
   different sampling shapes never mix
+
+### Computation speedups (2026-07-10)
+
+The production configs run three opt-in fast paths, each preserving the
+old implementation behind its default (measured old-vs-new equivalence +
+timings: `tests/test_speedups.py`, figure `tests/speedups.pdf`):
+
+- `Iterative_Greedy_Geolocator(utility_dispatch=...)` — `'per_vp'`
+  (default; historical one-executor-job-per-VP), `'chunk'`, `'inline'`,
+  or `'auto'` (inline for NM-free hypothesis utilities on short candidate
+  lists, chunked otherwise; 2–7× on selection).
+- `Iterative_Greedy_Geolocator(polish_mode='incremental')` — checkpoint
+  batch polish refits params over everything but re-optimises locations
+  only for pinged / offset-moved targets, warm-started (~14× per polish
+  at 3k pings; default `'full'`).
+- `PolicyFloorEstimator(field_dtype=np.float32)` — halves field RAM/disk
+  (distinct cache keys; exact-equality validation stays float64).
+- `--budget-spacing log --budget-points N` — log-spaced checkpoints
+  (each checkpoint pays a polish; dense early, sparse late).
 
 ## Documentation map
 

@@ -11,12 +11,15 @@ and what the experiments showed. Open follow-ups live in
 1. **PolicyFloorEstimator** (internet_gmaps/floor_query.py): policy-aware
    floors for arbitrary query points. Lazy one-Dijkstra-per-(VP, class
    signature) fields with LRU + disk cache (data/cache/policy_fields/),
-   VP-subset queries (`floor_ms_subset`) for the geolocation hot path,
-   OPEN-floor fallback exactly where the policy floor is inf (never bare
-   geodesic). Unit-tested for exact equality vs policy_floor_matrix,
-   bit-exact OPEN_POLICY equivalence with FloorEstimator, per-VP
-   inf-fallback, disk-cache roundtrip, LRU-eviction exactness
-   (tests/test_policy_floor_estimator.py, 12 tests).
+   VP-subset queries (`floor_ms_subset`) for the geolocation hot path.
+   No-route semantics (since 2026-07-09 / policy v3.3): `floor_ms`
+   raises NoRouteError (KeyError) where the policy strands an
+   open-routable pair; `no_route="open"` restores the OPEN-floor
+   fallback used by the n=100 experiment below (never bare geodesic).
+   Unit-tested for exact equality vs policy_floor_matrix, bit-exact
+   OPEN_POLICY equivalence with FloorEstimator, NoRouteError contract +
+   per-VP inf-fallback, terrestrial-only bans, disk-cache roundtrip,
+   LRU-eviction exactness (tests/test_policy_floor_estimator.py).
 
 2. **RttModel injection** (probabilistic_helpers.py): `RttModel` /
    `GeodesicRtt` / `FiberFloorRtt` — an injectable base-RTT term replacing
@@ -207,3 +210,134 @@ construction (well-placed VPs are NN's best case).
   stale physics.
 - Full n=100 run ≈ 25 min on the laptop (6 workers), fiber greedy
   ≈ 13 min of it.
+
+## 2026-07-10 dense collapse: root cause + resolution (2026-07-11)
+
+Fiber "stopped working" on every world sampled from 2026-07-09 on
+(dense targets ~9,300 km mean AND median). **The fiber model never
+regressed — the sampled worlds did.** The asymmetric coverage-greedy in
+`get_random_subsample` broke its equal-gain ties lexicographically by
+IP string, so the ~coverage_depth(10) sources serving ALL dense targets
+were always the lowest-address daily probes — AFRINIC 102.x / APNIC
+103.x, an Africa/Asia cluster. Which probes escaped depended on the
+daily target draw (the campaign DB reseeds the eligible pool): Jul 6-7
+drew spread sets (fiber won), Jul 10 drew the cluster (dense
+nearest-VP median 4,805 km) and EVERY strategy collapsed on dense
+targets — random+NN 7,292 km median, the ground-truth oracle 7,291.
+The fiber greedy amplified the bad geometry worst (×1.3 floor
+over-predicts 47% of >5,000 km dense constraints; clamped-≥0 offsets
+push the excess into position), which masqueraded as a fiber
+regression. Both prior investigations were right: 24-41% "violations"
+measured the ×1.3 SLOPED base (raw floor: 2-3%); 1.5×geodesic was the
+>5,000 km dense mix (<1,500 km pairs: 1.01-1.04); working-tree
+V32_POLICY floors are bit-identical to the winning-era default.
+
+Fixes (assess_geolocators.py): seeded jitter tie-break in the
+coverage greedy; VP-coordinate hash in the fiber estimator token +
+sidecar (stale-registry footgun). Tests:
+tests/test_fiber_beats_geo_real.py (hermetic sampler-geography
+regression; registry freshness; GEOLOC_E2E_REAL=1 e2e on pinned
+snapshot cache/world_100src_300dst_fibergeo.pkl — fiber 2350/1189 vs
+geodesic 2490/1318 mean/median km at b=2500).
+
+⚠️ Worlds snapshotted 2026-07-09..07-11 (sizecheck / san300 /
+300×2209 / 200×999) carry the degenerate geometry — resample; do not
+use for fiber-vs-geodesic conclusions.
+
+Full-scale rerun (identical settings, resampled world,
+cache/geolocator_run_300src_2204dst_resampled.pkl; mean/median km at
+b=32000, broken → resampled):
+
+| strategy | broken world | resampled |
+|---|---|---|
+| random+NN | 3773/2364 | 2310/987 |
+| smart_perfect | 3566/2095 | 2161/869 |
+| greedy_phased_geo | 2718/1915 | 2281/1200 |
+| greedy_phased_fiber | 5187/2836 | **2235/1075** |
+
+## Plateau mechanism + uncertainty repair (2026-07-11)
+
+Why every strategy flattens (probe audits: at 30% budget, 10% of
+remaining candidate pings are worth >1,000 km and the auction scores
+90% of them <1 km, Spearman ≈ 0):
+
+1. Degenerate VP geometry (10 shared VPs per dense target) creates
+   offset-position likelihood ridges (not capacity overfitting: ~3
+   params vs ~10 measurements).
+2. The additive fit launders position error into μ̂_dst (err>5,000 km
+   targets: median μ̂_dst 27 ms vs 0.5 ms for err<500 km;
+   corr(err, μ̂)=0.48) → residuals quiet → promises 0 → phased greedy
+   devolves to random exploration by ~25% of budget.
+3. The batch polish OVERWROTE rescues (params-first alternation judges
+   all starts under the incumbent basin's offsets; measured 2,977 km
+   ping-time → 13,827 polished).
+
+Measured outcomes (100×300 healthy world, fiber arm, b=2500):
+
+- **RECOMMENDED for real-mesh runs: GEOLOC_HYP_OUTER_RINGS=1
+  GEOLOC_POLISH_LIVE_STARTS=1** — hypothesis rings at the zero-offset
+  physics bound + live-estimate polish starts with penalized-NLL basin
+  arbitration. 3 runs 2134-2251/1137-1196 vs baselines 2394/1206,
+  2350/1189 (~7% mean); rescued-then-relost 12 → 4-7. Off by default:
+  honest synthetic worlds re-inflate pathological promises (4 pinned
+  sweep behaviors move).
+- Negative results (all measured, don't re-try blind): stronger L2
+  (GEOLOC_PRIOR_STRENGTH 10/30) shrinks laundered weights, rescues 0
+  targets, hurts medians; size-weighted exploration
+  (explore_bias='size') leaves the stranded count unchanged; fiber
+  prior_mu_ms=0 ("atlas needs no correction") 2457/1215 at S=2,
+  2745/1742 at S=15 — the ×1.3 floor is a bound, not a mean; real
+  paths carry ~5 ms genuine overhead above it. Default prior stays
+  5 ms (knobs: GEOLOC_PRIOR_MU_MS / GEOLOC_PRIOR_STRENGTH /
+  GEOLOC_MU_FLOOR_MS; per-model prior via FiberFloorRtt(prior_mu_ms=)).
+- Residual stranded targets are likelihood-limited (wrong basin
+  genuinely fits better under conical VP geometry) — only
+  bearing-diverse probes fix them (see TODOS).
+
+Oracle (smart_perfect) fixes: candidate simulation now uses the same
+radius it commits (was rtt×100 vs rtt×100/1.3×1.05); scoring converter
+is settable (--oracle-converter / GEOLOC_ORACLE_CONVERTER). Measured
+shoot-out under oracle selection (100×300, b=2500): NN 2382/1208 <
+additive_em 2604/1518 < hard_circle 2906/1540 (degrades with budget —
+validity cliff) < em_gaussian 4222/3036 < gaussian 4619/3586. NN stays
+the default.
+
+## Graph-node search (map-matching) — default fiber location step (2026-07-11)
+
+The additive MAP for fiber models now scores EVERY atlas graph node in
+one vectorized pass (per-VP open-field rows), seeds Nelder-Mead from
+the best node, rescored top nodes compete under the full policy base,
+and off-infrastructure winners (the geodesic-fallback zone — where the
+mid-ocean estimates lived) are rejected.  Default on;
+GEOLOC_NODE_SEARCH=0 restores free search; test mocks lack node fields
+so plumbing pins stay bit-exact.  Measured on the pinned resampled
+300×2204 world, greedy_phased_fiber, identical settings
+(cache/geolocator_run_300src_2204dst_resampled_nodesearch.pkl):
+
+- final b=32000: 2078/1022 vs 2235/1075 km (mean/median), stranded
+  >5000 km 254 vs 276; dense 2126/979 vs 2395/1037.
+- the win is BUDGET EFFICIENCY: new curve dominates at every budget,
+  mid-range medians −25..−33% (b=2617: 3243 vs 4858; b=7962: 1724 vs
+  2331); reaches the old estimator's final median with ~25% fewer
+  pings.
+- paired ledger: 803 helped / 898 hurt >100 km, net +157 km mean —
+  node granularity slightly perturbs many well-located targets while
+  hemisphere-rescuing the stranded tail.
+- figure: figures/node_search_before_after.pdf (case-study map).
+
+Model grid (2026-07-11, 42 arms × 2 200×500 worlds, estimation-only,
+unbiased priors, node-search positions; scripts in session scratch):
+winning structure = 1.3×raw-floor + δ_src + δ_dst (≥0, prior 0, S=2)
+with HUBER loss — 2792/993, stranded 87 vs NN's 2716/936/104.
+Marginals: adders −1041 km, fixed-1.3 multiplier −465, huber −50
+(−107 on top arm), learned μ vs fixed 1.3 +6 (don't learn it), free
+sign +9 (clamp costs nothing), stiffer priors monotonically worse
+(S=32: +658 mean).  Production delta implied: Huber loss in the
+additive fit/MAP (not yet implemented).
+
+Fiber toggle for the synthetic additive sweep:
+tests/test_e2e_additive_em.py helpers take rtt_model= (None = bit-
+identical geodesic); TestFiberToggleSweep pins fiber-base additive_em
+441 km vs geodesic-base 1560 on toy-C-cable truth; figure
+tests/error_over_measurements_additive_fiber.pdf
+(plot_error_additive.py --fiber).

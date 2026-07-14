@@ -3,7 +3,30 @@
 Open work items (kept deliberately terse — completed work lives in git
 history, `CLAUDE.md`, and `.claude/FIBER_GEOLOCATOR_RESULTS.md`; the
 atlas-side research agenda is `.claude/HANDOFF_routing_realism.md`).
-Last reviewed 2026-07-07.
+Last reviewed 2026-07-11.
+
+## Plateau follow-ups (from the 2026-07-11 investigation — see
+## "Plateau mechanism" in FIBER_GEOLOCATOR_RESULTS.md)
+
+- Bearing-diverse dense sources: the residual stranded targets (~12%
+  of dense) are likelihood-limited by conical 10-VP geometry; the
+  sampler's coverage_depth tie-break could prefer bearing diversity
+  (or raise dense depth) — the only lever that fixes them.
+- Payoff-uncertainty scoring: risk_gain scores the p25 of each
+  candidate's per-hypothesis benefit distribution (pessimism, chosen
+  to stop budget-sinking). A "10,000-or-500 km" candidate scores ≈500;
+  optimism-under-remaining-budget (UCB-style) is a one-constant
+  experiment.
+- Multi-seed validation of GEOLOC_HYP_OUTER_RINGS +
+  GEOLOC_POLISH_LIVE_STARTS (currently 3-runs-vs-2 evidence, ~7% mean)
+  before flipping them on by default for real-mesh runs.
+- Offset-doubt uncertainty floor: report region size ≥ μ̂_dst×100 km
+  until the offset is VERIFIED by bearing-diverse constraints (the
+  fitted offset is a confession, not an explanation) — sketched, not
+  implemented.
+- Mid-run rescue losses outside the polish (shared-model refit path
+  re-launders; measured 617 km → 14,716 at ping 1469) — the arbitration
+  only guards checkpoint polishes.
 
 ## Fiber model follow-ups (from the integration verdict)
 

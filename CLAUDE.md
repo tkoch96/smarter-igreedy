@@ -240,7 +240,8 @@ NN converter) sits at ~615.
 
 Fiber-floor result (2026-07-06, assess_fiber_real.py, merged mesh n=100 =
 58 dense + 42 campaign, seed 31415, b=2500): swapping the geodesic d/100
-base term for the internet_gmaps policy floor (v3.2 × 1.3, RttModel
+base term for the internet_gmaps policy floor (v3.2 × 1.3 — the then-
+current DEFAULT_POLICY; v3.5 since 2026-07-09, RttModel
 injection) breaks the greedy plateau — greedy_phased_fiber 1532/748
 (mean/median km) vs geodesic greedy_phased 1933/1246, and the fiber
 additive estimator on RANDOM pings (1695/785) beats the geodesic greedy.
@@ -511,9 +512,20 @@ tests/test_e2e_additive_em.py         additive two-way model rtt = SOL + X_src +
                                       3475+ at b=10), matches additive_em at full
                                       coverage, patho ping share ≤ 0.375 (fair 0.25).
                                       Oracle = Perfect_Geolocator selection + true
-                                      (μ, σ), pinned to dominate at every budget
+                                      (μ, σ), pinned to dominate at every budget.
+                                      FIBER TOGGLE: the sweep helpers take rtt_model=
+                                      (None = geodesic d/100, bit-for-bit) and scenarios
+                                      carry vp_locs + their truth base; TestFiberToggleSweep
+                                      reruns the sweep on a toy-C-cable-truth world with
+                                      both bases and pins fiber-base additive_em < 0.5×
+                                      its geodesic twin (measured: 441 vs 1560 km at
+                                      full coverage)
 tests/plot_error_additive.py          error-vs-budget curves under the additive world
-                                      (writes tests/error_over_measurements_additive.pdf)
+                                      (writes tests/error_over_measurements_additive.pdf);
+                                      `--fiber` / make_fiber_figure: the fiber toggle —
+                                      same estimators on a toy-fiber-truth world, geodesic
+                                      base (dashed) vs injected fiber base (solid)
+                                      (writes tests/error_over_measurements_additive_fiber.pdf)
 tests/test_e2e_adaptive_em.py         online-EM e2e (single-target estimator comparison
                                       + noise models under contamination) AND the
                                       multi-target budget-allocation comparison:
