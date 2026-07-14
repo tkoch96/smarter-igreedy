@@ -11,7 +11,7 @@ from iterative_greedy_geolocator import Iterative_Greedy_Geolocator
 from feasible_region_maintainer import FeasibleRegion, HARD_CIRCLE, GAUSSIAN, EM_GAUSSIAN, ADDITIVE
 from probabilistic_helpers import (
 	GLOBAL_SIGMA_MS, GAUSSIAN_NOISE, ASYMMETRIC_NOISE, additive_batch_em,
-	FiberFloorRtt,
+	FiberFloorRtt, GeodesicRtt,
 )
 
 from plot_results import *
@@ -90,12 +90,15 @@ def convert_measurements(measurements, target_data, mode, rtt_model=None):
 
 
 def evaluate_geolocator(geolocator, target_data, converter_mode, budgets,
-                        rtt_model=None):
+                        rtt_model=None, progress_fn=None):
 	"""Run one geolocator over the budget grid; returns its plot_data
 	('budgets'/'errors' for plotting + 'per_target' {budget: {dst: err}}
 	for post-hoc slicing).  Module-level and self-contained so the
 	parallel path can run each (independent) geolocator in its own
-	process."""
+	process.  `progress_fn`: checkpoint the full plot_data (including
+	the per-ping telemetry so far) to this file after EVERY budget — a
+	crash mid-run then loses at most one budget segment, never the
+	telemetry."""
 	address_to_loc = target_data.get('address_to_loc', {})
 	all_targets = set()
 	for dsts in target_data.get('loc_loc_meas', {}).values():
@@ -132,16 +135,68 @@ def evaluate_geolocator(geolocator, target_data, converter_mode, budgets,
 			plot_data['budgets'].append(budget)
 			plot_data['errors'].append(avg_error)
 			plot_data['per_target'][budget] = per_target
+		if progress_fn:
+			_attach_debug_state(plot_data, geolocator)
+			_dump_atomic(plot_data, progress_fn)
+
+	_attach_debug_state(plot_data, geolocator)
 	return plot_data
 
 
-def _parallel_worker(geolocator, target_data, converter_mode, budgets, rtt_model, q):
+def _attach_debug_state(plot_data, geolocator):
+	"""Per-ping decision telemetry (greedys only): expected vs realized
+	utility, explore/exploit flag, model beliefs at selection time — the
+	"why did gains slow down" record.  Persisted in the returned
+	plot_data (arm pickles + run records); it used to die with the
+	worker process."""
+	telemetry = getattr(geolocator, 'utility_tracking', None)
+	if telemetry:
+		plot_data['utility_tracking'] = list(telemetry)
+	model = getattr(geolocator, 'latency_model', None)
+	if model is not None:
+		plot_data['model_params'] = {
+			'mu_s': dict(model.mu_s), 'var_s': dict(model.var_s),
+			'mu_t': dict(model.mu_t), 'var_t': dict(model.var_t),
+			'learn': tuple(getattr(model, 'learn', ())),
+		}
+
+
+def _dump_atomic(obj, fn):
+	"""Crash-safe pickle: a reader never sees a half-written file."""
+	tmp = fn + '.tmp'
+	with open(tmp, 'wb') as fh:
+		pickle.dump(obj, fh)
+	os.replace(tmp, fn)
+
+
+def _parallel_worker(geolocator, target_data, converter_mode, budgets, rtt_model, q,
+                     progress_fn=None):
 	try:
 		pd = evaluate_geolocator(geolocator, target_data, converter_mode, budgets,
-		                         rtt_model=rtt_model)
+		                         rtt_model=rtt_model, progress_fn=progress_fn)
+		if progress_fn:
+			_dump_atomic(pd, progress_fn)
 		q.put((geolocator.name, pd, None))
 	except Exception:
 		q.put((geolocator.name, None, traceback.format_exc()))
+	finally:
+		if hasattr(geolocator, 'cleanup'):
+			geolocator.cleanup()
+
+
+def _grid_arm_worker(geolocator, target_data, budgets, out_fn, q):
+	"""One knob-grid arm in its own process: evaluate, write its own
+	pickle (so a crashed grid resumes arm-by-arm), report via queue."""
+	try:
+		pd = evaluate_geolocator(geolocator, target_data, 'nearest_neighbor',
+		                         budgets,
+		                         rtt_model=getattr(geolocator, 'rtt_model', None),
+		                         progress_fn=out_fn + '.progress')
+		_dump_atomic(pd, out_fn)
+		os.remove(out_fn + '.progress')
+		q.put((geolocator.name, None))
+	except Exception:
+		q.put((geolocator.name, traceback.format_exc()))
 	finally:
 		if hasattr(geolocator, 'cleanup'):
 			geolocator.cleanup()
@@ -156,6 +211,15 @@ def build_policy_estimator(vp_npz):
 	from floor_query import PolicyFloorEstimator
 
 	vs = np.load(vp_npz)
+	# GEOLOC_FIBER_POLICY pins the transit policy to a named constant in
+	# transit_policy (e.g. 'V32_POLICY') instead of DEFAULT_POLICY — the
+	# physics A/B knob (disk fields are keyed by policy name, so pinned
+	# and default runs never share fields).
+	policy = None
+	policy_attr = os.environ.get('GEOLOC_FIBER_POLICY')
+	if policy_attr:
+		import transit_policy
+		policy = getattr(transit_policy, policy_attr)
 	npz = np.load(sorted(glob(os.path.join(IGM_DIR, 'data', 'graph_*.npz')))[-1])
 	graph = FiberGraph(
 		npz['node_lat'], npz['node_lon'], npz['edge_src'], npz['edge_dst'],
@@ -165,28 +229,63 @@ def build_policy_estimator(vp_npz):
 	)
 	return PolicyFloorEstimator(
 		graph, vs['vp_lat'], vs['vp_lon'],
-		cache_dir=FIBER_FIELD_CACHE, max_cached_fields=1024,
+		policy=policy,
+		# RAM cap per estimator instance.  Every greedy worker process
+		# holds one of these, so large values multiply: 3 concurrent grid
+		# arms × 3 processes OOM-killed a 16 GB machine at 1024 × float64.
+		# float32 fields (~125 KB each — precision is µs-scale, plenty for
+		# geolocation) let 512 fit in the RAM 256 float64 fields used;
+		# the disk cache absorbs the misses.
+		cache_dir=FIBER_FIELD_CACHE,
+		max_cached_fields=int(os.environ.get('GEOLOC_FIELD_LRU', 512)),
+		field_dtype=np.float32,
+		# Geolocation queries arbitrary points — the (0,0) cold-start
+		# prior and Nelder-Mead excursions routinely hit policy-stranded
+		# locations, which is expected here, not a policy bug: take the
+		# OPEN floor there (the pre-no_route="raise" contract).  Strict
+		# raising stays the default for atlas validation code.
+		no_route="open",
 	)
 
 
 def make_fiber_model(target_data, tag, slope=1.3, offset_ms=0.0):
 	"""FiberFloorRtt whose estimator VP rows are the current mesh's
 	sources.  VP coordinates go into an npz sidecar so pickled models
-	carry only (factory, token)."""
+	carry only (factory, token).
+
+	The sidecar name and the process-global estimator-registry token both
+	embed a hash of the VP coordinates: two worlds run under the same tag
+	can never serve each other's floors (a tag-only token let a cached
+	estimator built from an OLDER overwritten sidecar answer for the
+	wrong probe set)."""
 	import functools
+	import hashlib
 
 	addr = target_data['address_to_loc']
 	vp_addrs = sorted(target_data['loc_loc_meas'])
 	locs = [addr[a] for a in vp_addrs]
+	vp_lat = np.array([l[0] for l in locs], dtype=np.float64)
+	vp_lon = np.array([l[1] for l in locs], dtype=np.float64)
+	vp_sig = hashlib.sha1(vp_lat.tobytes() + vp_lon.tobytes()).hexdigest()[:12]
 	os.makedirs(FIBER_FIELD_CACHE, exist_ok=True)
-	vp_npz = os.path.join(FIBER_FIELD_CACHE, f'vps{tag or "_default"}.npz')
-	np.savez(vp_npz,
-	         vp_lat=np.array([l[0] for l in locs]),
-	         vp_lon=np.array([l[1] for l in locs]))
+	vp_npz = os.path.join(FIBER_FIELD_CACHE,
+	                      f'vps{tag or "_default"}_{vp_sig}.npz')
+	np.savez(vp_npz, vp_lat=vp_lat, vp_lon=vp_lon)
 	factory = functools.partial(build_policy_estimator, vp_npz=vp_npz)
 	return FiberFloorRtt(estimator_factory=factory,
-	                     cache_token=f'fiber{tag or "_default"}',
-	                     slope=slope, offset_ms=offset_ms)
+	                     cache_token=f'fiber{tag or "_default"}_{vp_sig}',
+	                     slope=slope, offset_ms=offset_ms,
+	                     # Per-model additive prior mean.  prior 0 ("the
+	                     # atlas needs no correction") was measured WORSE on
+	                     # the real mesh — the x1.3 floor is a bound, not a
+	                     # mean; real paths carry ~5 ms genuine overhead
+	                     # above it, and a zero prior forces that overhead
+	                     # into position error for sparse targets (100x300
+	                     # fiber arm: 2457/1215 vs 2134-2251/1137-1196 km at
+	                     # prior 5; S=15 worse still, 2745/1742).  None =
+	                     # global default (5 ms; GEOLOC_PRIOR_MU_MS to
+	                     # experiment).
+	                     prior_mu_ms=None)
 
 
 def facility_select_sources(m, addr, targets, n):
@@ -284,6 +383,23 @@ class Geolocator_Comparator:
 
 	def load_target_measurement_data(self):
 		## loads all measurements from ripe atlas probes, and information about those probes
+		self._load_target_measurement_data()
+		if getattr(self, 'max_rtt_ms', None):
+			# Sanitize: a pair whose BEST rtt exceeds the cap carries almost
+			# no distance information (paths that long are detour/queueing
+			# dominated; the antipodal fiber floor itself is ~400ms), so it
+			# enters the model as pure noise.  Measured on the 300x2209
+			# world: 9.3% of pairs exceed 300ms, median pair is 172ms.
+			m = self.target_data['loc_loc_meas']
+			kept = {s: {t: r for t, r in d.items() if min(r) <= self.max_rtt_ms}
+			        for s, d in m.items()}
+			n0 = sum(len(d) for d in m.values())
+			self.target_data['loc_loc_meas'] = {s: d for s, d in kept.items() if d}
+			n1 = sum(len(d) for d in self.target_data['loc_loc_meas'].values())
+			print(f"rtt sanitization (<= {self.max_rtt_ms:.0f}ms): "
+			      f"dropped {n0 - n1}/{n0} pairs", flush=True)
+
+	def _load_target_measurement_data(self):
 		if self.data_source == 'merged':
 			from mesh_data import load_target_data
 			d = load_target_data()
@@ -392,25 +508,36 @@ class Geolocator_Comparator:
 			# lazy-greedy coverage selection (gains only shrink, so a stale
 			# heap top re-evaluated is exact); leftovers fill remaining
 			# slots by raw target count once every target hit coverage_depth
+			#
+			# Equal-gain ties are the COMMON case, not the corner case:
+			# every daily-mesh probe covers every dense target, so the
+			# first coverage_depth picks are an ~909-way tie.  A bare
+			# (gain, addr) heap breaks that tie lexicographically, which
+			# clusters the winners in low IP space (AFRINIC 102.x /
+			# APNIC 103.x = Africa/Asia) — every dense target then gets
+			# measured ONLY from one far-away regional cluster and no
+			# strategy can triangulate it (the 2026-07-10 dense collapse).
+			# A seeded jitter key makes tie-breaks geography-blind.
 			cov = {t: 0 for t in targets}
-			heap = [(-len(ts), s) for s, ts in src_targets.items()]
+			jitter = {s: rng.random() for s in sorted(src_targets)}
+			heap = [(-len(ts), jitter[s], s) for s, ts in src_targets.items()]
 			heapq.heapify(heap)
 			chosen, leftovers = [], []
 			while heap and len(chosen) < n:
-				neg_g, s = heapq.heappop(heap)
+				neg_g, j, s = heapq.heappop(heap)
 				gain = sum(1 for t in src_targets[s] if cov[t] < coverage_depth)
 				if gain != -neg_g:
 					if gain > 0:
-						heapq.heappush(heap, (-gain, s))
+						heapq.heappush(heap, (-gain, j, s))
 					else:
-						leftovers.append((-gain, s))
+						leftovers.append((-gain, j, s))
 					continue
 				chosen.append(s)
 				for t in src_targets[s]:
 					cov[t] += 1
 			if len(chosen) < n:
-				leftovers.sort(key=lambda kv: (-len(src_targets[kv[1]]), kv[1]))
-				chosen += [s for _, s in leftovers[: n - len(chosen)]]
+				leftovers.sort(key=lambda kv: (-len(src_targets[kv[2]]), kv[1]))
+				chosen += [s for *_, s in leftovers[: n - len(chosen)]]
 
 		chosen_set = set(chosen)
 		new_meas = {}
@@ -446,6 +573,14 @@ class Geolocator_Comparator:
 
 	def _converter_mode_for(self, geolocator):
 		return getattr(geolocator, 'converter_mode', None) or self.measurement_converter_mode
+
+	def _progress_fn(self, geolocator, shape, tag):
+		"""Per-strategy checkpoint file: refreshed after every budget with
+		the full plot_data + telemetry so far (atomic replace), so results
+		survive a crash of the strategy, the run, or the machine."""
+		d = os.path.join(CACHE_DIR, 'progress')
+		os.makedirs(d, exist_ok=True)
+		return os.path.join(d, f"{geolocator.name}_{shape}{tag}.pkl")
 
 	def run(self, min_budget=100, max_budget=2500, step=100, n_subsample=100,
 	        parallel=False, budgets=None, n_targets=None, k_vps_per_target=None,
@@ -500,23 +635,32 @@ class Geolocator_Comparator:
 					target=_parallel_worker,
 					args=(geolocator, self.target_data,
 					      self._converter_mode_for(geolocator), budgets,
-					      getattr(geolocator, 'rtt_model', None), q))
+					      getattr(geolocator, 'rtt_model', None), q,
+					      self._progress_fn(geolocator, shape, tag)))
 				p.start()
 				procs.append(p)
+			# One strategy failing must not lose the others' results: the
+			# survivors still land in the run record; failures are loud.
+			failures = {}
 			for _ in procs:
 				name, pd, err = q.get()
 				if err is not None:
-					raise RuntimeError(f"{name} failed in parallel run:\n{err}")
-				self.plot_data[name] = pd
+					failures[name] = err
+					print(f"!!! {name} FAILED (continuing with the rest):\n{err}",
+					      flush=True)
+				else:
+					self.plot_data[name] = pd
 			for p in procs:
 				p.join()
 		else:
+			failures = {}
 			for geolocator in to_run:
 				print(f"\n--- Running {geolocator.name} ---")
 				self.plot_data[geolocator.name] = evaluate_geolocator(
 					geolocator, self.target_data,
 					self._converter_mode_for(geolocator), budgets,
-					rtt_model=getattr(geolocator, 'rtt_model', None))
+					rtt_model=getattr(geolocator, 'rtt_model', None),
+					progress_fn=self._progress_fn(geolocator, shape, tag))
 				if hasattr(geolocator, 'cleanup'):
 					geolocator.cleanup()
 
@@ -532,6 +676,10 @@ class Geolocator_Comparator:
 		run_fn = os.path.join(CACHE_DIR, f"geolocator_run_{shape}{tag}.pkl")
 		pickle.dump(run_record, open(run_fn, 'wb'))
 		print(f"wrote {run_fn}", flush=True)
+		if failures:
+			print(f"!!! {len(failures)} strategies failed: {sorted(failures)} — "
+			      f"their last checkpoints (incl. telemetry) survive under "
+			      f"{os.path.join(CACHE_DIR, 'progress')}/", flush=True)
 
 		# Call the plotting function after all geolocators have run (or loaded)
 		fig_name = fig_name or f"geolocator_results_{shape}{tag}.pdf"
@@ -607,6 +755,8 @@ _SETTINGS = {
 	'min_budget':       ('GEOLOC_MIN_BUDGET',     100,                 int),
 	'max_budget':       ('GEOLOC_MAX_BUDGET',     2500,                int),
 	'budget_step':      ('GEOLOC_BUDGET_STEP',    100,                 int),
+	'budget_spacing':   ('GEOLOC_BUDGET_SPACING', 'linear',            str),
+	'budget_points':    ('GEOLOC_BUDGET_POINTS',  10,                  int),
 	'fiber':            ('GEOLOC_FIBER',          False,               lambda v: v == '1'),
 	'fiber_slope':      ('GEOLOC_FIBER_SLOPE',    1.3,                 float),
 	'fiber_offset_ms':  ('GEOLOC_FIBER_OFFSET',   0.0,                 float),
@@ -614,11 +764,15 @@ _SETTINGS = {
 	'converter_mode':   ('GEOLOC_CONVERTER',      'nearest_neighbor',  str),
 	'workers':          ('GEOLOC_WORKERS',        6,                   int),
 	'oracle_candidates':('GEOLOC_ORACLE_CANDS',   50,                  int),
+	'oracle_converter': ('GEOLOC_ORACLE_CONVERTER', 'nearest_neighbor', str),
 	'tag':              ('GEOLOC_TAG',            '',                  str),
 	'fig_name':         ('GEOLOC_FIG_NAME',       None,                str),
 	'seed':             ('GEOLOC_SEED',           31415,               int),
 	'parallel':         ('GEOLOC_PARALLEL',       False,               lambda v: v == '1'),
 	'breakdown':        ('GEOLOC_BREAKDOWN',      True,                lambda v: v != '0'),
+	'max_rtt_ms':       ('GEOLOC_MAX_RTT',        None,                float),
+	'knob_grid':        ('GEOLOC_KNOB_GRID',       False,               lambda v: v == '1'),
+	'grid_concurrency': ('GEOLOC_GRID_CONCURRENCY', 3,                  int),
 	'floor_sweep_targets': ('GEOLOC_FLOOR_TARGETS', None,              str),
 	'floor_sweep_sources': ('GEOLOC_FLOOR_SOURCES', '200,1000,0',      str),
 	'floor_sweep_seeds':   ('GEOLOC_FLOOR_SEEDS',   3,                 int),
@@ -661,17 +815,32 @@ def parse_settings(argv=None):
 	p.add_argument('--min-budget', type=int)
 	p.add_argument('--max-budget', type=int)
 	p.add_argument('--budget-step', type=int)
+	p.add_argument('--budget-spacing', choices=('linear', 'log'),
+	               help='checkpoint spacing: linear (min..max by step) or '
+	                    'log (--budget-points geometrically spaced — dense '
+	                    'early where curves move, sparse late; each '
+	                    'checkpoint pays a batch polish, so fewer late '
+	                    'checkpoints is nearly free accuracy-wise)')
+	p.add_argument('--budget-points', type=int,
+	               help='number of log-spaced checkpoints (default 10)')
 	p.add_argument('--fiber', action='store_true', default=None,
-	               help='add fiber-floor variants (random_additive_fiber, '
+	               help='add fiber-floor variants (greedy_fiber, '
 	                    'greedy_phased_fiber)')
 	p.add_argument('--fiber-slope', type=float, help='inflation over the raw floor (default 1.3)')
 	p.add_argument('--fiber-offset-ms', type=float)
-	p.add_argument('--strategies', help='comma filter of strategy names to run')
+	p.add_argument('--strategies', help='comma filter of strategy names to run '
+	               '(random + smart_perfect are always included — every run '
+	               'carries its floor and ceiling)')
 	p.add_argument('--converter-mode', help='default estimation mode for '
 	               'strategies without their own (default nearest_neighbor)')
 	p.add_argument('--workers', type=int, help='greedy inner-pool size')
 	p.add_argument('--oracle-candidates', type=int,
 	               help='Perfect_Geolocator sources considered per target')
+	p.add_argument('--oracle-converter',
+	               help='estimation mode scoring the oracle (default '
+	                    'nearest_neighbor — measured best on the real mesh; '
+	                    'hard_circle/gaussian/em_gaussian/additive_em to '
+	                    'experiment)')
 	p.add_argument('--tag', help='suffix for cache/figure filenames')
 	p.add_argument('--fig-name', help='output figure filename '
 	               '(default geolocator_results<tag>.pdf)')
@@ -679,6 +848,19 @@ def parse_settings(argv=None):
 	p.add_argument('--parallel', action='store_true', default=None)
 	p.add_argument('--no-breakdown', dest='breakdown', action='store_false',
 	               default=None, help='skip the per-region error table')
+	p.add_argument('--max-rtt-ms', type=float,
+	               help='drop (src,dst) pairs whose best rtt exceeds this '
+	                    'cap before sampling — paths that long are '
+	                    'detour-dominated noise, not distance (300 trims '
+	                    'the junk tail; the antipodal fiber floor is ~400)')
+	p.add_argument('--knob-grid', action='store_true', default=None,
+	               help='run the 2^6 additive-greedy ablation grid: '
+	                    '{mu_src,var_src,mu_dst,var_dst} learned vs frozen × '
+	                    '{1.3×geodesic, fiber floor} × {risk_gain, phased}; '
+	                    'resumable per-arm under cache/knob_grid_<shape>/')
+	p.add_argument('--grid-concurrency', type=int,
+	               help='concurrent grid arms (default 3; each uses --workers '
+	                    'inner workers)')
 	p.add_argument('--floor-sweep-targets', metavar='N1,N2,...',
 	               help='instead of a comparison run, compute the full-'
 	                    'coverage "perfect" floor (NN over the lowest-RTT '
@@ -717,6 +899,17 @@ def parse_settings(argv=None):
 	settings['configured'] = bool(explicit - {'seed', 'workers'})
 	settings['replot'] = replot
 	return settings
+
+
+def budget_grid(s):
+	"""The budget checkpoint list from a settings dict: explicit list >
+	log spacing > linear range."""
+	if s['budgets']:
+		return list(s['budgets'])
+	if s['budget_spacing'] == 'log':
+		pts = np.geomspace(s['min_budget'], s['max_budget'], s['budget_points'])
+		return sorted({int(round(p)) for p in pts})
+	return list(range(s['min_budget'], s['max_budget'] + 1, s['budget_step']))
 
 
 def run_floor_sweep(s):
@@ -856,6 +1049,261 @@ def run_floor_sweep(s):
 	print(f"wrote {out}", flush=True)
 
 
+GRID_KNOBS = ('mu_src', 'var_src', 'mu_dst', 'var_dst', 'fiber', 'phased')
+
+
+def _grid_arm_name(mask, base, sel):
+	return (f"ms{int(mask[0])}vs{int(mask[1])}mt{int(mask[2])}vt{int(mask[3])}"
+	        f"_{base}_{sel}")
+
+
+def _arm_stats(pd, b):
+	e = list(pd['per_target'][b].values())
+	return float(np.mean(e)), float(np.median(e))
+
+
+def knob_marginals(arms, budget):
+	"""Each knob's PAIRED marginal effect (arms differing only in that
+	knob, ON minus OFF) at `budget`.  Returns
+	{knob: (d_mean_km, d_median_km, on_wins, n_pairs)}."""
+	def knob_state(k, mask, base, sel):
+		if k < 4:
+			return mask[k]
+		return base == 'fib' if k == 4 else sel == 'phased'
+
+	by_key = {(mask, base, sel): pd for mask, base, sel, pd in arms}
+	out = {}
+	for k, kname in enumerate(GRID_KNOBS):
+		d_mean, d_med, wins = [], [], 0
+		for (mask, base, sel), pd_on in by_key.items():
+			if not knob_state(k, mask, base, sel):
+				continue
+			if k < 4:
+				off = (tuple(m if i != k else False for i, m in enumerate(mask)),
+				       base, sel)
+			elif k == 4:
+				off = (mask, 'geo', sel)
+			else:
+				off = (mask, base, 'risk_gain')
+			pd_off = by_key.get(off)
+			if pd_off is None:
+				continue
+			(m1, md1), (m0, md0) = _arm_stats(pd_on, budget), _arm_stats(pd_off, budget)
+			d_mean.append(m1 - m0)
+			d_med.append(md1 - md0)
+			wins += m1 < m0
+		if d_mean:
+			out[kname] = (float(np.mean(d_mean)), float(np.mean(d_med)),
+			              wins, len(d_mean))
+	return out
+
+
+def print_knob_grid_summary(arms, budgets):
+	"""arms: list of (mask, base, sel, plot_data).  Prints the full table
+	sorted by final-budget mean, then each knob's PAIRED marginal effect
+	(same 5 other knobs, on minus off) — single-seed greedy jitter is
+	~5-10%, so read the knobs from the 32-pair aggregates, not from
+	individual arm rankings."""
+	b_last = budgets[-1]
+	b_mid = min(budgets, key=lambda b: abs(b - budgets[-1] / 2))
+
+	print(f"\n=== knob grid: mean/median km at b={b_last} (and b={b_mid}) ===")
+	for mask, base, sel, pd in sorted(arms, key=lambda a: _arm_stats(a[3], b_last)[0]):
+		m, md = _arm_stats(pd, b_last)
+		m2, md2 = _arm_stats(pd, b_mid)
+		print(f"{_grid_arm_name(mask, base, sel):>28s}  "
+		      f"{m:7.0f} / {md:7.0f}   (b={b_mid}: {m2:7.0f} / {md2:7.0f})")
+
+	print(f"\n=== paired marginal knob effects at b={b_last} "
+	      f"(negative = knob ON helps; n pairs, ON-wins) ===")
+	for kname, (dm, dd, wins, n) in knob_marginals(arms, b_last).items():
+		print(f"{kname:>8s}: mean {dm:+7.0f} km   median {dd:+7.0f} km   "
+		      f"({n} pairs, ON better in {wins})")
+
+
+def write_knob_grid_figure(arms, budgets, shape, tag=''):
+	"""Two figures.  knob_grid_<shape>.pdf is the grid-native overview:
+	every arm ranked by final-budget error over a knob on/off indicator
+	matrix, plus the paired marginal effects — the view that scales with
+	knob count.  knob_grid_curves_<shape>.pdf shows budget dynamics for
+	a readable subset (full-learning / all-frozen / best arms) against
+	the cached random/smart_perfect anchors for the same shape."""
+	b_last = budgets[-1]
+
+	anchors = {}
+	for anchor in ('random', 'smart_perfect'):
+		fn_a = os.path.join(CACHE_DIR,
+		                    f"cached_results_{anchor}_nearest_neighbor_{shape}{tag}.pkl")
+		if os.path.exists(fn_a):
+			pd_a = pickle.load(open(fn_a, 'rb'))
+			if b_last in pd_a.get('per_target', {}):
+				anchors[anchor] = _arm_stats(pd_a, b_last)
+
+	ranked = sorted(arms, key=lambda a: _arm_stats(a[3], b_last)[0])
+	arm_rows = []
+	for mask, base, sel, pd in ranked:
+		m, md = _arm_stats(pd, b_last)
+		flags = list(mask) + [base == 'fib', sel == 'phased']
+		arm_rows.append((_grid_arm_name(mask, base, sel), flags, m, md))
+	plot_knob_grid_overview(arm_rows, list(GRID_KNOBS),
+	                        knob_marginals(arms, b_last), anchors,
+	                        os.path.join(FIG_DIR, f"knob_grid_{shape}{tag}.pdf"))
+
+	def curve(pd, style=None):
+		bs = pd['budgets']
+		return {'budgets': bs, 'mean': pd['errors'],
+		        'median': [float(np.median(list(pd['per_target'][b].values())))
+		                   for b in bs],
+		        'style': style or {}}
+
+	by_key = {(mask, base, sel): pd for mask, base, sel, pd in arms}
+	curves = {}
+	for base, color in (('geo', 'tab:blue'), ('fib', 'tab:red')):
+		key_full = ((True,) * 4, base, 'risk_gain')
+		key_frozen = ((False,) * 4, base, 'risk_gain')
+		if key_full in by_key:
+			curves[f'full learning ({base})'] = curve(
+				by_key[key_full], {'color': color})
+			if key_frozen in by_key:
+				curves[f'all frozen ({base})'] = curve(
+					by_key[key_frozen], {'color': color, 'linestyle': ':'})
+	ranked_med = sorted(arms, key=lambda a: _arm_stats(a[3], b_last)[1])
+	for label, (mask, base, sel, pd) in (('best mean', ranked[0]),
+	                                     ('best median', ranked_med[0])):
+		curves[f'{label}: {_grid_arm_name(mask, base, sel)}'] = curve(
+			pd, {'linestyle': '--'})
+
+	for anchor in ('random', 'smart_perfect'):
+		fn = os.path.join(CACHE_DIR,
+		                  f"cached_results_{anchor}_nearest_neighbor_{shape}{tag}.pkl")
+		if os.path.exists(fn):
+			pd = pickle.load(open(fn, 'rb'))
+			curves[anchor] = curve(pd, {'color': 'k' if anchor == 'random' else 'gray',
+			                            'linestyle': '-.', 'linewidth': 1.5})
+
+	plot_knob_grid(curves, knob_marginals(arms, b_last),
+	               os.path.join(FIG_DIR, f"knob_grid_curves_{shape}{tag}.pdf"))
+
+
+def run_knob_grid(s):
+	"""The 2^6 additive-greedy ablation: every combination of the four
+	learned-parameter families (per-source/-destination means and
+	variances), the base RTT model (1.3×geodesic vs fiber floor — both
+	INJECTED so the geodesic arm carries the same validated slope), and
+	the phased exploration switch (OFF = risk_gain, the same selection
+	without the marginal-returns switch to random exploration).
+
+	One process per arm, `grid_concurrency` at a time, each greedy with
+	`workers` inner workers.  Every arm writes its own pickle under
+	cache/knob_grid_<shape><tag>/ and is skipped when present, so the
+	grid is resumable; the combined record + summary write at the end."""
+	import itertools
+	import queue as queue_mod
+
+	# The sampled world must stay IDENTICAL across resumes, but the live
+	# merged mesh drifts while the campaign runs (measured: a supervisor
+	# relaunch re-sampled 997 -> 999 targets overnight and started a
+	# fresh grid in a new dir).  So the world is a snapshot: the first
+	# launch writes world.pkl into the grid dir and every later launch
+	# loads it — same-shape resumes via the dir, cross-drift resumes via
+	# GEOLOC_GRID_WORLD=<grid_dir>/world.pkl.
+	gc = Geolocator_Comparator(geolocators=[], data_source=s['data'])
+	gc.max_rtt_ms = s['max_rtt_ms']
+	world_fn = os.environ.get('GEOLOC_GRID_WORLD')
+	if world_fn:
+		w = pickle.load(open(world_fn, 'rb'))
+		gc.target_data, gc.experiment_meta = w['target_data'], w['meta']
+		gc._subsampled = True
+	else:
+		gc.load_target_measurement_data()
+		gc.get_random_subsample(n=s['n_sources'], n_targets=s['n_targets'],
+		                        k_vps_per_target=s['vps_per_target'],
+		                        seed=s['seed'],
+		                        source_selection=s['source_selection'])
+	shape = _shape_name(gc.experiment_meta, s['n_sources'])
+	budgets = budget_grid(s)
+
+	out_dir = os.path.join(CACHE_DIR, f"knob_grid_{shape}{s['tag']}")
+	os.makedirs(out_dir, exist_ok=True)
+	world_fn = os.path.join(out_dir, 'world.pkl')
+	if os.path.exists(world_fn):
+		w = pickle.load(open(world_fn, 'rb'))
+		gc.target_data, gc.experiment_meta = w['target_data'], w['meta']
+	else:
+		pickle.dump({'target_data': gc.target_data, 'meta': gc.experiment_meta},
+		            open(world_fn, 'wb'))
+
+	fiber_model = make_fiber_model(gc.target_data, s['tag'],
+	                               slope=s['fiber_slope'],
+	                               offset_ms=s['fiber_offset_ms'])
+	geo_model = GeodesicRtt(slope=s['fiber_slope'])
+
+	configs = [(mask, base, sel)
+	           for mask in itertools.product((False, True), repeat=4)
+	           for base in ('geo', 'fib')
+	           for sel in ('risk_gain', 'phased')]
+
+	def out_fn(cfg):
+		return os.path.join(out_dir, _grid_arm_name(*cfg) + '.pkl')
+
+	pending = [c for c in configs if not os.path.exists(out_fn(c))]
+	print(f"knob grid {shape}: {len(configs)} arms, "
+	      f"{len(configs) - len(pending)} cached, {len(pending)} to run "
+	      f"({s['grid_concurrency']} concurrent × {s['workers']} workers)",
+	      flush=True)
+
+	ctx = multiprocessing.get_context('spawn')
+	q = ctx.Queue()
+	running = {}
+	failures = {}
+	while pending or running:
+		while pending and len(running) < s['grid_concurrency']:
+			mask, base, sel = cfg = pending.pop(0)
+			g = Iterative_Greedy_Geolocator(
+				region_mode=ADDITIVE, model_refit_every=25, selection=sel,
+				utility_dispatch='auto', polish_mode='incremental',
+				max_workers=s['workers'],
+				rtt_model=fiber_model if base == 'fib' else geo_model,
+				additive_learn=mask, name=_grid_arm_name(*cfg))
+			p = ctx.Process(target=_grid_arm_worker,
+			                args=(g, gc.target_data, budgets, out_fn(cfg), q))
+			p.start()
+			running[g.name] = p
+			print(f"--- launched {g.name} ({len(pending)} queued) ---", flush=True)
+		try:
+			name, err = q.get(timeout=60)
+		except queue_mod.Empty:
+			for name, p in list(running.items()):
+				if not p.is_alive():   # died without reporting (e.g. OOM kill)
+					p.join()
+					running.pop(name)
+					failures[name] = f"exited without result (exitcode {p.exitcode})"
+					print(f"!!! {name} died (exitcode {p.exitcode})", flush=True)
+			continue
+		p = running.pop(name)
+		p.join()
+		if err:
+			failures[name] = err
+			print(f"!!! {name} FAILED:\n{err}", flush=True)
+		else:
+			print(f"=== {name} done ===", flush=True)
+
+	arms = [(mask, base, sel, pickle.load(open(out_fn(cfg), 'rb')))
+	        for cfg in configs if os.path.exists(out_fn(cfg))
+	        for mask, base, sel in [cfg]]
+	record = {'plot_data': {_grid_arm_name(m, b, sl): pd for m, b, sl, pd in arms},
+	          'budgets': budgets, 'meta': gc.experiment_meta,
+	          'address_to_loc': gc.target_data['address_to_loc'],
+	          'failures': failures}
+	out = os.path.join(CACHE_DIR, f"geolocator_knob_grid_{shape}{s['tag']}.pkl")
+	pickle.dump(record, open(out, 'wb'))
+	print(f"wrote {out}", flush=True)
+	if failures:
+		print(f"{len(failures)} arms failed: {sorted(failures)}", flush=True)
+	print_knob_grid_summary(arms, budgets)
+	write_knob_grid_figure(arms, budgets, shape, s['tag'])
+
+
 def _shape_name(meta, n_subsample):
 	"""<sources>src_<targets>dst — the human-readable experiment shape used
 	in figure/cache filenames (legacy symmetric runs: n on both sides)."""
@@ -877,42 +1325,95 @@ def replot_run(run_pkl, settings):
 
 
 def build_configured_comparator(s):
-	"""Build the comparator + strategy set from a settings dict."""
+	"""Build the comparator + strategy set from a settings dict.
+
+	The sampled world is SNAPSHOTTED (cache/world_<shape><tag>.pkl) and
+	reloaded on same-shape reruns, mirroring the knob grid: the live
+	merged mesh drifts while the campaign runs, so without the snapshot
+	a rerun/restart silently lands in a different world (measured twice:
+	997→999 targets overnight, 2166→2209 within a day).
+	GEOLOC_WORLD=<world.pkl> forces a specific snapshot."""
 	gc = Geolocator_Comparator(geolocators=[], data_source=s['data'])
 	gc.measurement_converter_mode = s['converter_mode']
-	gc.load_target_measurement_data()
-	gc.get_random_subsample(n=s['n_sources'], n_targets=s['n_targets'],
-	                        k_vps_per_target=s['vps_per_target'],
-	                        seed=s['seed'],
-	                        source_selection=s['source_selection'])
+	gc.max_rtt_ms = s['max_rtt_ms']
+	world_fn = os.environ.get('GEOLOC_WORLD')
+	if world_fn:
+		w = pickle.load(open(world_fn, 'rb'))
+		gc.target_data, gc.experiment_meta = w['target_data'], w['meta']
+		gc._subsampled = True
+	else:
+		gc.load_target_measurement_data()
+		gc.get_random_subsample(n=s['n_sources'], n_targets=s['n_targets'],
+		                        k_vps_per_target=s['vps_per_target'],
+		                        seed=s['seed'],
+		                        source_selection=s['source_selection'])
+		shape = _shape_name(gc.experiment_meta, s['n_sources'])
+		wfn = os.path.join(CACHE_DIR, f"world_{shape}{s['tag']}.pkl")
+		if os.path.exists(wfn):
+			w = pickle.load(open(wfn, 'rb'))
+			gc.target_data, gc.experiment_meta = w['target_data'], w['meta']
+			print(f"world snapshot reloaded: {wfn}", flush=True)
+		else:
+			_dump_atomic({'target_data': gc.target_data,
+			              'meta': gc.experiment_meta}, wfn)
 
+	# GEOLOC_FAST=0 flips every greedy here back to the historical code
+	# paths (per_vp dispatch + full polish) — the run-level A/B for the
+	# fast paths on real (non-mock) fiber fields.
+	fast = os.environ.get('GEOLOC_FAST', '1') == '1'
+	dispatch = 'auto' if fast else 'per_vp'
+	polish = 'incremental' if fast else 'full'
 	fiber_model = (make_fiber_model(gc.target_data, s['tag'],
 	                                slope=s['fiber_slope'],
 	                                offset_ms=s['fiber_offset_ms'])
 	               if s['fiber'] else None)
-	oracle = Perfect_Geolocator()
+	oracle = Perfect_Geolocator(converter_mode=s['oracle_converter'])
 	oracle.n_srcs_to_consider = s['oracle_candidates']
+	# `random` is the one random baseline by design: completely random
+	# measurement order + nearest-neighbor estimation, nothing else.
 	geolocators = [
 		Random_Geolocator(name='random', order_seed=s['seed']),
-		Random_Geolocator(name='random_additive', converter_mode='additive_em',
-		                  order_seed=s['seed']),
 		Iterative_Greedy_Geolocator(region_mode=ADDITIVE, model_refit_every=25,
 		                            selection='phased', max_workers=s['workers'],
+		                            utility_dispatch=dispatch,
+		                            polish_mode=polish,
 		                            name='greedy_phased'),
+		# The knob grid's geo twin of greedy_phased_fiber: same full
+		# learning + phased selection over an injected 1.3×geodesic base
+		# (greedy_phased above keeps the historical bare-d/100 base).
+		Iterative_Greedy_Geolocator(region_mode=ADDITIVE, model_refit_every=25,
+		                            selection='phased', max_workers=s['workers'],
+		                            utility_dispatch=dispatch,
+		                            polish_mode=polish,
+		                            rtt_model=GeodesicRtt(slope=s['fiber_slope']),
+		                            name='greedy_phased_geo'),
 		oracle,
 	]
 	if s['fiber']:
 		geolocators += [
-			Random_Geolocator(name='random_additive_fiber',
-			                  converter_mode='additive_em',
-			                  rtt_model=fiber_model, order_seed=s['seed']),
+			# greedy_fiber: plain greedy region-reduction under the fixed
+			# fiber-floor model (gaussian regions, simulate selection) — no
+			# phased exploration switch, no learned additive offsets.
+			# region_slope=1.0: FiberFloorRtt.base_ms already applies the
+			# fiber slope; gaussian_nll multiplies by the region slope on top.
+			Iterative_Greedy_Geolocator(region_mode=GAUSSIAN, region_slope=1.0,
+			                            utility_dispatch=dispatch,
+			                            max_workers=s['workers'],
+			                            rtt_model=fiber_model,
+			                            name='greedy_fiber'),
 			Iterative_Greedy_Geolocator(region_mode=ADDITIVE, model_refit_every=25,
 			                            selection='phased', max_workers=s['workers'],
+			                            utility_dispatch=dispatch,
+			                            polish_mode=polish,
 			                            rtt_model=fiber_model,
 			                            name='greedy_phased_fiber'),
 		]
 	if s['strategies']:
-		keep = set(s['strategies'].split(','))
+		# The random floor and the oracle ceiling are ALWAYS in the set:
+		# a strategy curve without both on the same axes is
+		# uninterpretable (a --strategies filter narrows the experiment
+		# arms, never the baselines).
+		keep = set(s['strategies'].split(',')) | {'random', 'smart_perfect'}
 		geolocators = [g for g in geolocators if g.name in keep]
 	gc.geolocators = geolocators
 	return gc
@@ -923,6 +1424,10 @@ if __name__ == "__main__":
 	np.random.seed(settings['seed'])
 	if settings['replot']:
 		replot_run(settings['replot'], settings)
+	elif settings['knob_grid']:
+		import random as _random
+		_random.seed(settings['seed'])
+		run_knob_grid(settings)
 	elif settings['floor_sweep_targets']:
 		run_floor_sweep(settings)
 	elif settings['configured']:
@@ -933,7 +1438,7 @@ if __name__ == "__main__":
 		       min_budget=settings['min_budget'],
 		       max_budget=settings['max_budget'],
 		       step=settings['budget_step'],
-		       budgets=settings['budgets'],
+		       budgets=budget_grid(settings),
 		       parallel=settings['parallel'],
 		       tag=settings['tag'],
 		       fig_name=settings['fig_name'])

@@ -11,12 +11,23 @@ MeasData = dict[str, dict[str, list[float]]]
 class Perfect_Geolocator:
 	"""An oracle that prioritizes measurements based on RTT and spatial diversity to maximally reduce the feasible region."""
 
-	def __init__(self) -> None:
+	def __init__(self, converter_mode: str = 'nearest_neighbor') -> None:
 		self.name = "smart_perfect"
 		self.data: Optional[TargetData] = None
 		self.measurement_order: list[tuple[str, str]] = []
 		# number of things to consider per target as a measurement to. Limits complexity to O(N)
 		self.n_srcs_to_consider = 50
+		# Estimation half (read by the harness's _converter_mode_for).
+		# nearest_neighbor is the measured default: on the real merged mesh
+		# (100x300 healthy world, b=2500, oracle selection) it beat every
+		# model-based converter — NN 2382/1208 km < additive_em 2604/1518
+		# < hard_circle 2906/1540 < em_gaussian 4222/3036 < gaussian
+		# 4619/3586.  Fixed-slope circle models (hard OR soft) are
+		# misspecified on real paths (median rtt ~2.3x geodesic time);
+		# hard_circle additionally DEGRADES as measurements accumulate
+		# (1147 -> 1540 median from b=1000 to 2500): each rtt that beats
+		# the slope-implied distance is a circle excluding the truth.
+		self.converter_mode = converter_mode
 
 	def set_data(self, data: TargetData) -> None:
 		self.data = data
@@ -54,7 +65,12 @@ class Perfect_Geolocator:
 						continue
 
 					old_guess = current_region.best_guess.copy()
-					max_radius_km = cand_rtt * 100.0
+					# Simulate with the SAME radius add_measurement would
+					# commit (implied distance at the model slope × safety
+					# multiplier) — a bare rtt×100 radius scored candidates
+					# against ~27% looser circles than the ones kept.
+					max_radius_km = (current_region.implied_distance_km(cand_rtt)
+					                 * current_region.radius_multiplier)
 					current_region.constraints.append((cand_loc, max_radius_km))
 					current_region._update_estimate()
 
